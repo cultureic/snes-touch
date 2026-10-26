@@ -37,6 +37,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10-6.5z" /></svg>
           Controller test
         </button>
+        <button id="join-button" class="btn btn-secondary" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21v-1a6 6 0 0 1 12 0v1M19 8v6M16 11h6" /></svg>
+          Join a game
+        </button>
         <p class="hero-note">
           Pick one or many: .sfc, .smc, .fig or .zip. Games stay on this device; nothing is uploaded.
         </p>
@@ -81,6 +85,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
         </button>
         <span id="game-title" class="game-title"></span>
+        <span id="p2-badge" class="p2-badge" hidden>P2</span>
         <button id="ff-button" class="icon-btn" type="button" aria-label="Fast forward" aria-pressed="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6v12l8.5-6zM12.5 6v12L21 12z" /></svg>
         </button>
@@ -110,20 +115,54 @@
     <dialog id="menu" class="menu">
       <h2 id="menu-title" class="menu-title">Paused</h2>
       <button id="resume-button" class="btn btn-primary" type="button">Resume</button>
-      <div class="menu-row">
-        <button id="save-button" class="btn btn-secondary" type="button">Save state</button>
-        <button id="load-button" class="btn btn-secondary" type="button">Load state</button>
-      </div>
-      <p id="save-info" class="menu-note"></p>
-      <div class="menu-row">
+      <div id="host-tools" class="menu-group">
+        <div class="menu-row">
+          <button id="save-button" class="btn btn-secondary" type="button">Save state</button>
+          <button id="load-button" class="btn btn-secondary" type="button">Load state</button>
+        </div>
+        <p id="save-info" class="menu-note"></p>
         <button id="reset-button" class="btn btn-secondary" type="button">Restart game</button>
-        <button id="fullscreen-button" class="btn btn-secondary" type="button">Full screen</button>
+        <section class="invite">
+          <button id="invite-button" class="btn btn-secondary" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21v-1a6 6 0 0 1 12 0v1M19 8v6M16 11h6" /></svg>
+            Invite player 2
+          </button>
+          <p id="invite-error" class="menu-note" hidden></p>
+          <div id="invite-room" class="invite-room" hidden>
+            <p class="invite-label">Room code</p>
+            <p id="invite-code" class="invite-code"></p>
+            <p id="invite-status" class="menu-note"></p>
+            <div class="menu-row">
+              <button id="invite-share" class="btn btn-secondary" type="button">Share invite</button>
+              <button id="invite-stop" class="btn btn-quiet" type="button">Close room</button>
+            </div>
+          </div>
+        </section>
       </div>
+      <button id="fullscreen-button" class="btn btn-secondary" type="button">Full screen</button>
       <label class="switch-row">
         <span>Vibrate on press</span>
         <input id="haptics-toggle" class="switch" type="checkbox" />
       </label>
       <button id="quit-button" class="btn btn-quiet" type="button">Save and quit to games</button>
+    </dialog>
+
+    <dialog id="join-dialog" class="menu">
+      <h2 class="menu-title">Join a game</h2>
+      <p class="menu-note">Enter the code from your friend's pause menu. You'll play as player 2 on their game.</p>
+      <input
+        id="join-code"
+        class="code-input"
+        type="text"
+        maxlength="4"
+        autocomplete="off"
+        autocapitalize="characters"
+        spellcheck="false"
+        aria-label="Room code"
+        placeholder="ABCD"
+      />
+      <button id="join-go" class="btn btn-primary" type="button">Join as player 2</button>
+      <button id="join-cancel" class="btn btn-quiet" type="button">Cancel</button>
     </dialog>
 
     <div id="toast" class="toast" role="status"></div>

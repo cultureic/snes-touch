@@ -185,6 +185,10 @@ svg {
   gap: 10px;
 }
 
+.hero .btn-primary {
+  grid-column: 1 / -1;
+}
+
 .hero-note {
   grid-column: 1 / -1;
   margin: 2px 0 0;
@@ -391,7 +395,8 @@ body.is-dropping::after {
   background: #000;
 }
 
-.screen canvas {
+.screen canvas,
+.screen video {
   position: absolute;
   inset: 0;
   display: block;
@@ -399,6 +404,11 @@ body.is-dropping::after {
   height: 100%;
   image-rendering: pixelated;
   pointer-events: none;
+}
+
+.screen video {
+  object-fit: contain;
+  background: #000;
 }
 
 .status {
@@ -488,6 +498,17 @@ body.is-dropping::after {
   text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.p2-badge {
+  flex: none;
+  padding: 3px 8px;
+  background: var(--btn-y);
+  border-radius: 999px;
+  color: #06210f;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
 }
 
 /* ------------------------------------------------------------ touch pad (portrait) */
@@ -865,6 +886,60 @@ body.is-dropping::after {
   color: var(--muted);
   font-size: 12.5px;
   text-align: center;
+}
+
+.menu-group,
+.invite {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.invite-room {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  text-align: center;
+}
+
+.invite-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.invite-code {
+  margin: 0;
+  font: 800 40px/1.1 ui-monospace, 'SF Mono', Menlo, monospace;
+  letter-spacing: 0.2em;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+.code-input {
+  padding: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  color: var(--text);
+  font: 800 32px/1.2 ui-monospace, 'SF Mono', Menlo, monospace;
+  letter-spacing: 0.3em;
+  text-align: center;
+  text-transform: uppercase;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.code-input:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .switch-row {

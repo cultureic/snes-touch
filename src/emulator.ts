@@ -4,6 +4,22 @@ import { closeAudio } from './audio'
 import type { Button } from './controller'
 
 const CORE = 'snes9x'
+// RetroArch has no keyboard bindings for player 2 by default, and Nostalgist presses buttons
+// through them. Letters that neither player 1 nor Nostalgist's enabled hotkeys use.
+const PLAYER_2_KEYS: Record<Button, string> = {
+  up: 'i',
+  down: 'k',
+  left: 'j',
+  right: 'l',
+  a: 'n',
+  b: 'b',
+  x: 'h',
+  y: 'g',
+  l: 't',
+  r: 'y',
+  select: 'u',
+  start: 'p',
+}
 // The same build Nostalgist 0.23 uses by default, fetched here so the download can
 // report progress and be unzipped with fflate instead of a second CDN library.
 const CORE_URL = `https://cdn.jsdelivr.net/gh/arianrhodsandlot/retroarch-emscripten-build@v1.22.2/retroarch/${CORE}_libretro.zip`
@@ -92,6 +108,7 @@ export class Emulator {
         video_gpu_screenshot: false, // native-resolution screenshots and thumbnails
         pause_nonactive: false, // the app pauses on its own when it is backgrounded
         fastforward_ratio: 3,
+        ...Object.fromEntries(Object.entries(PLAYER_2_KEYS).map(([button, key]) => [`input_player2_${button}`, key])),
       },
       resolveCoreJs: () => js,
       resolveCoreWasm: () => wasm,
@@ -99,9 +116,9 @@ export class Emulator {
     return new Emulator(nostalgist)
   }
 
-  press(button: Button, down: boolean) {
-    if (down) this.nostalgist.pressDown(button)
-    else this.nostalgist.pressUp(button)
+  press(button: Button, down: boolean, player = 1) {
+    if (down) this.nostalgist.pressDown({ button, player })
+    else this.nostalgist.pressUp({ button, player })
   }
 
   pause() {

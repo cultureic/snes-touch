@@ -1,7 +1,8 @@
 // Builds public/controller-test.sfc: a 64 KiB LoROM program that draws the SNES
 // pad and lights up each button while it is held, so the touch controller can be
-// checked end to end without a commercial ROM. The 65816 code is assembled by the
-// tiny assembler below, so no SNES toolchain is needed.
+// checked end to end without a commercial ROM. Player 2's pad lights the same
+// buttons plus a purple lamp at the top, for checking multiplayer input. The 65816
+// code is assembled by the tiny assembler below, so no SNES toolchain is needed.
 import { writeFileSync } from 'node:fs'
 
 const ROM_SIZE = 0x10000
@@ -60,6 +61,7 @@ const LDX16 = (value) => (byte(0xa2), operand(value))
 const LDY16 = (value) => (byte(0xa0), word(value))
 const CPX16 = (value) => (byte(0xe0), word(value))
 const AND16 = (value) => (byte(0x29), word(value))
+const ORA16 = (value) => (byte(0x09), word(value))
 const ADC16 = (value) => (byte(0x69), word(value))
 const LDA_abs = (address) => (byte(0xad), word(address))
 const LDA_absX = (name) => (byte(0xbd), operand(name))
@@ -72,6 +74,7 @@ const LDA_dp = (address) => byte(0xa5, address)
 const STA_dp = (address) => byte(0x85, address)
 const LDX_dp = (address) => byte(0xa6, address)
 const AND_dp = (address) => byte(0x25, address)
+const ORA_dp = (address) => byte(0x05, address)
 const DEC_dp = (address) => byte(0xc6, address)
 const BNE = (name) => branch(0xd0, name)
 const BEQ = (name) => branch(0xf0, name)
@@ -94,8 +97,9 @@ const PALETTES = {
   x: '#3f74e0', // palette 4
   y: '#2fae58', // palette 5
   meta: '#c9c4d6', // palette 6
+  p2: '#8b7cf6', // palette 7
 }
-const PALETTE_INDEX = { dpad: 1, a: 2, b: 3, x: 4, y: 5, meta: 6 }
+const PALETTE_INDEX = { dpad: 1, a: 2, b: 3, x: 4, y: 5, meta: 6, p2: 7 }
 
 const cgram = new Array(32).fill(0)
 cgram[0] = bgr15(PALETTES.backdrop)
@@ -118,6 +122,7 @@ const BUTTONS = [
   [0x0080, 'a', 26, 12, 3, 3], // A
   [0x2000, 'meta', 10, 21, 5, 2], // Select
   [0x1000, 'meta', 17, 21, 5, 2], // Start
+  [0x0002, 'p2', 14, 0, 4, 2], // player 2 lamp: another signature bit, set by the code below
 ]
 const SOLID_TILE = 1
 const OFF_ENTRY = SOLID_TILE // palette 0
@@ -225,6 +230,12 @@ AND16(0x0001) // auto-joypad read still running?
 BNE('joypad-wait')
 LDA_abs(0x4218)
 STA_dp(JOY)
+LDA_abs(0x421a) // player 2
+BEQ('solo')
+ORA16(0x0002) // mark "player 2 is pressing something" for the lamp
+label('solo')
+ORA_dp(JOY)
+STA_dp(JOY) // both pads light the same layout
 LDY16(0x0000)
 
 label('button')

@@ -10,6 +10,7 @@
     "test-rom": "node scripts/make-test-rom.mjs"
   },
   "dependencies": {
+    "@supabase/realtime-js": "2.117.3",
     "fflate": "0.8.3",
     "idb-keyval": "6.3.0",
     "nostalgist": "0.23.0"

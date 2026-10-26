@@ -8,6 +8,8 @@ A Super NES emulator for the browser with a multi-touch game controller, built f
 - **Saves:** ROMs, battery saves (polled every 15 s and when the app is backgrounded), a manual save-state slot and an auto-resume state (every 60 s and on quit) live in IndexedDB on the device.
 - **PWA:** installable, full screen from the home screen, works offline after the first visit.
 
+- **Two players:** the host opens the pause menu, taps **Invite player 2**, and shares the room code or link (`/#join=ABCD`). The guest joins from **Join a game** and plays as player 2 on the host's game: the host streams the screen and sound over WebRTC, and the guest's pad comes back over a data channel. The guest doesn't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
+
 Keyboard also works: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select, Esc = menu.
 
 ## Develop
@@ -26,6 +28,20 @@ scripts/deploy-private.sh ~/Downloads/game.zip ~/Downloads/other.sfc
 ```
 
 Builds the app with those ROMs in `/roms` (plus an `index.json`) and deploys that build with `vercel deploy --prebuilt --prod`. The first time a device opens the site, the games are copied into its library. A plain `vercel deploy --prod` afterwards replaces the build and drops the games. Without `--prod` on the script's last line you get a preview deployment instead, which Vercel Authentication keeps behind your Vercel login.
+
+## Multiplayer relay (TURN)
+
+Phones on cellular often can't connect to each other directly, so WebRTC needs a TURN relay. `supabase/functions/snes-ice` hands out ICE servers: STUN always, plus TURN when configured. Without it deployed the game falls back to STUN only, which works on many Wi-Fi networks.
+
+1. Create a TURN key in the Cloudflare dashboard (Realtime → TURN). 1,000 GB/month are free.
+2. Deploy the function and set its secrets:
+
+```bash
+supabase functions deploy snes-ice --project-ref ckrxlqxkfxgagsghoegr --no-verify-jwt
+supabase secrets set --project-ref ckrxlqxkfxgagsghoegr CLOUDFLARE_TURN_KEY_ID=… CLOUDFLARE_TURN_KEY_API_TOKEN=…
+```
+
+Any other TURN server works too: set `TURN_URLS`, `TURN_USERNAME` and `TURN_CREDENTIAL` instead.
 
 ## Controller test ROM
 

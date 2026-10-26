@@ -1,8 +1,9 @@
 import './style.css'
-import { trackAudioContexts, unlockAudio } from './audio'
+import { gameAudioStream, trackAudioContexts, unlockAudio } from './audio'
 import { TouchController } from './controller'
 import { Emulator, loadCore, onCoreProgress } from './emulator'
 import { setHapticsEnabled } from './haptics'
+import { diffButtons, GuestLink, HostRoom, type HostState, inviteLink, normalizeCode } from './netplay'
 import { readRoms, romId } from './rom'
 import * as db from './storage'
 
@@ -24,6 +25,7 @@ const ui = {
   library: element('library'),
   romInput: element<HTMLInputElement>('rom-input'),
   testButton: element<HTMLButtonElement>('test-button'),
+  joinButton: element<HTMLButtonElement>('join-button'),
   games: element<HTMLUListElement>('games'),
   gamesEmpty: element('games-empty'),
   iosTip: element('ios-tip'),
@@ -34,22 +36,36 @@ const ui = {
   statusText: element('status-text'),
   statusBack: element<HTMLButtonElement>('status-back'),
   title: element('game-title'),
+  p2Badge: element('p2-badge'),
   menuButton: element<HTMLButtonElement>('menu-button'),
   ffButton: element<HTMLButtonElement>('ff-button'),
   pad: element('pad'),
   menu: element<HTMLDialogElement>('menu'),
   menuTitle: element('menu-title'),
   resumeButton: element<HTMLButtonElement>('resume-button'),
+  hostTools: element('host-tools'),
   saveButton: element<HTMLButtonElement>('save-button'),
   loadButton: element<HTMLButtonElement>('load-button'),
   saveInfo: element('save-info'),
   resetButton: element<HTMLButtonElement>('reset-button'),
+  inviteButton: element<HTMLButtonElement>('invite-button'),
+  inviteError: element('invite-error'),
+  inviteRoom: element('invite-room'),
+  inviteCode: element('invite-code'),
+  inviteStatus: element('invite-status'),
+  inviteShare: element<HTMLButtonElement>('invite-share'),
+  inviteStop: element<HTMLButtonElement>('invite-stop'),
   fullscreenButton: element<HTMLButtonElement>('fullscreen-button'),
   hapticsToggle: element<HTMLInputElement>('haptics-toggle'),
   quitButton: element<HTMLButtonElement>('quit-button'),
+  joinDialog: element<HTMLDialogElement>('join-dialog'),
+  joinCode: element<HTMLInputElement>('join-code'),
+  joinGo: element<HTMLButtonElement>('join-go'),
+  joinCancel: element<HTMLButtonElement>('join-cancel'),
   toast: element('toast'),
 }
 
+/** A game running on this device, possibly hosting a room for player 2. */
 interface Session {
   game: db.GameMeta
   canvas: HTMLCanvasElement
@@ -57,11 +73,26 @@ interface Session {
   timers: number[]
   lastSram?: Uint8Array
   quitting?: boolean
+  room?: HostRoom
+  roomState?: HostState
+  player2: number // player 2's pad, as a button mask
+}
+
+/** Playing as player 2 on someone else's game, watching their stream. */
+interface GuestSession {
+  code: string
+  video: HTMLVideoElement
+  link?: GuestLink
+  leaving?: boolean
 }
 
 let session: Session | undefined
+let guest: GuestSession | undefined
 
-const controller = new TouchController(ui.pad, (button, down) => session?.emulator?.press(button, down))
+const controller = new TouchController(ui.pad, (button, down) => {
+  if (guest) guest.link?.press(button, down)
+  else session?.emulator?.press(button, down)
+})
 
 // ------------------------------------------------------------ library
 
@@ -214,7 +245,7 @@ ui.romInput.addEventListener('change', () => {
 
 // Desktop: drop ROM files anywhere on the library.
 document.addEventListener('dragover', (event) => {
-  if (session || !event.dataTransfer?.types.includes('Files')) return
+  if (session || guest || !event.dataTransfer?.types.includes('Files')) return
   event.preventDefault()
   document.body.classList.add('is-dropping')
 })
@@ -223,7 +254,7 @@ document.addEventListener('dragleave', (event) => {
 })
 document.addEventListener('drop', (event) => {
   document.body.classList.remove('is-dropping')
-  if (session || !event.dataTransfer?.files.length) return
+  if (session || guest || !event.dataTransfer?.files.length) return
   event.preventDefault()
   void importFiles(Array.from(event.dataTransfer.files))
 })
@@ -242,12 +273,12 @@ ui.testButton.addEventListener('click', async () => {
 // ------------------------------------------------------------ playing
 
 async function play(game: db.GameMeta, rom: Uint8Array) {
-  if (session) return
+  if (session || guest) return
   const canvas = document.createElement('canvas')
   ui.screen.prepend(canvas)
-  const current: Session = { game, canvas, timers: [] }
+  const current: Session = { game, canvas, timers: [], player2: 0 }
   session = current
-  showPlayer(game)
+  showPlayer(game.name)
   setStatus('Loading emulator…')
   const stopProgress = onCoreProgress((fraction) => setStatus(`Downloading emulator… ${Math.round(fraction * 100)}%`))
   try {
@@ -298,6 +329,7 @@ async function saveAutosave(current: Session) {
 }
 
 async function quit(reason: string) {
+  if (guest) return leaveGame()
   const current = session
   if (!current || current.quitting) return
   current.quitting = true
@@ -305,6 +337,7 @@ async function quit(reason: string) {
   if (ui.menu.open) ui.menu.close()
   controller.releaseAll()
   for (const timer of current.timers) clearInterval(timer)
+  await closeRoom(current)
   if (current.emulator) {
     setStatus('Saving…')
     current.emulator.resume()
@@ -319,10 +352,14 @@ async function quit(reason: string) {
   void renderLibrary()
 }
 
-function showPlayer(game: db.GameMeta) {
-  ui.title.textContent = game.name
-  ui.menuTitle.textContent = game.name
+function showPlayer(title: string, asGuest = false) {
+  ui.title.textContent = title
+  ui.menuTitle.textContent = title
   ui.ffButton.setAttribute('aria-pressed', 'false')
+  ui.ffButton.hidden = asGuest
+  ui.hostTools.hidden = asGuest
+  ui.quitButton.textContent = asGuest ? 'Leave game' : 'Save and quit to games'
+  showInvite()
   ui.library.hidden = true
   ui.player.hidden = false
   document.body.classList.add('playing')
@@ -353,11 +390,189 @@ ui.ffButton.addEventListener('click', () => {
 window.addEventListener('popstate', () => void quit('history back'))
 if (history.state?.player) history.replaceState(null, '')
 
+// ------------------------------------------------------------ multiplayer: hosting
+
+ui.inviteButton.addEventListener('click', async () => {
+  const current = session
+  if (!current?.emulator || current.room) return
+  ui.inviteButton.disabled = true
+  ui.inviteError.hidden = true
+  try {
+    const video = current.canvas.captureStream(60)
+    for (const track of video.getVideoTracks()) track.contentHint = 'motion'
+    const media = new MediaStream([...video.getTracks(), ...(gameAudioStream()?.getTracks() ?? [])])
+    const room = await HostRoom.open(media, {
+      state: (state) => roomChanged(current, state),
+      input: (mask) => {
+        diffButtons(current.player2, mask, (button, down) => current.emulator?.press(button, down, 2))
+        current.player2 = mask
+      },
+    })
+    if (session !== current || current.quitting) {
+      void room.close()
+      return
+    }
+    current.room = room
+    roomChanged(current, 'waiting')
+  } catch (error) {
+    ui.inviteError.textContent = `Couldn't open a room: ${errorMessage(error)}`
+    ui.inviteError.hidden = false
+  } finally {
+    ui.inviteButton.disabled = false
+  }
+})
+
+function roomChanged(current: Session, state: HostState) {
+  if (session !== current || !current.room) return
+  const previous = current.roomState
+  current.roomState = state
+  showInvite(current.room.code, state)
+  if (ui.menu.open) return
+  if (state === 'connected') toast('Player 2 joined')
+  else if (state === 'waiting' && previous === 'connected') toast('Player 2 left')
+}
+
+function showInvite(code?: string, state?: HostState) {
+  ui.inviteButton.hidden = !!code
+  ui.inviteRoom.hidden = !code
+  ui.inviteCode.textContent = code ?? ''
+  ui.inviteStatus.textContent =
+    state === 'connected' ? 'Player 2 is in. Resume to play!' : state === 'connecting' ? 'Player 2 is connecting…' : 'Waiting for player 2…'
+  ui.p2Badge.hidden = state !== 'connected'
+  if (!code) ui.inviteError.hidden = true
+}
+
+async function closeRoom(current: Session) {
+  const room = current.room
+  if (!room) return
+  current.room = undefined
+  current.roomState = undefined
+  diffButtons(current.player2, 0, (button, down) => current.emulator?.press(button, down, 2))
+  current.player2 = 0
+  if (session === current) showInvite()
+  await room.close()
+}
+
+ui.inviteShare.addEventListener('click', async () => {
+  const code = session?.room?.code
+  if (!code) return
+  const url = inviteLink(code)
+  try {
+    if (navigator.share) await navigator.share({ title: 'SNES Touch', text: `Play SNES with me! Room ${code}`, url })
+    else {
+      await navigator.clipboard.writeText(url)
+      ui.inviteStatus.textContent = 'Invite link copied'
+    }
+  } catch {
+    // share sheet dismissed
+  }
+})
+
+ui.inviteStop.addEventListener('click', () => {
+  if (session) void closeRoom(session)
+})
+
+// ------------------------------------------------------------ multiplayer: joining
+
+function openJoin(code = '') {
+  ui.joinCode.value = code
+  ui.joinDialog.showModal()
+  if (!code) ui.joinCode.focus()
+}
+
+ui.joinButton.addEventListener('click', () => openJoin())
+ui.joinCancel.addEventListener('click', () => ui.joinDialog.close())
+ui.joinCode.addEventListener('input', () => {
+  ui.joinCode.value = normalizeCode(ui.joinCode.value)
+})
+ui.joinCode.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') ui.joinGo.click()
+})
+ui.joinGo.addEventListener('click', () => {
+  const code = normalizeCode(ui.joinCode.value)
+  if (code.length !== 4) {
+    ui.joinCode.focus()
+    return
+  }
+  ui.joinDialog.close()
+  void joinGame(code)
+})
+
+async function joinGame(code: string) {
+  if (session || guest) return
+  const video = document.createElement('video')
+  video.playsInline = true
+  video.autoplay = true
+  video.muted = true // autoplay rules; the first tap on the pad turns the sound on
+  ui.screen.prepend(video)
+  const current: GuestSession = { code, video }
+  guest = current
+  showPlayer(`Player 2 · room ${code}`, true)
+  setStatus(`Joining room ${code}…`)
+  try {
+    const link = await GuestLink.join(code, {
+      stream: (stream) => {
+        video.srcObject = stream
+        void video.play().catch(() => undefined)
+      },
+      state: (state, reason) => {
+        if (guest !== current) return
+        if (state === 'connecting') setStatus('Connecting to the host…')
+        else if (state === 'connected') {
+          setStatus()
+          toast("You're player 2. Tap the pad for sound.")
+        } else setStatus(reason ?? 'The game ended.', true)
+      },
+    })
+    if (guest !== current) await link.close()
+    else current.link = link
+  } catch (error) {
+    if (guest === current) setStatus(errorMessage(error), true)
+  }
+}
+
+async function leaveGame() {
+  const current = guest
+  if (!current || current.leaving) return
+  current.leaving = true
+  if (ui.menu.open) ui.menu.close()
+  controller.releaseAll()
+  await current.link?.close()
+  current.video.srcObject = null
+  current.video.remove()
+  guest = undefined
+  setStatus()
+  showLibrary()
+  if (history.state?.player) history.back()
+}
+
+function unmuteGuest() {
+  const video = guest?.video
+  if (!video?.muted || !video.srcObject) return
+  video.muted = false
+  void video.play().catch(() => undefined)
+}
+
+// Invite links look like https://…/#join=ABCD
+const invited = /^#join=([a-z0-9]{4})$/i.exec(location.hash)
+if (invited) {
+  history.replaceState(null, '', location.pathname + location.search)
+  openJoin(normalizeCode(invited[1]))
+}
+
 // ------------------------------------------------------------ pause menu
 
 async function openMenu() {
+  if (ui.menu.open) return
+  if (guest) {
+    if (guest.leaving) return
+    controller.releaseAll()
+    ui.menu.showModal()
+    ui.resumeButton.focus()
+    return
+  }
   const current = session
-  if (!current?.emulator || current.quitting || ui.menu.open) return
+  if (!current?.emulator || current.quitting) return
   controller.releaseAll()
   current.emulator.pause()
   ui.menu.showModal()
@@ -442,12 +657,17 @@ ui.hapticsToggle.addEventListener('change', () => {
 })
 
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && session && !ui.menu.open) void openMenu()
+  if (event.key === 'Escape' && (session || guest) && !ui.menu.open) void openMenu()
 })
 
 // Leaving the app: release held buttons, keep the save RAM, and come back paused.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'hidden' || !session?.emulator || session.quitting) return
+  if (document.visibilityState !== 'hidden') return
+  if (guest) {
+    controller.releaseAll()
+    return
+  }
+  if (!session?.emulator || session.quitting) return
   controller.releaseAll()
   void saveSram(session)
   void openMenu()
@@ -459,7 +679,14 @@ window.addEventListener('pagehide', () => {
 // ------------------------------------------------------------ page setup
 
 for (const type of ['pointerdown', 'pointerup', 'touchend', 'keydown']) {
-  document.addEventListener(type, unlockAudio, { capture: true, passive: true })
+  document.addEventListener(
+    type,
+    () => {
+      unlockAudio()
+      unmuteGuest()
+    },
+    { capture: true, passive: true },
+  )
 }
 document.addEventListener('gesturestart', (event) => event.preventDefault()) // iOS pinch zoom
 document.addEventListener('dblclick', (event) => event.preventDefault())
@@ -489,7 +716,21 @@ if ('serviceWorker' in navigator && import.meta.env.PROD) {
 }
 
 if (debug) {
-  Object.assign(window, { snesTouch: { get emulator() { return session?.emulator }, controller, addBundledGames } })
+  Object.assign(window, {
+    snesTouch: {
+      get emulator() {
+        return session?.emulator
+      },
+      get room() {
+        return session?.room
+      },
+      get guest() {
+        return guest
+      },
+      controller,
+      addBundledGames,
+    },
+  })
 }
 
 void renderLibrary().then(addBundledGames)
