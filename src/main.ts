@@ -52,6 +52,7 @@ const ui = {
   inviteError: element('invite-error'),
   inviteRoom: element('invite-room'),
   inviteCode: element('invite-code'),
+  inviteLink: element('invite-link'),
   inviteStatus: element('invite-status'),
   inviteShare: element<HTMLButtonElement>('invite-share'),
   inviteStop: element<HTMLButtonElement>('invite-stop'),
@@ -436,6 +437,7 @@ function showInvite(code?: string, state?: HostState) {
   ui.inviteButton.hidden = !!code
   ui.inviteRoom.hidden = !code
   ui.inviteCode.textContent = code ?? ''
+  ui.inviteLink.textContent = code ? inviteLink(code).replace(/^https?:\/\//, '') : ''
   ui.inviteStatus.textContent =
     state === 'connected' ? 'Player 2 is in. Resume to play!' : state === 'connecting' ? 'Player 2 is connecting…' : 'Waiting for player 2…'
   ui.p2Badge.hidden = state !== 'connected'
@@ -458,7 +460,8 @@ ui.inviteShare.addEventListener('click', async () => {
   if (!code) return
   const url = inviteLink(code)
   try {
-    if (navigator.share) await navigator.share({ title: 'SNES Touch', text: `Play SNES with me! Room ${code}`, url })
+    // only the link: with extra text, some apps (and the share sheet's Copy) drop the URL
+    if (navigator.share) await navigator.share({ title: 'Join my SNES Touch game', url })
     else {
       await navigator.clipboard.writeText(url)
       ui.inviteStatus.textContent = 'Invite link copied'

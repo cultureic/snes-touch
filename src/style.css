@@ -923,6 +923,16 @@ body.is-dropping::after {
   user-select: all;
 }
 
+.invite-link {
+  margin: 0;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
 .code-input {
   padding: 12px;
   background: var(--surface-2);
