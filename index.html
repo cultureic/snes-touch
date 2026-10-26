@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#111017" />
+    <meta name="description" content="Play Super NES games in the browser with a multi-touch game controller." />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="SNES Touch" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>SNES Touch</title>
+  </head>
+  <body>
+    <main id="library" class="library">
+      <header class="brand">
+        <img class="brand-mark" src="/icon.svg" alt="" width="48" height="48" />
+        <div>
+          <h1>SNES Touch</h1>
+          <p>Super NES in your browser, with a real multi-touch pad.</p>
+        </div>
+      </header>
+
+      <section class="hero">
+        <label class="btn btn-primary" for="rom-input">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Load ROMs
+        </label>
+        <input id="rom-input" class="visually-hidden" type="file" multiple />
+        <button id="test-button" class="btn btn-secondary" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10-6.5z" /></svg>
+          Controller test
+        </button>
+        <p class="hero-note">
+          Pick one or many: .sfc, .smc, .fig or .zip. Games stay on this device; nothing is uploaded.
+        </p>
+      </section>
+
+      <section class="games">
+        <h2>Your games</h2>
+        <ul id="games" class="game-list"></ul>
+        <p id="games-empty" class="games-empty">Games you load show up here, with your saves.</p>
+      </section>
+
+      <section id="ios-tip" class="tip" hidden>
+        <strong>Play full screen:</strong> tap
+        <svg class="tip-icon" viewBox="0 0 24 24" aria-label="Share"><path d="M12 15V3m0 0L8 7m4-4 4 4M6 11H5v10h14V11h-1" /></svg>
+        Share, then <em>Add to Home Screen</em>. It also keeps your saves from being cleared.
+      </section>
+      <button id="install-button" class="btn btn-secondary install" type="button" hidden>Install app</button>
+
+      <footer class="credits">
+        <p>
+          Emulation by snes9x via RetroArch and
+          <a href="https://nostalgist.js.org/" target="_blank" rel="noreferrer">Nostalgist.js</a>.
+          Keyboard: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select.
+        </p>
+        <p>Only play games you own.</p>
+      </footer>
+    </main>
+
+    <section id="player" class="player" hidden>
+      <div class="stage">
+        <div id="screen" class="screen">
+          <div id="status" class="status" hidden>
+            <div class="spinner" aria-hidden="true"></div>
+            <p id="status-text" role="status"></p>
+            <button id="status-back" class="btn btn-secondary" type="button" hidden>Back to games</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button id="menu-button" class="icon-btn" type="button" aria-label="Pause menu">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+        </button>
+        <span id="game-title" class="game-title"></span>
+        <button id="ff-button" class="icon-btn" type="button" aria-label="Fast forward" aria-pressed="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6v12l8.5-6zM12.5 6v12L21 12z" /></svg>
+        </button>
+      </div>
+
+      <div id="pad" class="pad" aria-hidden="true">
+        <div class="shoulder shoulder-l" data-btn="l">L</div>
+        <div class="shoulder shoulder-r" data-btn="r">R</div>
+        <div class="dpad">
+          <div class="dpad-arm dpad-up" data-btn="up"></div>
+          <div class="dpad-arm dpad-left" data-btn="left"></div>
+          <div class="dpad-hub"></div>
+          <div class="dpad-arm dpad-right" data-btn="right"></div>
+          <div class="dpad-arm dpad-down" data-btn="down"></div>
+        </div>
+        <div class="face">
+          <div class="face-btn face-x" data-btn="x">X</div>
+          <div class="face-btn face-y" data-btn="y">Y</div>
+          <div class="face-btn face-a" data-btn="a">A</div>
+          <div class="face-btn face-b" data-btn="b">B</div>
+        </div>
+        <div class="meta-btn meta-select" data-btn="select"><span class="pill"></span>SELECT</div>
+        <div class="meta-btn meta-start" data-btn="start"><span class="pill"></span>START</div>
+      </div>
+    </section>
+
+    <dialog id="menu" class="menu">
+      <h2 id="menu-title" class="menu-title">Paused</h2>
+      <button id="resume-button" class="btn btn-primary" type="button">Resume</button>
+      <div class="menu-row">
+        <button id="save-button" class="btn btn-secondary" type="button">Save state</button>
+        <button id="load-button" class="btn btn-secondary" type="button">Load state</button>
+      </div>
+      <p id="save-info" class="menu-note"></p>
+      <div class="menu-row">
+        <button id="reset-button" class="btn btn-secondary" type="button">Restart game</button>
+        <button id="fullscreen-button" class="btn btn-secondary" type="button">Full screen</button>
+      </div>
+      <label class="switch-row">
+        <span>Vibrate on press</span>
+        <input id="haptics-toggle" class="switch" type="checkbox" />
+      </label>
+      <button id="quit-button" class="btn btn-quiet" type="button">Save and quit to games</button>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
