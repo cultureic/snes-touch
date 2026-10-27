@@ -162,6 +162,7 @@ export class Emulator {
         video_font_enable: false, // the app shows its own messages
         video_gpu_screenshot: false, // native-resolution screenshots and thumbnails
         pause_nonactive: false, // the app pauses on its own when it is backgrounded
+        input_joypad_driver: 'null', // the app reads gamepads itself (gamepads.ts), the same way for every system
         fastforward_ratio: 3,
         ...Object.fromEntries(Object.entries(PLAYER_2_KEYS).map(([button, key]) => [`input_player2_${button}`, key])),
       },

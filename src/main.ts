@@ -2,6 +2,8 @@ import './style.css'
 import { gameAudioStream, trackAudioContexts, unlockAudio } from './audio'
 import { type Button, TouchController } from './controller'
 import { coreFor, Emulator, loadCore, onCoreProgress } from './emulator'
+import { Gamepads } from './gamepads'
+import { UsbPads } from './usbpads'
 import { setHapticsEnabled } from './haptics'
 import {
   diffButtons,
@@ -38,6 +40,7 @@ const ui = {
   romInput: element<HTMLInputElement>('rom-input'),
   testButton: element<HTMLButtonElement>('test-button'),
   joinButton: element<HTMLButtonElement>('join-button'),
+  usbButton: element<HTMLButtonElement>('usb-button'),
   games: element<HTMLUListElement>('games'),
   gamesEmpty: element('games-empty'),
   iosTip: element('ios-tip'),
@@ -97,6 +100,7 @@ interface Session {
 /** Playing on someone else's game as player 2, 3 or 4, watching their stream. */
 interface GuestSession {
   code: string
+  system?: System
   player?: number
   video: HTMLVideoElement
   link?: GuestLink
@@ -117,6 +121,42 @@ const controller = new TouchController(
     else session?.emulator?.stick(x, y)
   },
 )
+
+// USB and Bluetooth pads: the first one is player 1 (or this guest), the next player 2, and so
+// on. While other people are in the room, only the first pad plays, so seats don't clash.
+const gamepads = new Gamepads({
+  system: () => {
+    if (ui.menu.open) return undefined
+    if (guest) return guest.link && !guest.leaving ? guest.system : undefined
+    return session?.emulator && !session.quitting ? session.system : undefined
+  },
+  press: (player, button, down) => {
+    if (guest) {
+      if (player === 1) guest.link?.press(button, down)
+    } else if (session && (player === 1 || (!session.room && player <= maxPlayers(session.system)))) {
+      session.emulator?.press(button, down, player)
+    }
+  },
+  stick: (player, x, y) => {
+    if (guest) {
+      if (player === 1) guest.link?.stick(x, y)
+    } else if (session && (player === 1 || (!session.room && player <= maxPlayers(session.system)))) {
+      session.emulator?.stick(x, y, player)
+    }
+  },
+  menu: () => void openMenu(),
+})
+
+// Xbox One pads that the system has no driver for (third-party ones on a Mac) work over WebUSB
+// once picked here; Chrome remembers the choice for later visits.
+ui.usbButton.hidden = !UsbPads.supported || /iPad|iPhone|iPod|Android/.test(navigator.userAgent)
+ui.usbButton.addEventListener('click', async () => {
+  try {
+    toast(`${await gamepads.usb.request()} connected`)
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === 'NotFoundError')) toast(`Couldn't connect: ${errorMessage(error)}`) // NotFoundError: chooser closed
+  }
+})
 
 // ------------------------------------------------------------ library
 
@@ -581,6 +621,7 @@ async function joinGame(code: string) {
       seated: (system, player) => {
         if (guest !== current) return
         current.player = player
+        current.system = system
         controller.use(system)
         ui.title.textContent = ui.menuTitle.textContent = `Player ${player} · room ${code}`
       },

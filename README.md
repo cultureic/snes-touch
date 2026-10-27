@@ -11,6 +11,8 @@ A Super NES and Nintendo 64 emulator for the browser with a multi-touch game con
 
 - **Multiplayer:** 2 players for SNES games, up to 4 for N64. The host opens the pause menu and taps **Invite player 2** (**Invite players** on N64), which copies the invite link (`/#join=ABCD`) to send to friends. Opening the link joins the game straight away as the next free player; a guest can also type the room code into **Join a game**. The host streams the screen and sound to each guest over WebRTC, and each guest's pad (stick included) comes back over a data channel. Guests don't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
 
+USB and Bluetooth controllers work through the browser's Gamepad API (`src/gamepads.ts`): the first pad is player 1, the next player 2, and so on (only the first one while friends are in the room). Buttons go by position. SNES: bottom = B, right = A, left = Y, top = X, bumpers or triggers = L/R, Back = Select, left stick or d-pad = d-pad. N64: left stick = stick, bottom = A, left (or right) = B, triggers = Z, bumpers = L/R, right stick = C buttons. Home, or Back + Start, opens the menu. Wired Xbox One/Series controllers that the system has no driver for (third-party ones like the Hyperkin X91 on a Mac) work in Chrome and Edge through **Connect USB controller**, which reads them over WebUSB (`src/usbpads.ts`); Chrome remembers the choice. Steam takes Xbox-style controllers for itself while it runs, so quit it first.
+
 Keyboard also works. SNES: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select. N64: arrows = stick, X/Z = A/B, A = Z, Q/W = L/R, I/J/K/L = C buttons, Enter = Start. Esc opens the menu.
 
 ## Develop
