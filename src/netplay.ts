@@ -10,8 +10,9 @@ import type { Button } from './controller'
 const BUTTON_BITS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'select', 'start']
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no 0/O or 1/I
 const STUN: RTCIceServer[] = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }]
+const OPEN_TIMEOUT = 10_000
 const HELLO_EVERY = 1500
-const HELLO_TRIES = 5
+const HELLO_TRIES = 20 // 30 s: a host on a phone may still be in another app, sending the invite
 const INPUT_EVERY = 50 // ms; pad state is resent so a lost packet costs at most this much
 const DISCONNECT_GRACE = 8000
 
@@ -24,6 +25,10 @@ type Outgoing = Signal extends infer S ? (S extends Signal ? Omit<S, 'from'> : n
 
 export function normalizeCode(raw: string) {
   return raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4)
+}
+
+export function newRoomCode() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(4)), (n) => CODE_LETTERS[n % CODE_LETTERS.length]).join('')
 }
 
 export const inviteLink = (code: string) => `${location.origin}/#join=${code}`
@@ -66,11 +71,19 @@ class Signaling {
     })
   }
 
+  // A dropped socket reconnects and rejoins by itself, so errors only count once time is up.
   open() {
     return new Promise<void>((resolve, reject) => {
+      let lastError: unknown
+      const giveUp = window.setTimeout(() => {
+        void this.close()
+        reject(new Error('the matchmaking server is unreachable', { cause: lastError }))
+      }, OPEN_TIMEOUT)
       this.channel.subscribe((status, error) => {
-        if (status === 'SUBSCRIBED') resolve()
-        else if (status !== 'CLOSED') reject(error ?? new Error(`the matchmaking server is unreachable (${status})`))
+        if (status === 'SUBSCRIBED') {
+          window.clearTimeout(giveUp)
+          resolve()
+        } else if (error) lastError = error
       })
     })
   }
@@ -125,8 +138,7 @@ export class HostRoom {
     private readonly events: HostEvents,
   ) {}
 
-  static async open(media: MediaStream, events: HostEvents) {
-    const code = Array.from(crypto.getRandomValues(new Uint8Array(4)), (n) => CODE_LETTERS[n % CODE_LETTERS.length]).join('')
+  static async open(code: string, media: MediaStream, events: HostEvents) {
     const room = new HostRoom(code, media, events)
     room.signaling = new Signaling(code, (signal) => void room.handle(signal))
     await room.signaling.open()

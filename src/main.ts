@@ -3,7 +3,7 @@ import { gameAudioStream, trackAudioContexts, unlockAudio } from './audio'
 import { TouchController } from './controller'
 import { Emulator, loadCore, onCoreProgress } from './emulator'
 import { setHapticsEnabled } from './haptics'
-import { diffButtons, GuestLink, HostRoom, type HostState, inviteLink, normalizeCode } from './netplay'
+import { diffButtons, GuestLink, HostRoom, type HostState, inviteLink, newRoomCode, normalizeCode } from './netplay'
 import { readRoms, romId } from './rom'
 import * as db from './storage'
 
@@ -387,8 +387,11 @@ ui.ffButton.addEventListener('click', () => {
   if (on !== undefined) ui.ffButton.setAttribute('aria-pressed', String(on))
 })
 
-// The system back gesture leaves the game (it is saved on the way out).
-window.addEventListener('popstate', () => void quit('history back'))
+// The system back gesture leaves the game (it is saved on the way out). An invite link opened
+// in this tab also lands here; followInvite handles that one.
+window.addEventListener('popstate', () => {
+  if (!/^#join=/i.test(location.hash)) void quit('history back')
+})
 if (history.state?.player) history.replaceState(null, '')
 
 // ------------------------------------------------------------ multiplayer: hosting
@@ -398,11 +401,15 @@ ui.inviteButton.addEventListener('click', async () => {
   if (!current?.emulator || current.room) return
   ui.inviteButton.disabled = true
   ui.inviteError.hidden = true
+  // Copy the link before the room is open: browsers only allow clipboard writes during the
+  // tap itself, and opening the room takes a moment.
+  const code = newRoomCode()
+  const copied = copyText(inviteLink(code))
   try {
     const video = current.canvas.captureStream(60)
     for (const track of video.getVideoTracks()) track.contentHint = 'motion'
     const media = new MediaStream([...video.getTracks(), ...(gameAudioStream()?.getTracks() ?? [])])
-    const room = await HostRoom.open(media, {
+    const room = await HostRoom.open(code, media, {
       state: (state) => roomChanged(current, state),
       input: (mask) => {
         diffButtons(current.player2, mask, (button, down) => current.emulator?.press(button, down, 2))
@@ -415,6 +422,7 @@ ui.inviteButton.addEventListener('click', async () => {
     }
     current.room = room
     roomChanged(current, 'waiting')
+    if (await copied) ui.inviteStatus.textContent = 'Invite link copied. Send it to player 2.'
   } catch (error) {
     ui.inviteError.textContent = `Couldn't open a room: ${errorMessage(error)}`
     ui.inviteError.hidden = false
@@ -462,13 +470,15 @@ ui.inviteShare.addEventListener('click', async () => {
   try {
     // only the link: with extra text, some apps (and the share sheet's Copy) drop the URL
     if (navigator.share) await navigator.share({ title: 'Join my SNES Touch game', url })
-    else {
-      await navigator.clipboard.writeText(url)
-      ui.inviteStatus.textContent = 'Invite link copied'
-    }
+    else if (await copyText(url)) ui.inviteStatus.textContent = 'Invite link copied'
   } catch {
     // share sheet dismissed
   }
+})
+
+ui.inviteLink.addEventListener('click', async () => {
+  const code = session?.room?.code
+  if (code && (await copyText(inviteLink(code)))) ui.inviteStatus.textContent = 'Invite link copied'
 })
 
 ui.inviteStop.addEventListener('click', () => {
@@ -477,10 +487,10 @@ ui.inviteStop.addEventListener('click', () => {
 
 // ------------------------------------------------------------ multiplayer: joining
 
-function openJoin(code = '') {
-  ui.joinCode.value = code
+function openJoin() {
+  ui.joinCode.value = ''
   ui.joinDialog.showModal()
-  if (!code) ui.joinCode.focus()
+  ui.joinCode.focus()
 }
 
 ui.joinButton.addEventListener('click', () => openJoin())
@@ -556,12 +566,19 @@ function unmuteGuest() {
   void video.play().catch(() => undefined)
 }
 
-// Invite links look like https://…/#join=ABCD
-const invited = /^#join=([a-z0-9]{4})$/i.exec(location.hash)
-if (invited) {
+// Invite links look like https://…/#join=ABCD and go straight into the game. An installed app
+// that is already open gets them as a hash change instead of a fresh load.
+async function followInvite() {
+  const invited = /^#join=([a-z0-9]{4})$/i.exec(location.hash)
+  if (!invited) return
   history.replaceState(null, '', location.pathname + location.search)
-  openJoin(normalizeCode(invited[1]))
+  const code = normalizeCode(invited[1])
+  if (session) return toast(`Quit this game to join room ${code}`)
+  await leaveGame() // already player 2 in another room
+  void joinGame(code)
 }
+void followInvite()
+window.addEventListener('hashchange', () => void followInvite())
 
 // ------------------------------------------------------------ pause menu
 
@@ -763,6 +780,38 @@ function writeSetting(key: string, value: string) {
     localStorage.setItem(key, value)
   } catch {
     // private browsing: the setting lasts for this visit only
+  }
+}
+
+/** Resolves to whether it worked. Call it before any await: browsers only allow it during a tap. */
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // plain-http pages and in-app browsers that block the clipboard API still allow the old way
+    return legacyCopy(text)
+  }
+}
+
+function legacyCopy(text: string) {
+  const focused = document.activeElement
+  const field = document.createElement('textarea')
+  field.value = text
+  field.readOnly = true
+  field.className = 'visually-hidden'
+  // a modal dialog makes the rest of the page inert, so the field has to go inside it
+  const host = document.querySelector('dialog[open]') ?? document.body
+  host.append(field)
+  field.select()
+  field.setSelectionRange(0, text.length) // iOS
+  try {
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    field.remove()
+    if (focused instanceof HTMLElement) focused.focus()
   }
 }
 

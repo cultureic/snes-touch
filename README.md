@@ -8,7 +8,7 @@ A Super NES emulator for the browser with a multi-touch game controller, built f
 - **Saves:** ROMs, battery saves (polled every 15 s and when the app is backgrounded), a manual save-state slot and an auto-resume state (every 60 s and on quit) live in IndexedDB on the device.
 - **PWA:** installable, full screen from the home screen, works offline after the first visit.
 
-- **Two players:** the host opens the pause menu, taps **Invite player 2**, and shares the room code or link (`/#join=ABCD`). The guest joins from **Join a game** and plays as player 2 on the host's game: the host streams the screen and sound over WebRTC, and the guest's pad comes back over a data channel. The guest doesn't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
+- **Two players:** the host opens the pause menu, taps **Invite player 2**, which copies the invite link (`/#join=ABCD`) to send to a friend. Opening the link joins the game straight away; the guest can also type the room code into **Join a game**. They play as player 2 on the host's game: the host streams the screen and sound over WebRTC, and the guest's pad comes back over a data channel. The guest doesn't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
 
 Keyboard also works: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select, Esc = menu.
 

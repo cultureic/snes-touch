@@ -136,7 +136,8 @@ svg {
 .btn:focus-visible,
 .icon-btn:focus-visible,
 .game-play:focus-visible,
-.game-remove:focus-visible {
+.game-remove:focus-visible,
+.invite-link:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -925,12 +926,14 @@ body.is-dropping::after {
 
 .invite-link {
   margin: 0;
+  padding: 4px 0;
+  border: 0;
+  background: none;
   color: var(--accent);
   font-size: 13px;
   font-weight: 600;
   word-break: break-all;
-  -webkit-user-select: all;
-  user-select: all;
+  cursor: pointer;
 }
 
 .code-input {
