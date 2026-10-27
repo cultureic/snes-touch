@@ -7,7 +7,7 @@
       content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
     />
     <meta name="theme-color" content="#111017" />
-    <meta name="description" content="Play Super NES games in the browser with a multi-touch game controller." />
+    <meta name="description" content="Play Super NES and Nintendo 64 games in the browser with a multi-touch game controller." />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -23,7 +23,7 @@
         <img class="brand-mark" src="/icon.svg" alt="" width="48" height="48" />
         <div>
           <h1>SNES Touch</h1>
-          <p>Super NES in your browser, with a real multi-touch pad.</p>
+          <p>Super NES and N64 in your browser, with a real multi-touch pad.</p>
         </div>
       </header>
 
@@ -42,7 +42,7 @@
           Join a game
         </button>
         <p class="hero-note">
-          Pick one or many: .sfc, .smc, .fig or .zip. Games stay on this device; nothing is uploaded.
+          Pick one or many: SNES (.sfc, .smc, .fig), N64 (.z64, .n64, .v64) or .zip. Games stay on this device; nothing is uploaded.
         </p>
       </section>
 
@@ -92,23 +92,40 @@
       </div>
 
       <div id="pad" class="pad" aria-hidden="true">
-        <div class="shoulder shoulder-l" data-btn="l">L</div>
-        <div class="shoulder shoulder-r" data-btn="r">R</div>
-        <div class="dpad">
-          <div class="dpad-arm dpad-up" data-btn="up"></div>
-          <div class="dpad-arm dpad-left" data-btn="left"></div>
-          <div class="dpad-hub"></div>
-          <div class="dpad-arm dpad-right" data-btn="right"></div>
-          <div class="dpad-arm dpad-down" data-btn="down"></div>
+        <div class="pad-layout" data-layout="snes">
+          <div class="shoulder shoulder-l" data-btn="l">L</div>
+          <div class="shoulder shoulder-r" data-btn="r">R</div>
+          <div class="dpad">
+            <div class="dpad-arm dpad-up" data-btn="up"></div>
+            <div class="dpad-arm dpad-left" data-btn="left"></div>
+            <div class="dpad-hub"></div>
+            <div class="dpad-arm dpad-right" data-btn="right"></div>
+            <div class="dpad-arm dpad-down" data-btn="down"></div>
+          </div>
+          <div class="face">
+            <div class="face-btn face-x" data-btn="x">X</div>
+            <div class="face-btn face-y" data-btn="y">Y</div>
+            <div class="face-btn face-a" data-btn="a">A</div>
+            <div class="face-btn face-b" data-btn="b">B</div>
+          </div>
+          <div class="meta-btn meta-select" data-btn="select"><span class="pill"></span>SELECT</div>
+          <div class="meta-btn meta-start" data-btn="start"><span class="pill"></span>START</div>
         </div>
-        <div class="face">
-          <div class="face-btn face-x" data-btn="x">X</div>
-          <div class="face-btn face-y" data-btn="y">Y</div>
-          <div class="face-btn face-a" data-btn="a">A</div>
-          <div class="face-btn face-b" data-btn="b">B</div>
+        <div class="pad-layout" data-layout="n64" hidden>
+          <div class="shoulder shoulder-l" data-btn="z">Z</div>
+          <div class="shoulder shoulder-mini" data-btn="l">L</div>
+          <div class="shoulder shoulder-r" data-btn="r">R</div>
+          <div class="stick"><div class="stick-knob"></div></div>
+          <div class="face face-n64">
+            <div class="face-btn n64-b" data-btn="b">B</div>
+            <div class="face-btn n64-a" data-btn="a">A</div>
+            <div class="face-btn n64-c n64-cu" data-btn="cu"></div>
+            <div class="face-btn n64-c n64-cl" data-btn="cl"></div>
+            <div class="face-btn n64-c n64-cr" data-btn="cr"></div>
+            <div class="face-btn n64-c n64-cd" data-btn="cd"></div>
+          </div>
+          <div class="meta-btn meta-start" data-btn="start"><span class="pill"></span>START</div>
         </div>
-        <div class="meta-btn meta-select" data-btn="select"><span class="pill"></span>SELECT</div>
-        <div class="meta-btn meta-start" data-btn="start"><span class="pill"></span>START</div>
       </div>
     </section>
 
@@ -125,7 +142,7 @@
         <section class="invite">
           <button id="invite-button" class="btn btn-secondary" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21v-1a6 6 0 0 1 12 0v1M19 8v6M16 11h6" /></svg>
-            Invite player 2
+            <span id="invite-label">Invite player 2</span>
           </button>
           <p id="invite-error" class="menu-note" hidden></p>
           <div id="invite-room" class="invite-room" hidden>
@@ -150,7 +167,7 @@
 
     <dialog id="join-dialog" class="menu">
       <h2 class="menu-title">Join a game</h2>
-      <p class="menu-note">Enter the code from your friend's pause menu. You'll play as player 2 on their game.</p>
+      <p class="menu-note">Enter the code from your friend's pause menu. You'll join their game as the next free player.</p>
       <input
         id="join-code"
         class="code-input"
@@ -162,7 +179,7 @@
         aria-label="Room code"
         placeholder="ABCD"
       />
-      <button id="join-go" class="btn btn-primary" type="button">Join as player 2</button>
+      <button id="join-go" class="btn btn-primary" type="button">Join game</button>
       <button id="join-cancel" class="btn btn-quiet" type="button">Cancel</button>
     </dialog>
 

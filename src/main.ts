@@ -1,11 +1,23 @@
 import './style.css'
 import { gameAudioStream, trackAudioContexts, unlockAudio } from './audio'
-import { TouchController } from './controller'
-import { Emulator, loadCore, onCoreProgress } from './emulator'
+import { type Button, TouchController } from './controller'
+import { coreFor, Emulator, loadCore, onCoreProgress } from './emulator'
 import { setHapticsEnabled } from './haptics'
-import { diffButtons, GuestLink, HostRoom, type HostState, inviteLink, newRoomCode, normalizeCode } from './netplay'
+import {
+  diffButtons,
+  GuestLink,
+  HostRoom,
+  inviteLink,
+  maxPlayers,
+  newRoomCode,
+  NO_INPUT,
+  normalizeCode,
+  type PadState,
+  type Seat,
+} from './netplay'
 import { readRoms, romId } from './rom'
 import * as db from './storage'
+import { type System, systemOf } from './systems'
 
 trackAudioContexts()
 
@@ -49,6 +61,7 @@ const ui = {
   saveInfo: element('save-info'),
   resetButton: element<HTMLButtonElement>('reset-button'),
   inviteButton: element<HTMLButtonElement>('invite-button'),
+  inviteLabel: element('invite-label'),
   inviteError: element('invite-error'),
   inviteRoom: element('invite-room'),
   inviteCode: element('invite-code'),
@@ -66,22 +79,25 @@ const ui = {
   toast: element('toast'),
 }
 
-/** A game running on this device, possibly hosting a room for player 2. */
+/** A game running on this device, possibly hosting a room for other players. */
 interface Session {
   game: db.GameMeta
+  system: System
   canvas: HTMLCanvasElement
   emulator?: Emulator
   timers: number[]
   lastSram?: Uint8Array
   quitting?: boolean
   room?: HostRoom
-  roomState?: HostState
-  player2: number // player 2's pad, as a button mask
+  seats: Seat[]
+  /** each guest's pad, by player number */
+  pads: Map<number, PadState>
 }
 
-/** Playing as player 2 on someone else's game, watching their stream. */
+/** Playing on someone else's game as player 2, 3 or 4, watching their stream. */
 interface GuestSession {
   code: string
+  player?: number
   video: HTMLVideoElement
   link?: GuestLink
   leaving?: boolean
@@ -90,10 +106,17 @@ interface GuestSession {
 let session: Session | undefined
 let guest: GuestSession | undefined
 
-const controller = new TouchController(ui.pad, (button, down) => {
-  if (guest) guest.link?.press(button, down)
-  else session?.emulator?.press(button, down)
-})
+const controller = new TouchController(
+  ui.pad,
+  (button, down) => {
+    if (guest) guest.link?.press(button, down)
+    else session?.emulator?.press(button, down)
+  },
+  (x, y) => {
+    if (guest) guest.link?.stick(x, y)
+    else session?.emulator?.stick(x, y)
+  },
+)
 
 // ------------------------------------------------------------ library
 
@@ -143,7 +166,8 @@ async function renderGame(game: db.GameMeta, urls: string[]) {
   name.textContent = game.name
   const meta = document.createElement('span')
   meta.className = 'game-meta'
-  meta.textContent = `${game.playedAt ? `Played ${timeAgo(game.playedAt)}` : 'Not played yet'} · ${formatSize(game.size)}`
+  const system = systemOf(game.fileName) === 'n64' ? 'N64 · ' : ''
+  meta.textContent = `${system}${game.playedAt ? `Played ${timeAgo(game.playedAt)}` : 'Not played yet'} · ${formatSize(game.size)}`
   text.append(name, meta)
   play.append(art, text)
 
@@ -208,7 +232,7 @@ async function importFiles(files: File[]) {
   const { added, skipped, first } = await addRoms(files)
   await renderLibrary()
   if (first && added === 1 && skipped.length === 0) void play(first.game, first.rom)
-  else if (added === 0) toast(skipped.length === 1 ? skipped[0] : `No SNES ROMs in those ${skipped.length} files`)
+  else if (added === 0) toast(skipped.length === 1 ? skipped[0] : `No ROMs in those ${skipped.length} files`)
   else toast(`Added ${count(added, 'game')}${skipped.length ? `, skipped ${count(skipped.length, 'file')}` : ''}`)
 }
 
@@ -277,17 +301,20 @@ async function play(game: db.GameMeta, rom: Uint8Array) {
   if (session || guest) return
   const canvas = document.createElement('canvas')
   ui.screen.prepend(canvas)
-  const current: Session = { game, canvas, timers: [], player2: 0 }
+  const system = systemOf(game.fileName)
+  const current: Session = { game, system, canvas, timers: [], seats: [], pads: new Map() }
   session = current
+  controller.use(system)
   showPlayer(game.name)
   setStatus('Loading emulator…')
   const stopProgress = onCoreProgress((fraction) => setStatus(`Downloading emulator… ${Math.round(fraction * 100)}%`))
   try {
-    const [sram, autosave] = await Promise.all([db.getSram(game.id), db.getState(game.id, 'auto'), loadCore()])
+    const [sram, autosave] = await Promise.all([db.getSram(game.id), db.getState(game.id, 'auto'), loadCore(coreFor(system))])
     stopProgress()
     if (session !== current) return
     setStatus('Starting game…')
     const emulator = await Emulator.launch({
+      system,
       canvas,
       fileName: game.fileName,
       rom,
@@ -360,7 +387,7 @@ function showPlayer(title: string, asGuest = false) {
   ui.ffButton.hidden = asGuest
   ui.hostTools.hidden = asGuest
   ui.quitButton.textContent = asGuest ? 'Leave game' : 'Save and quit to games'
-  showInvite()
+  showInvite(session)
   ui.library.hidden = true
   ui.player.hidden = false
   document.body.classList.add('playing')
@@ -409,20 +436,20 @@ ui.inviteButton.addEventListener('click', async () => {
     const video = current.canvas.captureStream(60)
     for (const track of video.getVideoTracks()) track.contentHint = 'motion'
     const media = new MediaStream([...video.getTracks(), ...(gameAudioStream()?.getTracks() ?? [])])
-    const room = await HostRoom.open(code, media, {
-      state: (state) => roomChanged(current, state),
-      input: (mask) => {
-        diffButtons(current.player2, mask, (button, down) => current.emulator?.press(button, down, 2))
-        current.player2 = mask
-      },
+    const room = await HostRoom.open(code, media, current.system, {
+      seats: (seats) => seatsChanged(current, seats),
+      input: (player, pad) => setPad(current, player, pad),
     })
     if (session !== current || current.quitting) {
       void room.close()
       return
     }
     current.room = room
-    roomChanged(current, 'waiting')
-    if (await copied) ui.inviteStatus.textContent = 'Invite link copied. Send it to player 2.'
+    seatsChanged(current, [])
+    if (await copied) {
+      const friends = maxPlayers(current.system) - 1
+      ui.inviteStatus.textContent = `Invite link copied. Send it to ${friends === 1 ? 'player 2' : `up to ${friends} friends`}.`
+    }
   } catch (error) {
     ui.inviteError.textContent = `Couldn't open a room: ${errorMessage(error)}`
     ui.inviteError.hidden = false
@@ -431,36 +458,62 @@ ui.inviteButton.addEventListener('click', async () => {
   }
 })
 
-function roomChanged(current: Session, state: HostState) {
+function seatsChanged(current: Session, seats: Seat[]) {
   if (session !== current || !current.room) return
-  const previous = current.roomState
-  current.roomState = state
-  showInvite(current.room.code, state)
+  const wasIn = new Set(current.seats.filter(({ state }) => state === 'connected').map(({ player }) => player))
+  const isIn = new Set(seats.filter(({ state }) => state === 'connected').map(({ player }) => player))
+  current.seats = seats
+  showInvite(current)
   if (ui.menu.open) return
-  if (state === 'connected') toast('Player 2 joined')
-  else if (state === 'waiting' && previous === 'connected') toast('Player 2 left')
+  const joined = [...isIn].filter((player) => !wasIn.has(player))
+  const left = [...wasIn].filter((player) => !isIn.has(player))
+  if (joined.length) toast(`${players(joined)} joined`)
+  else if (left.length) toast(`${players(left)} left`)
 }
 
-function showInvite(code?: string, state?: HostState) {
+function showInvite(current?: Session) {
+  const code = current?.room?.code
+  const seats = current?.seats ?? []
+  const room = current ? maxPlayers(current.system) : 2
+  ui.inviteLabel.textContent = room > 2 ? 'Invite players' : 'Invite player 2'
   ui.inviteButton.hidden = !!code
   ui.inviteRoom.hidden = !code
   ui.inviteCode.textContent = code ?? ''
   ui.inviteLink.textContent = code ? inviteLink(code).replace(/^https?:\/\//, '') : ''
-  ui.inviteStatus.textContent =
-    state === 'connected' ? 'Player 2 is in. Resume to play!' : state === 'connecting' ? 'Player 2 is connecting…' : 'Waiting for player 2…'
-  ui.p2Badge.hidden = state !== 'connected'
+  const isIn = seats.filter(({ state }) => state === 'connected').map(({ player }) => player)
+  const arriving = seats.filter(({ state }) => state === 'connecting').map(({ player }) => player)
+  const status = []
+  if (isIn.length) status.push(`${players(isIn)} ${isIn.length === 1 ? 'is' : 'are'} in. Resume to play!`)
+  if (arriving.length) status.push(`${players(arriving)} ${arriving.length === 1 ? 'is' : 'are'} connecting…`)
+  if (seats.length < room - 1) status.push(seats.length ? 'Room for more.' : room > 2 ? 'Waiting for players…' : 'Waiting for player 2…')
+  ui.inviteStatus.textContent = status.join(' ')
+  ui.p2Badge.hidden = isIn.length === 0
+  ui.p2Badge.textContent = `${isIn.length + 1}P`
   if (!code) ui.inviteError.hidden = true
+}
+
+/** "Player 2", "Players 2 and 3", "Players 2, 3 and 4" */
+function players(numbers: number[]) {
+  if (numbers.length === 1) return `Player ${numbers[0]}`
+  return `Players ${numbers.slice(0, -1).join(', ')} and ${numbers[numbers.length - 1]}`
 }
 
 async function closeRoom(current: Session) {
   const room = current.room
   if (!room) return
   current.room = undefined
-  current.roomState = undefined
-  diffButtons(current.player2, 0, (button, down) => current.emulator?.press(button, down, 2))
-  current.player2 = 0
-  if (session === current) showInvite()
+  current.seats = []
+  for (const player of current.pads.keys()) setPad(current, player, NO_INPUT)
+  if (session === current) showInvite(current)
   await room.close()
+}
+
+function setPad(current: Session, player: number, pad: PadState) {
+  const { emulator } = current
+  const previous = current.pads.get(player) ?? NO_INPUT
+  diffButtons(previous.mask, pad.mask, (button, down) => emulator?.press(button, down, player))
+  if (pad.x !== previous.x || pad.y !== previous.y) emulator?.stick(pad.x, pad.y, player)
+  current.pads.set(player, pad)
 }
 
 ui.inviteShare.addEventListener('click', async () => {
@@ -520,10 +573,17 @@ async function joinGame(code: string) {
   ui.screen.prepend(video)
   const current: GuestSession = { code, video }
   guest = current
-  showPlayer(`Player 2 · room ${code}`, true)
+  controller.use('snes') // until the host says which system it runs
+  showPlayer(`Room ${code}`, true)
   setStatus(`Joining room ${code}…`)
   try {
     const link = await GuestLink.join(code, {
+      seated: (system, player) => {
+        if (guest !== current) return
+        current.player = player
+        controller.use(system)
+        ui.title.textContent = ui.menuTitle.textContent = `Player ${player} · room ${code}`
+      },
       stream: (stream) => {
         video.srcObject = stream
         void video.play().catch(() => undefined)
@@ -533,7 +593,7 @@ async function joinGame(code: string) {
         if (state === 'connecting') setStatus('Connecting to the host…')
         else if (state === 'connected') {
           setStatus()
-          toast("You're player 2. Tap the pad for sound.")
+          toast(`You're player ${current.player ?? 2}. Tap the pad for sound.`)
         } else setStatus(reason ?? 'The game ended.', true)
       },
     })
@@ -574,7 +634,7 @@ async function followInvite() {
   history.replaceState(null, '', location.pathname + location.search)
   const code = normalizeCode(invited[1])
   if (session) return toast(`Quit this game to join room ${code}`)
-  await leaveGame() // already player 2 in another room
+  await leaveGame() // already a guest in another room
   void joinGame(code)
 }
 void followInvite()
@@ -680,6 +740,47 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && (session || guest) && !ui.menu.open) void openMenu()
 })
 
+// RetroArch reads the keyboard for SNES games itself; the N64 cores take input from the app,
+// so their keys are mapped here. Arrows steer the stick.
+const N64_KEYS: Record<string, Button> = {
+  KeyX: 'a',
+  KeyZ: 'b',
+  KeyA: 'z',
+  KeyQ: 'l',
+  KeyW: 'r',
+  Enter: 'start',
+  KeyI: 'cu',
+  KeyK: 'cd',
+  KeyJ: 'cl',
+  KeyL: 'cr',
+}
+const ARROWS: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }
+const arrowsHeld = new Set<string>()
+
+function n64Key(event: KeyboardEvent) {
+  const emulator = session?.emulator
+  const down = event.type === 'keydown'
+  // key releases still count while the menu is open, so nothing stays held
+  if (emulator?.system !== 'n64' || (down && ui.menu.open) || event.repeat || event.metaKey || event.ctrlKey) return
+  const button = N64_KEYS[event.code]
+  if (button) emulator.press(button, down)
+  else if (event.code in ARROWS) {
+    if (down) arrowsHeld.add(event.code)
+    else arrowsHeld.delete(event.code)
+    let x = 0
+    let y = 0
+    for (const code of arrowsHeld) {
+      x += ARROWS[code][0]
+      y += ARROWS[code][1]
+    }
+    const length = Math.hypot(x, y) || 1
+    emulator.stick(x / length, y / length)
+  } else return
+  event.preventDefault()
+}
+document.addEventListener('keydown', n64Key)
+document.addEventListener('keyup', n64Key)
+
 // Leaving the app: release held buttons, keep the save RAM, and come back paused.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'hidden') return
@@ -755,7 +856,7 @@ if (debug) {
 
 void renderLibrary().then(addBundledGames)
 // warm the cache so the first game starts faster
-window.setTimeout(() => void loadCore().catch(() => undefined), 1500)
+window.setTimeout(() => void loadCore(coreFor('snes')).catch(() => undefined), 1500)
 
 // ------------------------------------------------------------ helpers
 

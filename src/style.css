@@ -740,6 +740,124 @@ body.is-dropping::after {
   transform: rotate(-24deg) translateY(2px);
 }
 
+/* ------------------------------------------------------------ N64 pad */
+
+.pad-layout {
+  display: contents;
+}
+
+.pad-layout[hidden] {
+  display: none;
+}
+
+.shoulder-mini {
+  left: calc(max(12px, 4cqw) + var(--shoulder) + 10px);
+  width: 56px;
+  border-radius: 12px;
+}
+
+.stick {
+  position: absolute;
+  left: calc(25cqw - var(--dpad) / 2);
+  top: calc(54cqh - var(--dpad) / 2);
+  display: grid;
+  place-items: center;
+  width: var(--dpad);
+  height: var(--dpad);
+  border-radius: 50%;
+  background: radial-gradient(circle, #1b1824 0%, #2a2636 70%, #322d40 100%);
+  box-shadow:
+    inset 0 4px 10px rgb(0 0 0 / 0.55),
+    0 3px 0 rgb(0 0 0 / 0.45);
+}
+
+.stick-knob {
+  width: 46%;
+  height: 46%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 35%, #5a5470, #3a3548 70%);
+  box-shadow:
+    0 5px 10px rgb(0 0 0 / 0.5),
+    inset 0 2px 0 rgb(255 255 255 / 0.15);
+}
+
+.face-n64::before {
+  display: none;
+}
+
+.n64-a,
+.n64-b {
+  width: 34%;
+  height: 34%;
+}
+
+.n64-a {
+  left: 30%;
+  top: 60%;
+  background: var(--btn-x);
+}
+
+.n64-b {
+  left: 0;
+  top: 36%;
+  width: 30%;
+  height: 30%;
+  background: var(--btn-y);
+}
+
+.n64-c {
+  width: 22%;
+  height: 22%;
+  background: var(--btn-b);
+}
+
+/* an arrow pointing the C button's way */
+.n64-c::after {
+  width: 40%;
+  height: 34%;
+  background: rgb(70 48 0 / 0.8);
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+  content: '';
+}
+
+.n64-cu {
+  left: 59%;
+  top: -2%;
+}
+
+.n64-cd {
+  left: 59%;
+  top: 40%;
+}
+
+.n64-cl {
+  left: 38%;
+  top: 19%;
+}
+
+.n64-cr {
+  left: 80%;
+  top: 19%;
+}
+
+.n64-cd::after {
+  rotate: 180deg;
+}
+
+.n64-cl::after {
+  rotate: -90deg;
+}
+
+.n64-cr::after {
+  rotate: 90deg;
+}
+
+@media (orientation: portrait) {
+  [data-layout='n64'] .meta-start {
+    left: calc(50cqw - 32px);
+  }
+}
+
 /* ------------------------------------------------------------ landscape: pad overlays the sides */
 
 @media (orientation: landscape) {
@@ -797,7 +915,8 @@ body.is-dropping::after {
     background: none;
   }
 
-  .dpad {
+  .dpad,
+  .stick {
     left: calc(var(--dpad-x) - var(--dpad) / 2);
     top: calc(58cqh - var(--dpad) / 2);
   }
@@ -819,6 +938,10 @@ body.is-dropping::after {
     right: calc(max(12px, 3cqw) + var(--safe-r));
   }
 
+  .shoulder-mini {
+    left: calc(max(12px, 3cqw) + var(--safe-l) + var(--shoulder) + 10px);
+  }
+
   .meta-btn {
     bottom: max(8px, var(--safe-b));
   }
@@ -832,6 +955,7 @@ body.is-dropping::after {
   }
 
   .dpad,
+  .stick,
   .face,
   .shoulder,
   .meta-btn {

@@ -1,13 +1,16 @@
 import { RealtimeClient, type RealtimeChannel } from '@supabase/realtime-js'
 import { SUPABASE_KEY, SUPABASE_URL } from './config'
 import type { Button } from './controller'
+import type { System } from './systems'
 
-// Two-player rooms. The host runs the emulator and streams its screen and sound over WebRTC;
-// the guest's pad comes back over a data channel as player 2. Supabase Realtime only carries
-// the handshake (offer, answer, ICE candidates); the game itself flows peer to peer, or
-// through a TURN relay when the networks in between don't allow a direct path.
+// Multiplayer rooms: 2 players for SNES games, up to 4 for N64. The host runs the emulator and
+// streams its screen and sound over WebRTC to each guest; each guest's pad comes back over a
+// data channel as player 2, 3 or 4. Supabase Realtime only carries the handshake (offer, answer,
+// ICE candidates); the game itself flows peer to peer, or through a TURN relay when the networks
+// in between don't allow a direct path.
 
-const BUTTON_BITS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'select', 'start']
+const BUTTON_BITS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'select', 'start', 'z', 'cu', 'cd', 'cl', 'cr']
+const STICK_SCALE = 0x7fff
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no 0/O or 1/I
 const STUN: RTCIceServer[] = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }]
 const OPEN_TIMEOUT = 10_000
@@ -19,7 +22,8 @@ const DISCONNECT_GRACE = 8000
 type Signal =
   | { kind: 'hello'; from: string }
   | { kind: 'busy' | 'bye'; from: string; to: string }
-  | { kind: 'offer' | 'answer'; from: string; to: string; sdp: RTCSessionDescriptionInit }
+  | { kind: 'offer'; from: string; to: string; sdp: RTCSessionDescriptionInit; system?: System; player?: number }
+  | { kind: 'answer'; from: string; to: string; sdp: RTCSessionDescriptionInit }
   | { kind: 'ice'; from: string; to: string; candidate: RTCIceCandidateInit }
 type Outgoing = Signal extends infer S ? (S extends Signal ? Omit<S, 'from'> : never) : never
 
@@ -32,6 +36,15 @@ export function newRoomCode() {
 }
 
 export const inviteLink = (code: string) => `${location.origin}/#join=${code}`
+
+/** A guest's pad: buttons as a bit mask, plus the analog stick from -1 to 1 (N64 only). */
+export interface PadState {
+  mask: number
+  x: number
+  y: number
+}
+
+export const NO_INPUT: PadState = { mask: 0, x: 0, y: 0 }
 
 /** Calls `apply` for every button whose state differs between two pad masks. */
 export function diffButtons(previous: number, next: number, apply: (button: Button, down: boolean) => void) {
@@ -120,102 +133,139 @@ class Peer {
   }
 }
 
-export type HostState = 'waiting' | 'connecting' | 'connected'
-
-interface HostEvents {
-  state(state: HostState): void
-  input(mask: number): void
+/** A guest's seat in the room: which player they are, and whether they are in yet. */
+export interface Seat {
+  player: number
+  state: 'connecting' | 'connected'
 }
 
+interface HostEvents {
+  /** Every time a guest arrives, connects or leaves. */
+  seats(seats: Seat[]): void
+  input(player: number, pad: PadState): void
+}
+
+interface Guest {
+  id: string
+  player: number
+  connected: boolean
+  peer?: Peer
+  lastSeq: number
+}
+
+/** How many people can play a system's games, the host included. */
+export const maxPlayers = (system: System) => (system === 'n64' ? 4 : 2)
+
 export class HostRoom {
-  private guest?: { id: string; peer?: Peer }
-  private lastSeq = -1
+  private readonly guests = new Map<string, Guest>()
   private signaling!: Signaling
 
   private constructor(
     readonly code: string,
     private readonly media: MediaStream,
+    private readonly system: System,
     private readonly events: HostEvents,
   ) {}
 
-  static async open(code: string, media: MediaStream, events: HostEvents) {
-    const room = new HostRoom(code, media, events)
+  static async open(code: string, media: MediaStream, system: System, events: HostEvents) {
+    const room = new HostRoom(code, media, system, events)
     room.signaling = new Signaling(code, (signal) => void room.handle(signal))
     await room.signaling.open()
     return room
   }
 
   async close() {
-    if (this.guest) this.signaling.send({ kind: 'bye', to: this.guest.id })
-    this.drop()
+    for (const guest of this.guests.values()) {
+      this.signaling.send({ kind: 'bye', to: guest.id })
+      this.drop(guest)
+    }
     await this.signaling.close()
   }
 
   private async handle(signal: Signal) {
-    const fromGuest = signal.from === this.guest?.id
+    const guest = this.guests.get(signal.from)
     switch (signal.kind) {
-      case 'hello':
-        if (!this.guest) await this.connect(signal.from)
-        else if (!fromGuest) this.signaling.send({ kind: 'busy', to: signal.from })
+      case 'hello': {
+        if (guest) break // a repeated hello while connecting
+        const player = this.freeSeat()
+        if (player) await this.connect(signal.from, player)
+        else this.signaling.send({ kind: 'busy', to: signal.from })
         break
+      }
       case 'answer':
-        if (fromGuest && this.guest?.peer) {
-          await this.guest.peer.describe(signal.sdp)
-          for (const sender of this.guest.peer.pc.getSenders()) if (sender.track?.kind === 'video') void tuneVideo(sender)
+        if (guest?.peer) {
+          await guest.peer.describe(signal.sdp)
+          for (const sender of guest.peer.pc.getSenders()) if (sender.track?.kind === 'video') void tuneVideo(sender)
         }
         break
       case 'ice':
-        if (fromGuest) await this.guest?.peer?.candidate(signal.candidate)
+        await guest?.peer?.candidate(signal.candidate)
         break
       case 'bye':
-        if (fromGuest) this.drop()
+        if (guest) this.drop(guest)
         break
     }
   }
 
-  private async connect(guestId: string) {
-    const guest: { id: string; peer?: Peer } = { id: guestId }
-    this.guest = guest // claim the seat before the await, so a repeated hello is ignored
-    this.events.state('connecting')
+  /** The lowest free player number, or undefined when the room is full. */
+  private freeSeat() {
+    const taken = new Set(Array.from(this.guests.values(), ({ player }) => player))
+    for (let player = 2; player <= maxPlayers(this.system); player++) if (!taken.has(player)) return player
+    return undefined
+  }
+
+  private async connect(guestId: string, player: number) {
+    const guest: Guest = { id: guestId, player, connected: false, lastSeq: -1 }
+    this.guests.set(guestId, guest) // claim the seat before the await, so a repeated hello is ignored
+    this.announce()
     const peer = new Peer(await iceServers())
-    if (this.guest !== guest) return
+    if (this.guests.get(guestId) !== guest) return
     guest.peer = peer
     const { pc } = peer
     for (const track of this.media.getTracks()) pc.addTrack(track, this.media)
     const input = pc.createDataChannel('input', { ordered: false, maxRetransmits: 0 })
     input.binaryType = 'arraybuffer'
-    input.onmessage = ({ data }) => this.receive(data as ArrayBuffer)
+    input.onmessage = ({ data }) => this.receive(guest, data as ArrayBuffer)
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) this.signaling.send({ kind: 'ice', to: guestId, candidate: candidate.toJSON() })
     }
     let grace = 0
     pc.onconnectionstatechange = () => {
-      if (this.guest !== guest) return
+      if (this.guests.get(guestId) !== guest) return
       window.clearTimeout(grace)
-      if (pc.connectionState === 'connected') this.events.state('connected')
-      else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') this.drop()
-      else if (pc.connectionState === 'disconnected') grace = window.setTimeout(() => this.drop(), DISCONNECT_GRACE)
+      if (pc.connectionState === 'connected') {
+        guest.connected = true
+        this.announce()
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') this.drop(guest)
+      else if (pc.connectionState === 'disconnected') grace = window.setTimeout(() => this.drop(guest), DISCONNECT_GRACE)
     }
     await pc.setLocalDescription(await pc.createOffer())
-    if (pc.localDescription) this.signaling.send({ kind: 'offer', to: guestId, sdp: pc.localDescription.toJSON() })
+    if (pc.localDescription) {
+      this.signaling.send({ kind: 'offer', to: guestId, sdp: pc.localDescription.toJSON(), system: this.system, player })
+    }
   }
 
-  private receive(data: ArrayBuffer) {
-    const [seq, mask] = new Uint16Array(data)
+  private receive(guest: Guest, data: ArrayBuffer) {
+    // [sequence, buttons low 16 bits, buttons high 16 bits, stick x, stick y]
+    const [seq, low, high = 0] = new Uint16Array(data)
+    const [, , , x = 0, y = 0] = new Int16Array(data)
     // drop packets older than the last one applied (the 16-bit sequence wraps around)
-    if (this.lastSeq >= 0 && ((seq - this.lastSeq) & 0xffff) >= 0x8000) return
-    this.lastSeq = seq
-    this.events.input(mask)
+    if (guest.lastSeq >= 0 && ((seq - guest.lastSeq) & 0xffff) >= 0x8000) return
+    guest.lastSeq = seq
+    this.events.input(guest.player, { mask: low | (high << 16), x: x / STICK_SCALE, y: y / STICK_SCALE })
   }
 
-  private drop() {
-    const guest = this.guest
-    if (!guest) return
-    this.guest = undefined
-    this.lastSeq = -1
+  private drop(guest: Guest) {
+    if (this.guests.get(guest.id) !== guest) return
+    this.guests.delete(guest.id)
     guest.peer?.pc.close()
-    this.events.input(0)
-    this.events.state('waiting')
+    this.events.input(guest.player, NO_INPUT)
+    this.announce()
+  }
+
+  private announce() {
+    const seats = Array.from(this.guests.values(), ({ player, connected }): Seat => ({ player, state: connected ? 'connected' : 'connecting' }))
+    this.events.seats(seats.sort((a, b) => a.player - b.player))
   }
 }
 
@@ -231,6 +281,8 @@ async function tuneVideo(sender: RTCRtpSender) {
 export type GuestState = 'connecting' | 'connected' | 'ended'
 
 interface GuestEvents {
+  /** The host's system, which decides the pad to show, and which player this guest is. */
+  seated(system: System, player: number): void
   stream(stream: MediaStream): void
   state(state: GuestState, reason?: string): void
 }
@@ -240,6 +292,8 @@ export class GuestLink {
   private peer?: Peer
   private input?: RTCDataChannel
   private mask = 0
+  private stickX = 0
+  private stickY = 0
   private seq = 0
   private resend = 0
   private answered?: (busy: boolean) => void
@@ -248,7 +302,7 @@ export class GuestLink {
 
   private constructor(private readonly events: GuestEvents) {}
 
-  /** Joins a room as player 2; rejects when no host answers or the seat is taken. */
+  /** Joins a room as the next free player; rejects when no host answers or the room is full. */
   static async join(code: string, events: GuestEvents) {
     const link = new GuestLink(events)
     link.signaling = new Signaling(code, (signal) => void link.handle(signal))
@@ -265,6 +319,12 @@ export class GuestLink {
   press(button: Button, down: boolean) {
     const bit = 1 << BUTTON_BITS.indexOf(button)
     this.mask = down ? this.mask | bit : this.mask & ~bit
+    this.send()
+  }
+
+  stick(x: number, y: number) {
+    this.stickX = Math.round(x * STICK_SCALE)
+    this.stickY = Math.round(y * STICK_SCALE)
     this.send()
   }
 
@@ -290,7 +350,7 @@ export class GuestLink {
       }
       this.answered = (busy) => {
         window.clearInterval(timer)
-        if (busy) reject(new Error('That game already has a player 2.'))
+        if (busy) reject(new Error('That game is full.'))
         else resolve()
       }
       hello()
@@ -305,6 +365,8 @@ export class GuestLink {
         if (this.hostId && !fromHost) return
         this.hostId = signal.from
         this.answered?.(false)
+        // hosts from before N64 support say neither
+        this.events.seated(signal.system ?? 'snes', signal.player ?? 2)
         await this.answer(signal.sdp)
         break
       case 'busy':
@@ -349,6 +411,7 @@ export class GuestLink {
   private send() {
     if (this.input?.readyState !== 'open') return
     this.seq = (this.seq + 1) & 0xffff
-    this.input.send(new Uint16Array([this.seq, this.mask]))
+    const packet = new Int16Array([this.seq, this.mask & 0xffff, this.mask >>> 16, this.stickX, this.stickY])
+    this.input.send(packet)
   }
 }

@@ -1,6 +1,5 @@
 import { unzipSync } from 'fflate'
-
-const ROM_FILE = /\.(sfc|smc|fig|swc)$/i
+import { ROM_FILE } from './systems'
 
 export interface Rom {
   name: string
@@ -8,18 +7,18 @@ export interface Rom {
   bytes: Uint8Array
 }
 
-/** Every SNES ROM in the file: the file itself, or each one inside a zip. */
+/** Every SNES or N64 ROM in the file: the file itself, or each one inside a zip. */
 export async function readRoms(file: File): Promise<Rom[]> {
   const data = new Uint8Array(await file.arrayBuffer())
   if (isZip(data)) {
     const entries = Object.entries(unzipSync(data, { filter: (entry) => ROM_FILE.test(entry.name) }))
     const roms = entries.filter(([, bytes]) => bytes.length >= MIN_SIZE).map(([path, bytes]) => toRom(path, bytes))
-    if (roms.length === 0) throw new Error(`${file.name} has no SNES ROM inside.`)
+    if (roms.length === 0) throw new Error(`${file.name} has no SNES or N64 ROM inside.`)
     return roms
   }
   // No `accept` filter on the picker (iOS greys out unknown types), so check here.
-  if (!ROM_FILE.test(file.name)) throw new Error(`${file.name} isn't a SNES ROM (.sfc, .smc, .fig or .zip).`)
-  if (data.length < MIN_SIZE) throw new Error(`${file.name} is too small to be a SNES ROM.`)
+  if (!ROM_FILE.test(file.name)) throw new Error(`${file.name} isn't a SNES or N64 ROM (.sfc, .smc, .fig, .z64, .n64, .v64 or .zip).`)
+  if (data.length < MIN_SIZE) throw new Error(`${file.name} is too small to be a ROM.`)
   return [toRom(file.name, data)]
 }
 

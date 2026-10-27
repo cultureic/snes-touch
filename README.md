@@ -1,16 +1,17 @@
 # SNES Touch
 
-A Super NES emulator for the browser with a multi-touch game controller, built for phones.
+A Super NES and Nintendo 64 emulator for the browser with a multi-touch game controller, built for phones.
 
-- **Emulation:** snes9x (libretro core, WebAssembly) driven by [Nostalgist.js](https://nostalgist.js.org/). The core (~1.2 MB) is fetched from jsDelivr on first use and cached by the service worker.
-- **Touch controller:** D-pad that works like a stick once grabbed (8-way, narrower diagonals, dead zone), ABXY with slide-between and press-two-at-once in the gap between neighbours, L/R, Select/Start, haptic tick on press (Vibration API on Android, the `<input switch>` haptic on iOS 18+). Portrait layout below the screen; landscape overlays the sides.
-- **Loading games:** "Load ROMs" takes one or many files (.sfc, .smc, .fig, .swc or .zip; every SNES ROM inside a zip is added), or drop them on the page on desktop. ROMs never leave the device.
+- **Emulation:** libretro cores (WebAssembly) driven by [Nostalgist.js](https://nostalgist.js.org/). SNES runs on snes9x (~1.2 MB, fetched from jsDelivr). N64 runs on mupen64plus_next, or parallel_n64 on iPhone and iPad, where EmulatorJS also avoids mupen64plus_next; both are [EmulatorJS](https://github.com/EmulatorJS/EmulatorJS) 4.2 builds (GPLv2, sources at [EmulatorJS/mupen64plus-libretro-nx](https://github.com/EmulatorJS/mupen64plus-libretro-nx) and [EmulatorJS/parallel-n64](https://github.com/EmulatorJS/parallel-n64)) served from `public/cores` (~2 MB each). Cores download on first use and the service worker caches them. GameCube isn't supported: no GameCube emulator runs in a browser yet.
+- **N64 pad:** analog stick (full push near the rim, small dead zone), A, B, the four C buttons, Z, L, R and Start.
+- **Touch controller (SNES):** D-pad that works like a stick once grabbed (8-way, narrower diagonals, dead zone), ABXY with slide-between and press-two-at-once in the gap between neighbours, L/R, Select/Start, haptic tick on press (Vibration API on Android, the `<input switch>` haptic on iOS 18+). Portrait layout below the screen; landscape overlays the sides.
+- **Loading games:** "Load ROMs" takes one or many files (SNES .sfc, .smc, .fig, .swc; N64 .z64, .n64, .v64; or .zip, and every ROM inside a zip is added), or drop them on the page on desktop. ROMs never leave the device.
 - **Saves:** ROMs, battery saves (polled every 15 s and when the app is backgrounded), a manual save-state slot and an auto-resume state (every 60 s and on quit) live in IndexedDB on the device.
 - **PWA:** installable, full screen from the home screen, works offline after the first visit.
 
-- **Two players:** the host opens the pause menu, taps **Invite player 2**, which copies the invite link (`/#join=ABCD`) to send to a friend. Opening the link joins the game straight away; the guest can also type the room code into **Join a game**. They play as player 2 on the host's game: the host streams the screen and sound over WebRTC, and the guest's pad comes back over a data channel. The guest doesn't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
+- **Multiplayer:** 2 players for SNES games, up to 4 for N64. The host opens the pause menu and taps **Invite player 2** (**Invite players** on N64), which copies the invite link (`/#join=ABCD`) to send to friends. Opening the link joins the game straight away as the next free player; a guest can also type the room code into **Join a game**. The host streams the screen and sound to each guest over WebRTC, and each guest's pad (stick included) comes back over a data channel. Guests don't need the ROM. Signaling goes through Supabase Realtime (`src/config.ts`); TURN relays come from the `snes-ice` edge function (below).
 
-Keyboard also works: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select, Esc = menu.
+Keyboard also works. SNES: arrows, Z/X = B/A, A/S = Y/X, Q/W = L/R, Enter = Start, Right Shift = Select. N64: arrows = stick, X/Z = A/B, A = Z, Q/W = L/R, I/J/K/L = C buttons, Enter = Start. Esc opens the menu.
 
 ## Develop
 

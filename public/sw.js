@@ -1,4 +1,4 @@
-// Offline support: once visited, the app shell and the emulator core load from cache.
+// Offline support: once visited, the app shell and the emulator cores load from cache.
 const CACHE = 'snes-touch-v1'
 const CORE_HOST = 'cdn.jsdelivr.net' // versioned, immutable emulator core files
 
@@ -19,7 +19,7 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (url.pathname.startsWith('/roms/')) return // bundled ROMs are copied into IndexedDB once
   if (request.mode === 'navigate') event.respondWith(networkFirst(request))
-  else if (url.hostname === CORE_HOST || (url.origin === location.origin && url.pathname.startsWith('/assets/')))
+  else if (url.hostname === CORE_HOST || (url.origin === location.origin && /^\/(assets|cores)\//.test(url.pathname)))
     event.respondWith(cacheFirst(request))
   else if (url.origin === location.origin) event.respondWith(staleWhileRevalidate(event))
 })
