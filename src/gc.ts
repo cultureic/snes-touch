@@ -7,10 +7,12 @@ import type { Machine } from './machine'
 // same-origin frame and the app drives it through the globals it exposes (window.__host).
 // Desktop Chrome only: it needs 1.5 GB of shared memory and 16 threads.
 
-// The README's recommended settings, without metrics, and without its own gamepad polling,
-// which would overwrite the input the app sends.
+// The README's recommended settings, without metrics and without its own gamepad polling (which
+// would overwrite the input the app sends). Block re-dispatch is off: at commit 7e38409 the JIT
+// emits an invalid WebAssembly block with it once warm-up ends ("Compiling function #19 failed"
+// in Need for Speed: Underground 2, stock core as well as ours) and the core stops.
 const PAGE =
-  '/gc/?core=upstream&video=software&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=1&pacing=tick&fastsw=1&nogamepad=1'
+  '/gc/?core=upstream&video=software&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&disable=blockredispatch&oc=1&pacing=tick&fastsw=1&nogamepad=1'
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3
 

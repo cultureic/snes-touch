@@ -816,7 +816,7 @@ function snesTouchWriteUserFiles(fs) {
   snesTouchPendingUserFiles = null;
   if (!files) return;
   for (const [path, data] of Object.entries(files)) {
-    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/")) continue;
+    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/") && !path.startsWith("/dolphin-sys/GC/")) continue;
     let dir = "";
     for (const part of path.split("/").slice(1, -1)) {
       dir += "/" + part;
