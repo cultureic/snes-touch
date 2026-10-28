@@ -1,0 +1,139 @@
+SNES Touch changes to wasm-dolphin (github.com/dougchansan/wasm-dolphin, commit 7e38409), GPLv2+.
+Build: npm run fetch:dolphin && npm run patch:upstream, apply this patch, add '_SetInputStateForPort' after '_SetInputState' in the EXPORTED_FUNCTIONS of vendor/dolphin/Source/Core/Core/CMakeLists.txt, then configure:upstream and build:upstream:full-core (Emscripten 5.0.7).
+The JavaScript changes (src/upstream-worker-adapter.js, src/upstream-discio-worker.js, src/upstream-worker-protocol.js) are marked 'SNES Touch' in the files themselves.
+
+diff --git a/core/upstream/dolphin_web_core.cpp b/core/upstream/dolphin_web_core.cpp
+index 9f07725..c3c28f0 100644
+--- a/core/upstream/dolphin_web_core.cpp
++++ b/core/upstream/dolphin_web_core.cpp
+@@ -29,6 +29,7 @@
+ #include "Core/BootManager.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/HW/SI/SI_Device.h"
+ #include "Core/ConfigLoaders/BaseConfigLoader.h"
+ #include "Core/ConfigManager.h"
+ #include "Core/Core.h"
+@@ -619,6 +620,9 @@ void EnsureRuntime()
+   Config::SetBase(Config::MAIN_OSD_MESSAGES, false);
+   Config::SetBase(Config::MAIN_SLOT_A, ExpansionInterface::EXIDeviceType::MemoryCardFolder);
+   Config::SetBase(Config::MAIN_SLOT_B, ExpansionInterface::EXIDeviceType::None);
++  // SNES Touch: controllers in all four ports, for players 2-4
++  for (int port = 0; port < 4; ++port)
++    Config::SetBase(Config::GetInfoForSIDevice(port), SerialInterface::SIDevices::SIDEVICE_GC_CONTROLLER);
+   Config::SetBase(Config::MAIN_AUDIO_BACKEND, std::string("Web Audio"));
+   Config::SetBase(Config::MAIN_AUDIO_MUTED, false);
+   Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM, s_video_backend == "OGL");
+diff --git a/core/upstream/dolphin_web_discio.cpp b/core/upstream/dolphin_web_discio.cpp
+index be24a6b..dc7bf92 100644
+--- a/core/upstream/dolphin_web_discio.cpp
++++ b/core/upstream/dolphin_web_discio.cpp
+@@ -131,6 +131,8 @@ struct PadPollSnapshot
+ 
+ std::mutex s_input_state_mutex;
+ InputStateSnapshot s_input_state;
++// SNES Touch: controller ports 2-4, set with SetInputStateForPort.
++InputStateSnapshot s_extra_input_states[3];
+ std::mutex s_pad_poll_mutex;
+ PadPollSnapshot s_pad_poll;
+ bool s_using_xfb_frame = false;
+@@ -844,6 +846,30 @@ void SetInputState(std::uint32_t mask, int stick_x, int stick_y, int c_stick_x,
+   s_input_update_count.fetch_add(1, std::memory_order_relaxed);
+ }
+ 
++// SNES Touch: the same state for controller port 2, 3 or 4 (port 1..3 here).
++#ifdef __EMSCRIPTEN__
++EMSCRIPTEN_KEEPALIVE
++#endif
++void SetInputStateForPort(int port, std::uint32_t mask, int stick_x, int stick_y, int c_stick_x,
++                          int c_stick_y, int trigger_left, int trigger_right, int analog_a,
++                          int analog_b)
++{
++  if (port < 1 || port > 3)
++    return;
++  InputStateSnapshot next;
++  next.mask = mask;
++  next.stick_x = ClampPadByte(stick_x);
++  next.stick_y = ClampPadByte(stick_y);
++  next.c_stick_x = ClampPadByte(c_stick_x);
++  next.c_stick_y = ClampPadByte(c_stick_y);
++  next.trigger_left = ClampPadByte(trigger_left);
++  next.trigger_right = ClampPadByte(trigger_right);
++  next.analog_a = ClampPadByte(analog_a);
++  next.analog_b = ClampPadByte(analog_b);
++  const std::lock_guard<std::mutex> lock(s_input_state_mutex);
++  s_extra_input_states[port - 1] = next;
++}
++
+ int SetPresentationScale(float scale)
+ {
+   if (scale < 0.25f || scale > 1.0f)
+@@ -1087,13 +1113,13 @@ const char* GetVideoStats()
+ 
+ int DolphinWeb_GetPadStatus(int pad_num, GCPadStatus* status)
+ {
+-  if (!status || pad_num != 0)
++  if (!status || pad_num < 0 || pad_num > 3)
+     return 0;
+ 
+   InputStateSnapshot input;
+   {
+     const std::lock_guard<std::mutex> lock(s_input_state_mutex);
+-    input = s_input_state;
++    input = pad_num == 0 ? s_input_state : s_extra_input_states[pad_num - 1];
+   }
+ 
+   *status = {};
+diff --git a/tools/configure-upstream-wasm.mjs b/tools/configure-upstream-wasm.mjs
+index a8329a0..b842838 100644
+--- a/tools/configure-upstream-wasm.mjs
++++ b/tools/configure-upstream-wasm.mjs
+@@ -1,6 +1,6 @@
+ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+ import { spawnSync } from "node:child_process";
+-import { dirname, resolve } from "node:path";
++import { delimiter, dirname, resolve } from "node:path";
+ import { sha256File, verifyWasmToolchain } from "./wasm-toolchain.mjs";
+ 
+ const root = process.cwd();
+@@ -78,7 +78,7 @@ const toolchain = verifyWasmToolchain();
+ const { emcc, emcmake, cmake, ninja, cargo, rustc } = toolchain.paths;
+ const nagaEnvironment = {
+   ...process.env,
+-  PATH: `${dirname(rustc)};${dirname(emcc)};${process.env.PATH ?? ""}`,
++  PATH: [dirname(rustc), dirname(emcc), process.env.PATH ?? ""].join(delimiter),
+   RUSTC: rustc,
+   CARGO: cargo
+ };
+diff --git a/tools/wasm-toolchain.mjs b/tools/wasm-toolchain.mjs
+index 0c240e4..d8390b8 100644
+--- a/tools/wasm-toolchain.mjs
++++ b/tools/wasm-toolchain.mjs
+@@ -83,6 +83,27 @@ export function loadWasmToolchainLock() {
+ 
+ export function verifyWasmToolchain() {
+   const lock = loadWasmToolchainLock();
++  // SNES Touch: the lock pins a Windows toolchain; on macOS take the tools from the environment
++  // (same Emscripten version, a current nightly Rust) without the Windows executable hashes.
++  if (process.platform === "darwin") {
++    const env = (name) => {
++      invariant(process.env[name], `set ${name} to the tool's path`);
++      return process.env[name];
++    };
++    const emcc = env("EMCC");
++    return {
++      lock: { ...lock, rust: { ...lock.rust, toolchain: "nightly" } },
++      paths: {
++        node: process.execPath, emcc, emcmake: env("EMCMAKE"), cmake: env("CMAKE"), ninja: env("NINJA"),
++        rustc: env("RUSTC"), cargo: env("CARGO"), rustup: env("RUSTUP"),
++        clangxx: resolve(dirname(emcc), "../bin/clang++")
++      },
++      hashes: {
++        lock: sha256File(lockPath),
++        cargoLock: sha256NormalizedTextFile(resolve(root, "tools/naga-spirv-wgsl/Cargo.lock"))
++      }
++    };
++  }
+   invariant(lock.schemaVersion === 1, `Unsupported toolchain lock schema ${lock.schemaVersion}`);
+   invariant(`${process.platform}-${process.arch}` === lock.platform, `Toolchain lock requires ${lock.platform}`);
+ 

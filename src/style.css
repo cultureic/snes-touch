@@ -858,6 +858,74 @@ body.is-dropping::after {
   }
 }
 
+/* ------------------------------------------------------------ PS2 and GameCube pads */
+
+.shoulder-mini-r {
+  right: calc(max(12px, 4cqw) + var(--shoulder) + 10px);
+  left: auto;
+}
+
+.face-ps2 .face-btn {
+  background: #2c2838;
+  font-size: calc(var(--face) * 0.15);
+}
+
+.face-ps2 .face-x {
+  color: #3fc6a0;
+}
+
+.face-ps2 .face-a {
+  color: #f0616d;
+}
+
+.face-ps2 .face-b {
+  color: #7ea6f2;
+}
+
+.face-ps2 .face-y {
+  color: #e48ad6;
+}
+
+.gc-a {
+  left: 30%;
+  top: 34%;
+  width: 38%;
+  height: 38%;
+  background: #2fae58;
+}
+
+.gc-b {
+  left: 4%;
+  top: 66%;
+  width: 26%;
+  height: 26%;
+  background: #e5483f;
+}
+
+.gc-x {
+  left: 74%;
+  top: 28%;
+  width: 24%;
+  height: 30%;
+  border-radius: 45%;
+  background: #8d889c;
+}
+
+.gc-y {
+  left: 26%;
+  top: 4%;
+  width: 34%;
+  height: 22%;
+  border-radius: 45%;
+  background: #8d889c;
+}
+
+@media (orientation: portrait) {
+  [data-layout='gc'] .meta-start {
+    left: calc(50cqw - 32px);
+  }
+}
+
 /* ------------------------------------------------------------ landscape: pad overlays the sides */
 
 @media (orientation: landscape) {
@@ -940,6 +1008,11 @@ body.is-dropping::after {
 
   .shoulder-mini {
     left: calc(max(12px, 3cqw) + var(--safe-l) + var(--shoulder) + 10px);
+  }
+
+  .shoulder-mini-r {
+    right: calc(max(12px, 3cqw) + var(--safe-r) + var(--shoulder) + 10px);
+    left: auto;
   }
 
   .meta-btn {
@@ -1160,4 +1233,15 @@ body.is-dropping::after {
 .toast.is-visible {
   opacity: 1;
   transform: translate(-50%, 0);
+}
+
+/* ------------------------------------------------------------ GameCube */
+
+.gc-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
 }

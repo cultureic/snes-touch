@@ -20,6 +20,11 @@ export type Button =
   | 'cd'
   | 'cl'
   | 'cr'
+  // PS2 only (its L1/R1 are l/r, and cross/circle/square/triangle are b/a/y/x by position)
+  | 'l2'
+  | 'r2'
+  | 'l3'
+  | 'r3'
 
 // A touch that starts near the d-pad (or the N64 stick) steers it for as long as it stays
 // down; any other touch presses whatever button is under it and can slide between them.
@@ -169,11 +174,11 @@ export class TouchController {
     if (dpad) this.dpad = center(dpad)
     const hub = center(cluster)
     this.stick = stick ? center(stick) : undefined
-    // SNES buttons sit in a ring, so each reaches toward the ring's center; the N64's are
+    // SNES (and PS2) buttons sit in a ring, so each reaches toward the ring's center; N64 and GameCube ones are
     // uneven, so each reaches a little past its own edge.
     this.face = Array.from(this.layout.querySelectorAll<HTMLElement>('.face-btn'), (element) => {
       const { x, y, r } = center(element)
-      const reach = this.system === 'n64' ? r * BUTTON_REACH : Math.hypot(x - hub.x, y - hub.y) * FACE_REACH
+      const reach = this.system === 'n64' || this.system === 'gc' ? r * BUTTON_REACH : Math.hypot(x - hub.x, y - hub.y) * FACE_REACH
       return { button: element.dataset.btn as Button, x, y, reach }
     })
     this.rects = Array.from(this.layout.querySelectorAll<HTMLElement>('.shoulder, .meta-btn'), (element) => ({

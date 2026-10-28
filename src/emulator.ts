@@ -2,6 +2,7 @@ import { unzipSync } from 'fflate'
 import { Nostalgist } from 'nostalgist'
 import { closeAudio } from './audio'
 import type { Button } from './controller'
+import type { Machine } from './machine'
 import type { System } from './systems'
 
 type CoreName = 'snes9x' | 'mupen64plus_next' | 'parallel_n64'
@@ -134,7 +135,12 @@ export interface LaunchOptions {
   state?: Uint8Array
 }
 
-export class Emulator {
+export class Emulator implements Machine {
+  readonly canSaveState = true
+  readonly canFastForward = true
+  readonly canReset = true
+  readonly reloadOnExit = false
+
   // Saves are read back through RetroArch's virtual file system and Nostalgist polls for
   // each file, so file operations run one at a time.
   private queue: Promise<unknown> = Promise.resolve()
@@ -144,6 +150,7 @@ export class Emulator {
   private constructor(
     private readonly nostalgist: Nostalgist,
     readonly system: System,
+    readonly canvas: HTMLCanvasElement,
   ) {}
 
   // RetroArch sizes the canvas from its CSS box and follows that box when it changes
@@ -156,7 +163,8 @@ export class Emulator {
       element: options.canvas,
       rom: { fileName: options.fileName, fileContent: toBlob(options.rom) },
       sram: options.sram && toBlob(options.sram),
-      state: options.state && toBlob(options.state),
+      // EmulatorJS builds load states their own way, after launch (below)
+      state: options.system === 'n64' ? undefined : options.state && toBlob(options.state),
       retroarchConfig: {
         video_smooth: false,
         video_font_enable: false, // the app shows its own messages
@@ -172,7 +180,9 @@ export class Emulator {
       resolveCoreJs: () => js,
       resolveCoreWasm: () => wasm,
     })
-    return new Emulator(nostalgist, options.system)
+    const emulator = new Emulator(nostalgist, options.system, options.canvas)
+    if (options.system === 'n64' && options.state) await emulator.loadState(options.state).catch(() => undefined)
+    return emulator
   }
 
   press(button: Button, down: boolean, player = 1) {
@@ -184,8 +194,8 @@ export class Emulator {
   }
 
   /** The analog stick, x and y from -1 to 1 (y points down). Only the N64 has one. */
-  stick(x: number, y: number, player = 1) {
-    if (this.system !== 'n64') return
+  stick(x: number, y: number, player = 1, stick: 0 | 1 = 0) {
+    if (this.system !== 'n64' || stick !== 0) return
     this.input(player, STICK.right, Math.max(x, 0) * AXIS_MAX)
     this.input(player, STICK.left, Math.max(-x, 0) * AXIS_MAX)
     this.input(player, STICK.down, Math.max(y, 0) * AXIS_MAX)
@@ -216,6 +226,7 @@ export class Emulator {
   }
 
   saveState() {
+    if (this.system === 'n64') return this.serial(async () => ({ state: this.ejsSaveState() }))
     return this.serial(async () => {
       const { state, thumbnail } = await withTimeout(this.nostalgist.saveState(), 10_000)
       return { state: await toBytes(state), thumbnail: thumbnail && (await toBytes(thumbnail)) }
@@ -223,7 +234,31 @@ export class Emulator {
   }
 
   loadState(state: Uint8Array) {
+    if (this.system === 'n64') return this.serial(async () => this.ejsLoadState(state))
     return this.serial(() => withTimeout(this.nostalgist.loadState(toBlob(state)), 10_000))
+  }
+
+  // EmulatorJS cores: save_state_info serializes the state in memory and answers
+  // "size|address|ok"; load_state reads a state file.
+  private ejsSaveState() {
+    const module = this.ejsModule()
+    const [size, address, ok] = String(module.cwrap('save_state_info', 'string', [])()).split('|')
+    if (ok !== '1') throw new Error(size || "the emulator couldn't save a state")
+    return module.HEAPU8.slice(Number(address), Number(address) + Number(size))
+  }
+
+  private ejsLoadState(state: Uint8Array) {
+    const module = this.ejsModule()
+    module.FS.writeFile('/game.state', state)
+    module.cwrap('load_state', 'number', ['string', 'number'])('game.state', 0)
+  }
+
+  private ejsModule() {
+    return this.nostalgist.getEmscriptenModule() as unknown as {
+      cwrap(name: string, returnType: string | null, argTypes: string[]): (...args: unknown[]) => unknown
+      HEAPU8: Uint8Array
+      FS: { writeFile(path: string, data: Uint8Array): void }
+    }
   }
 
   /** The cart's battery-backed save RAM, or undefined when the game has none. */

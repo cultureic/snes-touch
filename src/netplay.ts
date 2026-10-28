@@ -9,7 +9,7 @@ import type { System } from './systems'
 // ICE candidates); the game itself flows peer to peer, or through a TURN relay when the networks
 // in between don't allow a direct path.
 
-const BUTTON_BITS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'select', 'start', 'z', 'cu', 'cd', 'cl', 'cr']
+const BUTTON_BITS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'select', 'start', 'z', 'cu', 'cd', 'cl', 'cr', 'l2', 'r2', 'l3', 'r3']
 const STICK_SCALE = 0x7fff
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no 0/O or 1/I
 const STUN: RTCIceServer[] = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }]
@@ -154,7 +154,8 @@ interface Guest {
 }
 
 /** How many people can play a system's games, the host included. */
-export const maxPlayers = (system: System) => (system === 'n64' ? 4 : 2)
+// Play! (PS2) only reads pad 1; our GameCube core build reads all four ports.
+export const maxPlayers = (system: System) => ({ snes: 2, n64: 4, ps2: 1, gc: 4 })[system]
 
 export class HostRoom {
   private readonly guests = new Map<string, Guest>()

@@ -18,6 +18,7 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return
   const url = new URL(request.url)
   if (url.pathname.startsWith('/roms/')) return // bundled ROMs are copied into IndexedDB once
+  if (url.pathname.startsWith('/gc/')) return // the GameCube emulator fetches its 13 MB core uncached on purpose
   if (request.mode === 'navigate') event.respondWith(networkFirst(request))
   else if (url.hostname === CORE_HOST || (url.origin === location.origin && /^\/(assets|cores)\//.test(url.pathname)))
     event.respondWith(cacheFirst(request))

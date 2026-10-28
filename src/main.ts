@@ -17,9 +17,11 @@ import {
   type PadState,
   type Seat,
 } from './netplay'
+import { launchDisc } from './discs'
+import type { Machine } from './machine'
 import { readRoms, romId } from './rom'
 import * as db from './storage'
-import { type System, systemOf } from './systems'
+import { DISC_FILE, detectDisc, SHORT_NAMES, type System } from './systems'
 
 trackAudioContexts()
 
@@ -38,6 +40,7 @@ function element<T extends HTMLElement = HTMLElement>(id: string) {
 const ui = {
   library: element('library'),
   romInput: element<HTMLInputElement>('rom-input'),
+  romLabel: element('rom-label'),
   testButton: element<HTMLButtonElement>('test-button'),
   joinButton: element<HTMLButtonElement>('join-button'),
   usbButton: element<HTMLButtonElement>('usb-button'),
@@ -87,9 +90,10 @@ interface Session {
   game: db.GameMeta
   system: System
   canvas: HTMLCanvasElement
-  emulator?: Emulator
+  emulator?: Machine
   timers: number[]
   lastSram?: Uint8Array
+  lastFiles?: Record<string, Uint8Array>
   quitting?: boolean
   room?: HostRoom
   seats: Seat[]
@@ -137,11 +141,11 @@ const gamepads = new Gamepads({
       session.emulator?.press(button, down, player)
     }
   },
-  stick: (player, x, y) => {
+  stick: (player, x, y, stick) => {
     if (guest) {
-      if (player === 1) guest.link?.stick(x, y)
+      if (player === 1 && stick === 0) guest.link?.stick(x, y)
     } else if (session && (player === 1 || (!session.room && player <= maxPlayers(session.system)))) {
-      session.emulator?.stick(x, y, player)
+      session.emulator?.stick(x, y, player, stick)
     }
   },
   menu: () => void openMenu(),
@@ -206,7 +210,8 @@ async function renderGame(game: db.GameMeta, urls: string[]) {
   name.textContent = game.name
   const meta = document.createElement('span')
   meta.className = 'game-meta'
-  const system = systemOf(game.fileName) === 'n64' ? 'N64 · ' : ''
+  const kind = db.systemOfGame(game)
+  const system = kind === 'snes' ? '' : `${SHORT_NAMES[kind]} · `
   meta.textContent = `${system}${game.playedAt ? `Played ${timeAgo(game.playedAt)}` : 'Not played yet'} · ${formatSize(game.size)}`
   text.append(name, meta)
   play.append(art, text)
@@ -228,6 +233,15 @@ async function renderGame(game: db.GameMeta, urls: string[]) {
 }
 
 async function openGame(game: db.GameMeta) {
+  if (game.disc) {
+    const file = await discFile(game)
+    if (file) void play(game, file)
+    else {
+      toast(`Pick “${game.fileName}” again to play it`)
+      void pickFiles()
+    }
+    return
+  }
   const rom = await db.getRom(game.id)
   if (!rom) {
     toast('This ROM is missing. Load it again.')
@@ -236,16 +250,52 @@ async function openGame(game: db.GameMeta) {
   void play(game, rom)
 }
 
+/** Disc images picked during this visit, for browsers that can't keep a handle to the file. */
+const pickedDiscs = new Map<string, File>()
+
+interface PermissionedHandle extends FileSystemFileHandle {
+  queryPermission?(options: { mode: 'read' }): Promise<PermissionState>
+  requestPermission?(options: { mode: 'read' }): Promise<PermissionState>
+}
+
+async function discFile(game: db.GameMeta) {
+  const picked = pickedDiscs.get(game.id)
+  if (picked) return picked
+  const handle = (await db.getDiscHandle(game.id)) as PermissionedHandle | undefined
+  if (!handle) return undefined
+  try {
+    // Chrome asks once per visit before a page may read a file it kept a handle to
+    let permission = (await handle.queryPermission?.({ mode: 'read' })) ?? 'granted'
+    if (permission !== 'granted') permission = (await handle.requestPermission?.({ mode: 'read' })) ?? 'denied'
+    return permission === 'granted' ? await handle.getFile() : undefined
+  } catch {
+    return undefined // moved or deleted
+  }
+}
+
+/** A picked or dropped file, with a handle to it when the browser gives one (Chrome, Edge). */
+interface PickedFile {
+  file: File
+  handle?: FileSystemFileHandle
+}
+
 interface AddResult {
   added: number
   skipped: string[]
-  first?: { game: db.GameMeta; rom: Uint8Array }
+  first?: { game: db.GameMeta; rom: Uint8Array | File }
 }
 
-async function addRoms(files: File[]) {
+async function addRoms(picked: (File | PickedFile)[]) {
   const result: AddResult = { added: 0, skipped: [] }
-  for (const file of files) {
+  for (const entry of picked) {
+    const { file, handle } = entry instanceof File ? { file: entry, handle: undefined } : entry
     try {
+      if (DISC_FILE.test(file.name)) {
+        const game = await addDisc(file, handle)
+        result.first ??= { game, rom: file }
+        result.added++
+        continue
+      }
       for (const rom of await readRoms(file)) {
         const game: db.GameMeta = {
           id: await romId(rom.bytes),
@@ -266,8 +316,31 @@ async function addRoms(files: File[]) {
   return result
 }
 
+// Discs stay where they are on disk. The id comes from the start of the disc and its size,
+// so adding the same file again finds the same saves.
+async function addDisc(file: File, handle?: FileSystemFileHandle) {
+  const system = await detectDisc(file)
+  if (!system) throw new Error(`${file.name} isn't a PS2 or GameCube disc.`)
+  const head = new Uint8Array(await file.slice(0, 1 << 20).arrayBuffer())
+  const sized = new Uint8Array(head.length + 8)
+  sized.set(head)
+  new DataView(sized.buffer).setFloat64(head.length, file.size)
+  const game: db.GameMeta = {
+    id: await romId(sized),
+    name: file.name.replace(DISC_FILE, '').replace(/\.nkit$/i, '').trim() || 'Untitled',
+    fileName: file.name,
+    size: file.size,
+    addedAt: Date.now(),
+    system,
+    disc: true,
+  }
+  pickedDiscs.set(game.id, file)
+  await db.addGame(game, handle)
+  return game
+}
+
 // One ROM starts right away; a batch (several files, or a zip of games) fills the library.
-async function importFiles(files: File[]) {
+async function importFiles(files: (File | PickedFile)[]) {
   if (files.length === 0) return
   const { added, skipped, first } = await addRoms(files)
   await renderLibrary()
@@ -308,6 +381,30 @@ ui.romInput.addEventListener('change', () => {
   void importFiles(files)
 })
 
+type OpenFilePicker = (options: { multiple: boolean }) => Promise<FileSystemFileHandle[]>
+
+// Where the browser can keep handles to picked files (Chrome and Edge on desktop), use its own
+// picker, so disc images can be played again later without copying gigabytes into the library.
+async function pickFiles() {
+  const showOpenFilePicker = (window as Window & { showOpenFilePicker?: OpenFilePicker }).showOpenFilePicker
+  if (!showOpenFilePicker) {
+    ui.romInput.click()
+    return
+  }
+  try {
+    const handles = await showOpenFilePicker({ multiple: true })
+    void importFiles(await Promise.all(handles.map(async (handle) => ({ file: await handle.getFile(), handle }))))
+  } catch {
+    // picker closed
+  }
+}
+
+ui.romLabel.addEventListener('click', (event) => {
+  if (!('showOpenFilePicker' in window)) return // the label opens the plain file input
+  event.preventDefault()
+  void pickFiles()
+})
+
 // Desktop: drop ROM files anywhere on the library.
 document.addEventListener('dragover', (event) => {
   if (session || guest || !event.dataTransfer?.types.includes('Files')) return
@@ -317,11 +414,23 @@ document.addEventListener('dragover', (event) => {
 document.addEventListener('dragleave', (event) => {
   if (!event.relatedTarget) document.body.classList.remove('is-dropping')
 })
+type HandleItem = DataTransferItem & { getAsFileSystemHandle?(): Promise<FileSystemHandle | null> }
+
 document.addEventListener('drop', (event) => {
   document.body.classList.remove('is-dropping')
   if (session || guest || !event.dataTransfer?.files.length) return
   event.preventDefault()
-  void importFiles(Array.from(event.dataTransfer.files))
+  // handles have to be asked for before the event ends, files can be read after
+  const items = Array.from(event.dataTransfer.items, (item) => [item.getAsFile(), (item as HandleItem).getAsFileSystemHandle?.()] as const)
+  void (async () => {
+    const picked: PickedFile[] = []
+    for (const [file, handle] of items) {
+      if (!file) continue
+      const resolved = await handle?.catch(() => null)
+      picked.push({ file, handle: resolved?.kind === 'file' ? (resolved as FileSystemFileHandle) : undefined })
+    }
+    await importFiles(picked)
+  })()
 })
 
 ui.testButton.addEventListener('click', async () => {
@@ -337,11 +446,11 @@ ui.testButton.addEventListener('click', async () => {
 
 // ------------------------------------------------------------ playing
 
-async function play(game: db.GameMeta, rom: Uint8Array) {
+async function play(game: db.GameMeta, rom: Uint8Array | File) {
   if (session || guest) return
   const canvas = document.createElement('canvas')
   ui.screen.prepend(canvas)
-  const system = systemOf(game.fileName)
+  const system = db.systemOfGame(game)
   const current: Session = { game, system, canvas, timers: [], seats: [], pads: new Map() }
   session = current
   controller.use(system)
@@ -349,32 +458,40 @@ async function play(game: db.GameMeta, rom: Uint8Array) {
   setStatus('Loading emulator…')
   const stopProgress = onCoreProgress((fraction) => setStatus(`Downloading emulator… ${Math.round(fraction * 100)}%`))
   try {
-    const [sram, autosave] = await Promise.all([db.getSram(game.id), db.getState(game.id, 'auto'), loadCore(coreFor(system))])
-    stopProgress()
-    if (session !== current) return
-    setStatus('Starting game…')
-    const emulator = await Emulator.launch({
-      system,
-      canvas,
-      fileName: game.fileName,
-      rom,
-      sram,
-      state: autosave?.state,
-    })
+    let emulator: Machine
+    let autosave: db.SavedState | undefined
+    if (rom instanceof File) {
+      const saveFiles = await db.getSaveFiles(game.id)
+      setStatus('Starting game…')
+      emulator = await launchDisc(system, canvas, rom, saveFiles)
+      stopProgress()
+      current.lastFiles = saveFiles
+    } else {
+      const [sram, state] = await Promise.all([db.getSram(game.id), db.getState(game.id, 'auto'), loadCore(coreFor(system))])
+      autosave = state
+      stopProgress()
+      if (session !== current) return
+      setStatus('Starting game…')
+      emulator = await Emulator.launch({ system, canvas, fileName: game.fileName, rom, sram, state: autosave?.state })
+      current.lastSram = sram
+    }
     if (session !== current) {
       emulator.exit()
+      if (emulator.reloadOnExit) location.reload()
       return
     }
     current.emulator = emulator
-    current.lastSram = sram
+    showFeatures(emulator)
     setStatus()
     if (autosave) toast('Resumed where you left off')
-    current.timers.push(
-      window.setInterval(() => void saveSram(current), SRAM_EVERY),
-      window.setInterval(() => {
-        if (document.visibilityState === 'visible' && !ui.menu.open) void saveAutosave(current)
-      }, AUTOSAVE_EVERY),
-    )
+    current.timers.push(window.setInterval(() => void saveSram(current), SRAM_EVERY))
+    if (emulator.canSaveState) {
+      current.timers.push(
+        window.setInterval(() => {
+          if (document.visibilityState === 'visible' && !ui.menu.open) void saveAutosave(current)
+        }, AUTOSAVE_EVERY),
+      )
+    }
     void db.markPlayed(game.id)
   } catch (error) {
     stopProgress()
@@ -383,13 +500,28 @@ async function play(game: db.GameMeta, rom: Uint8Array) {
 }
 
 async function saveSram(current: Session) {
+  if (current.emulator?.saveFiles) return saveFiles(current)
   const sram = await current.emulator?.saveSram().catch(() => undefined)
   if (!sram || (current.lastSram && sameBytes(sram, current.lastSram))) return
   current.lastSram = sram
   await db.putSram(current.game.id, sram)
 }
 
+// Disc systems keep their saves as files in the emulator; copy them out when any changed.
+async function saveFiles(current: Session) {
+  const files = await current.emulator?.saveFiles?.().catch(() => undefined)
+  if (!files) return
+  const last = current.lastFiles ?? {}
+  const changed =
+    Object.keys(files).length !== Object.keys(last).length ||
+    Object.entries(files).some(([path, data]) => !last[path] || !sameBytes(data, last[path]))
+  if (!changed) return
+  current.lastFiles = files
+  await db.putSaveFiles(current.game.id, files)
+}
+
 async function saveAutosave(current: Session) {
+  if (!current.emulator?.canSaveState) return
   const saved = await current.emulator?.saveState().catch(() => undefined)
   if (!saved) return
   await db.putState(current.game.id, 'auto', { state: saved.state, savedAt: Date.now() })
@@ -411,6 +543,12 @@ async function quit(reason: string) {
     current.emulator.resume()
     await Promise.all([saveSram(current), saveAutosave(current)])
     current.emulator.exit()
+    // threaded emulators (PS2, GameCube) keep running in their workers; a fresh page stops them
+    if (current.emulator.reloadOnExit) {
+      history.replaceState(null, '', location.pathname + location.search)
+      location.reload()
+      return
+    }
   }
   current.canvas.remove()
   session = undefined
@@ -432,6 +570,14 @@ function showPlayer(title: string, asGuest = false) {
   ui.player.hidden = false
   document.body.classList.add('playing')
   history.pushState({ player: true }, '')
+}
+
+/** Hides what this emulator can't do (PS2 has no save states, fast forward or restart). */
+function showFeatures(machine: Machine) {
+  ui.ffButton.hidden = !machine.canFastForward
+  ui.saveButton.parentElement!.hidden = !machine.canSaveState
+  ui.saveInfo.hidden = !machine.canSaveState
+  ui.resetButton.hidden = !machine.canReset
 }
 
 function showLibrary() {
@@ -473,9 +619,10 @@ ui.inviteButton.addEventListener('click', async () => {
   const code = newRoomCode()
   const copied = copyText(inviteLink(code))
   try {
-    const video = current.canvas.captureStream(60)
+    const video = current.emulator.canvas.captureStream(60)
     for (const track of video.getVideoTracks()) track.contentHint = 'motion'
-    const media = new MediaStream([...video.getTracks(), ...(gameAudioStream()?.getTracks() ?? [])])
+    const audio = current.emulator.audioStream?.() ?? gameAudioStream()
+    const media = new MediaStream([...video.getTracks(), ...(audio?.getTracks() ?? [])])
     const room = await HostRoom.open(code, media, current.system, {
       seats: (seats) => seatsChanged(current, seats),
       input: (player, pad) => setPad(current, player, pad),
@@ -516,7 +663,7 @@ function showInvite(current?: Session) {
   const seats = current?.seats ?? []
   const room = current ? maxPlayers(current.system) : 2
   ui.inviteLabel.textContent = room > 2 ? 'Invite players' : 'Invite player 2'
-  ui.inviteButton.hidden = !!code
+  ui.inviteButton.hidden = !!code || room < 2
   ui.inviteRoom.hidden = !code
   ui.inviteCode.textContent = code ?? ''
   ui.inviteLink.textContent = code ? inviteLink(code).replace(/^https?:\/\//, '') : ''
@@ -781,29 +928,38 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && (session || guest) && !ui.menu.open) void openMenu()
 })
 
-// RetroArch reads the keyboard for SNES games itself; the N64 cores take input from the app,
-// so their keys are mapped here. Arrows steer the stick.
-const N64_KEYS: Record<string, Button> = {
-  KeyX: 'a',
-  KeyZ: 'b',
-  KeyA: 'z',
-  KeyQ: 'l',
-  KeyW: 'r',
-  Enter: 'start',
-  KeyI: 'cu',
-  KeyK: 'cd',
-  KeyJ: 'cl',
-  KeyL: 'cr',
+// RetroArch reads the keyboard for SNES games itself; the other emulators take input from the
+// app, so their keys are mapped here. On N64 and GameCube the arrows steer the stick.
+const SYSTEM_KEYS: Partial<Record<System, Record<string, Button>>> = {
+  n64: { KeyX: 'a', KeyZ: 'b', KeyA: 'z', KeyQ: 'l', KeyW: 'r', Enter: 'start', KeyI: 'cu', KeyK: 'cd', KeyJ: 'cl', KeyL: 'cr' },
+  gc: { KeyX: 'a', KeyZ: 'b', KeyS: 'x', KeyA: 'y', KeyD: 'z', KeyQ: 'l', KeyW: 'r', Enter: 'start' },
+  ps2: {
+    KeyZ: 'b', // cross
+    KeyX: 'a', // circle
+    KeyA: 'y', // square
+    KeyS: 'x', // triangle
+    KeyQ: 'l',
+    KeyW: 'r',
+    Digit1: 'l2',
+    Digit2: 'r2',
+    Enter: 'start',
+    ShiftRight: 'select',
+    ArrowUp: 'up',
+    ArrowDown: 'down',
+    ArrowLeft: 'left',
+    ArrowRight: 'right',
+  },
 }
 const ARROWS: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }
 const arrowsHeld = new Set<string>()
 
-function n64Key(event: KeyboardEvent) {
+function systemKey(event: KeyboardEvent) {
   const emulator = session?.emulator
+  const keys = emulator && SYSTEM_KEYS[emulator.system]
   const down = event.type === 'keydown'
   // key releases still count while the menu is open, so nothing stays held
-  if (emulator?.system !== 'n64' || (down && ui.menu.open) || event.repeat || event.metaKey || event.ctrlKey) return
-  const button = N64_KEYS[event.code]
+  if (!emulator || !keys || (down && ui.menu.open) || event.repeat || event.metaKey || event.ctrlKey) return
+  const button = keys[event.code]
   if (button) emulator.press(button, down)
   else if (event.code in ARROWS) {
     if (down) arrowsHeld.add(event.code)
@@ -819,8 +975,8 @@ function n64Key(event: KeyboardEvent) {
   } else return
   event.preventDefault()
 }
-document.addEventListener('keydown', n64Key)
-document.addEventListener('keyup', n64Key)
+document.addEventListener('keydown', systemKey)
+document.addEventListener('keyup', systemKey)
 
 // Leaving the app: release held buttons, keep the save RAM, and come back paused.
 document.addEventListener('visibilitychange', () => {

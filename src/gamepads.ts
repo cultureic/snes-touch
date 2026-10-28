@@ -27,6 +27,8 @@ const DPAD: [number, Button][] = [
   [14, 'left'],
   [15, 'right'],
 ]
+const STICK_LEFT = 10
+const STICK_RIGHT = 11
 const HOME = 16
 
 // Laid out like the original pads: SNES B is the bottom face button, A the right one.
@@ -56,11 +58,41 @@ const N64_BUTTONS: [number, Button][] = [
   [START, 'start'],
 ]
 
+// PS2 by position like the SNES (cross is the bottom button), with L2/R2 on the triggers.
+const PS2_BUTTONS: [number, Button][] = [
+  [FACE_BOTTOM, 'b'],
+  [FACE_RIGHT, 'a'],
+  [FACE_LEFT, 'y'],
+  [FACE_TOP, 'x'],
+  [BUMPER_LEFT, 'l'],
+  [BUMPER_RIGHT, 'r'],
+  [TRIGGER_LEFT, 'l2'],
+  [TRIGGER_RIGHT, 'r2'],
+  [STICK_LEFT, 'l3'],
+  [STICK_RIGHT, 'r3'],
+  [BACK, 'select'],
+  [START, 'start'],
+]
+// GameCube: A bottom, B left, X right, Y top (as on its pad, around a big A), L/R on the
+// triggers, Z on the right bumper. The right stick is the C-stick.
+const GC_BUTTONS: [number, Button][] = [
+  [FACE_BOTTOM, 'a'],
+  [FACE_LEFT, 'b'],
+  [FACE_RIGHT, 'x'],
+  [FACE_TOP, 'y'],
+  [TRIGGER_LEFT, 'l'],
+  [TRIGGER_RIGHT, 'r'],
+  [BUMPER_RIGHT, 'z'],
+  [BUMPER_LEFT, 'z'],
+  [START, 'start'],
+]
+const BUTTONS: Record<System, [number, Button][]> = { snes: SNES_BUTTONS, n64: N64_BUTTONS, ps2: PS2_BUTTONS, gc: GC_BUTTONS }
+
 export interface GamepadEvents {
   /** Which system's mapping to use, or undefined while input shouldn't reach a game. */
   system(): System | undefined
   press(player: number, button: Button, down: boolean): void
-  stick(player: number, x: number, y: number): void
+  stick(player: number, x: number, y: number, stick: 0 | 1): void
   /** The pad's home or back+start: open the pause menu. */
   menu(): void
 }
@@ -69,8 +101,13 @@ interface PadState {
   buttons: Set<Button>
   x: number
   y: number
+  /** the right stick, on systems that have one */
+  x2: number
+  y2: number
   menu: boolean
 }
+
+const IDLE: PadState = { buttons: new Set(), x: 0, y: 0, x2: 0, y2: 0, menu: false }
 
 export class Gamepads {
   private readonly pads = new Map<number, PadState>() // by player
@@ -86,7 +123,7 @@ export class Gamepads {
 
   /** Lets go of everything held, e.g. when the menu opens. */
   releaseAll() {
-    for (const player of this.pads.keys()) this.apply(player, { buttons: new Set(), x: 0, y: 0, menu: false })
+    for (const player of this.pads.keys()) this.apply(player, IDLE)
   }
 
   private start() {
@@ -106,15 +143,16 @@ export class Gamepads {
         this.apply(i + 1, read(pad, system))
       })
     }
-    for (const player of this.pads.keys()) if (!seen.has(player)) this.apply(player, { buttons: new Set(), x: 0, y: 0, menu: false })
+    for (const player of this.pads.keys()) if (!seen.has(player)) this.apply(player, IDLE)
     if (pads.length) this.frame = requestAnimationFrame(this.poll)
   }
 
   private apply(player: number, next: PadState) {
-    const previous = this.pads.get(player) ?? { buttons: new Set<Button>(), x: 0, y: 0, menu: false }
+    const previous = this.pads.get(player) ?? IDLE
     for (const button of previous.buttons) if (!next.buttons.has(button)) this.events.press(player, button, false)
     for (const button of next.buttons) if (!previous.buttons.has(button)) this.events.press(player, button, true)
-    if (next.x !== previous.x || next.y !== previous.y) this.events.stick(player, next.x, next.y)
+    if (next.x !== previous.x || next.y !== previous.y) this.events.stick(player, next.x, next.y, 0)
+    if (next.x2 !== previous.x2 || next.y2 !== previous.y2) this.events.stick(player, next.x2, next.y2, 1)
     if (next.menu && !previous.menu) this.events.menu()
     this.pads.set(player, next)
   }
@@ -127,16 +165,18 @@ function read(pad: PadReading, system: System): PadState {
   }
   const axis = (index: number) => pad.axes[index] ?? 0
   const buttons = new Set<Button>()
-  for (const [index, button] of system === 'n64' ? N64_BUTTONS : SNES_BUTTONS) if (pressed(index)) buttons.add(button)
+  for (const [index, button] of BUTTONS[system]) if (pressed(index)) buttons.add(button)
   for (const [index, button] of DPAD) if (pressed(index)) buttons.add(button)
   let [x, y] = deadzone(axis(0), axis(1))
-  if (system === 'n64') {
+  let [x2, y2] = [0, 0]
+  if (system === 'ps2' || system === 'gc') [x2, y2] = deadzone(axis(2), axis(3))
+  else if (system === 'n64') {
     const [cx, cy] = [axis(2), axis(3)]
     if (cx < -DIGITAL_THRESHOLD) buttons.add('cl')
     if (cx > DIGITAL_THRESHOLD) buttons.add('cr')
     if (cy < -DIGITAL_THRESHOLD) buttons.add('cu')
     if (cy > DIGITAL_THRESHOLD) buttons.add('cd')
-  } else {
+  } else if (system === 'snes') {
     // the SNES has no stick: the left stick works the d-pad
     if (x < -DIGITAL_THRESHOLD) buttons.add('left')
     if (x > DIGITAL_THRESHOLD) buttons.add('right')
@@ -144,7 +184,7 @@ function read(pad: PadReading, system: System): PadState {
     if (y > DIGITAL_THRESHOLD) buttons.add('down')
     x = y = 0
   }
-  return { buttons, x, y, menu: pressed(HOME) || (pressed(BACK) && pressed(START)) }
+  return { buttons, x, y, x2, y2, menu: pressed(HOME) || (pressed(BACK) && pressed(START)) }
 }
 
 /** A round dead zone, with the push rescaled to start from zero at its edge. */
