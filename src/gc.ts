@@ -7,16 +7,17 @@ import type { Machine } from './machine'
 // same-origin frame and the app drives it through the globals it exposes (window.__host).
 // Desktop Chrome only: it needs 1.5 GB of shared memory and 16 threads.
 
-// Measured on Need for Speed: Underground 2 on an M2 Max (median core frames per second, 60 is
-// full speed): the README's settings run at 14; the emulated CPU is the bottleneck, so it is
-// underclocked to 20% (oc=0.2: 61 fps) and the software rasterizer gets more threads, while the
-// full-quality raster mode (fastsw=0) costs almost nothing. The PowerPC-to-WASM JIT and its cache
-// are off: at commit 7e38409 the JIT emits an invalid WebAssembly block in that game ("Compiling
-// function #19 failed", stock core too) and the cached block brings the crash back on every load.
-// The page's own gamepad polling is off too, since it would overwrite the input the app sends.
+// Measured on Need for Speed: Underground 2 on an M2 Max: the emulated CPU is the bottleneck and
+// the game runs at about a quarter of real speed. Up to 8 raster threads help a little (21% to
+// 26%). Underclocking the CPU (oc<1) does not: it keeps Dolphin's video at 60 fps while the game
+// itself crawls (its race timer ran at ~8% of real time at oc=0.2) and loading takes minutes.
+// The PowerPC-to-WASM JIT and its cache are off: at commit 7e38409 the JIT emits an invalid
+// WebAssembly block in that game ("Compiling function #19 failed", stock core too) and the cached
+// block brings the crash back on every load. The page's own gamepad polling is off too, since it
+// would overwrite the input the app sends.
 const RASTER_THREADS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 4))
 const PAGE =
-  `/gc/?core=upstream&video=software&presenter=webgpu&cpu=dual&speed=1&wasmjit=0&nojitcache=1&oc=0.2&swthreads=${RASTER_THREADS}&pacing=tick&fastsw=0&nogamepad=1`
+  `/gc/?core=upstream&video=software&presenter=webgpu&cpu=dual&speed=1&wasmjit=0&nojitcache=1&oc=1&swthreads=${RASTER_THREADS}&pacing=tick&fastsw=1&nogamepad=1`
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3
 
