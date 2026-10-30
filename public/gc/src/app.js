@@ -867,7 +867,9 @@ async function mountFile(file) {
     // the AudioContext can only be created after a user gesture; the disc
     // mount click is the user gesture, so unmute here so audio actually
     // plays. Users can still mute via the button.
-    if (audio.muted) {
+    // SNES Touch: the page stays silent unless the URL says ?sound=1; the
+    // button still turns the sound on.
+    if (audio.muted && new URLSearchParams(window.location.search).get("sound") === "1") {
       await audio.setMuted(false);
       setTransportGlyph(elements.muteButton,
                         /unmut/i.test(audio.label()) ? GLYPH.sound : GLYPH.muted,

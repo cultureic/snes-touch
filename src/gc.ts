@@ -7,17 +7,20 @@ import type { Machine } from './machine'
 // same-origin frame and the app drives it through the globals it exposes (window.__host).
 // Desktop Chrome only: it needs 1.5 GB of shared memory and 16 threads.
 
-// Measured on Need for Speed: Underground 2 on an M2 Max: the emulated CPU is the bottleneck and
-// the game runs at about a quarter of real speed. Up to 8 raster threads help a little (21% to
-// 26%). Underclocking the CPU (oc<1) does not: it keeps Dolphin's video at 60 fps while the game
-// itself crawls (its race timer ran at ~8% of real time at oc=0.2) and loading takes minutes.
-// The PowerPC-to-WASM JIT and its cache are off: at commit 7e38409 the JIT emits an invalid
-// WebAssembly block in that game ("Compiling function #19 failed", stock core too) and the cached
-// block brings the crash back on every load. The page's own gamepad polling is off too, since it
-// would overwrite the input the app sends.
-const RASTER_THREADS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 4))
-const PAGE =
-  `/gc/?core=upstream&video=software&presenter=webgpu&cpu=dual&speed=1&wasmjit=0&nojitcache=1&oc=1&swthreads=${RASTER_THREADS}&pacing=tick&fastsw=1&nogamepad=1`
+// Frames are drawn by the GPU (video=wgpu: Dolphin's draw calls replayed on WebGPU) rather than
+// by the port's software rasterizer, which capped 3D scenes at a fraction of real speed. The GPU
+// path drew black in Need for Speed: Underground 2 because the port fed its reversed depth buffer
+// (near = 1) straight into the GameCube fog formula, so everything near the camera was fogged to
+// the fog colour; our core build restores Dolphin's depth conversion for fog, depth copies and
+// EFB peeks (SNES-TOUCH-CHANGES.patch). The PowerPC-to-WASM JIT is on: our build also fixes the
+// bug that made it emit invalid WebAssembly (mcrf routed to the CR-logic emitter), compiles more
+// paired-single and quantized-load instructions natively, writes GX commands straight into the
+// gather pipe, dispatches compiled blocks directly, runs blocks on past conditional branches,
+// loops small loops inside WebAssembly and skips the software fused multiply-add when it can give
+// the same bits without it. By the game's race clock that is about a third of real speed; what
+// remains is mostly the per-block dispatch. The page's own gamepad polling is off, since it would
+// overwrite the app's input.
+const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=1&pacing=tick&nogamepad=1'
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3
 
@@ -55,6 +58,7 @@ interface DolphinWindow extends Window {
   __snesTouchUserFiles?: Record<string, Uint8Array>
   __host?: {
     setInputState(state: PadInput): void
+    setAudioMuted?(muted: boolean): void
     reset(): void
     adapter?: {
       request(name: string, payload: object): Promise<unknown>
@@ -62,8 +66,8 @@ interface DolphinWindow extends Window {
       loadStateFile(bytes: Uint8Array): Promise<unknown>
     }
   }
-  /** its audio output: an AudioWorklet feeding this gain node */
-  __audio?: { context?: AudioContext; gain?: GainNode }
+  /** its audio output: an AudioWorklet feeding this gain node, with the page's own mute switch */
+  __audio?: { context?: AudioContext; gain?: GainNode; muted?: boolean; setMuted?(muted: boolean): Promise<unknown> }
   DataTransfer: typeof DataTransfer
   Event: typeof Event
 }
@@ -81,6 +85,8 @@ export class GcMachine implements Machine {
   readonly canReset = true
   readonly reloadOnExit = true
   private fastForward = false
+  private muted = false
+  private muteTimer = 0
   /** each player's pad, players 1-4 */
   private readonly inputs: PadInput[] = Array.from({ length: 4 }, () => ({
     mask: 0,
@@ -111,6 +117,26 @@ export class GcMachine implements Machine {
     const destination = audio.context.createMediaStreamDestination()
     audio.gain.connect(destination)
     return destination.stream
+  }
+
+  // The frame's sound lives in its own window, out of reach of the app's audio routing, so it is
+  // muted the way the page's own sound button does it: the core's mixer goes quiet and the page's
+  // audio transport stops (writing its gain node directly doesn't stick; the page resets it when
+  // playback starts). The page also turns its sound back on by itself while the game boots, so the
+  // wanted state is re-asserted whenever the page's own flag drifts from it.
+  setMuted(muted: boolean) {
+    this.muted = muted
+    this.applyMute()
+    clearInterval(this.muteTimer)
+    this.muteTimer = window.setInterval(() => this.applyMute(), 500)
+  }
+
+  private applyMute() {
+    const host = this.page.__host
+    const audio = this.page.__audio
+    if (!host?.setAudioMuted || !audio?.setMuted || audio.muted === this.muted) return
+    host.setAudioMuted(this.muted)
+    void audio.setMuted(this.muted).catch(() => undefined)
   }
 
   static async launch({ canvas, file, saveFiles }: GcLaunchOptions) {
@@ -177,6 +203,7 @@ export class GcMachine implements Machine {
   resume() {
     void this.page.__host?.adapter?.request('validationSetCorePaused', { paused: false }).catch(() => undefined)
     this.frame.blur()
+    this.applyMute()
   }
 
   reset() {
@@ -211,6 +238,7 @@ export class GcMachine implements Machine {
   }
 
   exit() {
+    clearInterval(this.muteTimer)
     this.frame.remove()
   }
 

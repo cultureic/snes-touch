@@ -1,6 +1,12 @@
 SNES Touch changes to wasm-dolphin (github.com/dougchansan/wasm-dolphin, commit 7e38409), GPLv2+.
 Build: npm run fetch:dolphin && npm run patch:upstream, apply this patch, add '_SetInputStateForPort' after '_SetInputState' in the EXPORTED_FUNCTIONS of vendor/dolphin/Source/Core/Core/CMakeLists.txt, then configure:upstream and build:upstream:full-core (Emscripten 5.0.7).
-The JavaScript changes (src/upstream-worker-adapter.js, src/upstream-discio-worker.js, src/upstream-worker-protocol.js) are marked 'SNES Touch' in the files themselves.
+The JavaScript changes (src/upstream-worker-adapter.js, src/upstream-discio-worker.js, src/upstream-worker-protocol.js, src/core-host.js) are marked 'SNES Touch' in the files themselves.
+
+What the C++ changes do:
+- core/upstream: controllers in all four ports and a SetInputStateForPort export (players 2-4); tools: a macOS toolchain branch.
+- vendor/dolphin CachedInterpreter.cpp (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the PowerPC-to-WASM JIT routed mcrf (opcode 19, SUBOP10 0) to the condition-register logic emitter and produced invalid WebAssembly, it now takes the fallback path; ps_sum0/1, ps_sel, fsel, ps_div, ps_neg/mr/abs/nabs and the integer psq_l formats are compiled natively instead of ending the block; stw/sth/stb into the write-gather pipe page go straight into the pipe; compiled blocks are dispatched directly (DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH=1); blocks run on past conditional branches (side exits), and a block that branches back to its own start loops inside WebAssembly while its cycle budget lasts (?sideexit=0 and ?wasmloop=0 turn these off; src/core-host.js).
+- vendor/dolphin Interpreter_FPUtils.h (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the fused multiply-adds skip the software fma that WebAssembly falls back to when the product is exact in double precision, which gives the same bits.
+- vendor/dolphin VideoCommon: the WebGPU backend had been exempted from Dolphin's depth conversion for backends without a reversible depth range (fog depth, per-pixel depth, depth copies, EFB peeks and pokes, clear depth), but its vertex shader writes a reversed depth buffer, so those exemptions fed inverted depth into the fog formula and fogged everything near the camera to the fog colour (a black screen in Need for Speed: Underground 2). The standard conversion is restored.
 
 diff --git a/core/upstream/dolphin_web_core.cpp b/core/upstream/dolphin_web_core.cpp
 index 9f07725..c3c28f0 100644
@@ -136,4 +142,167 @@ index 0c240e4..d8390b8 100644
 +  }
    invariant(lock.schemaVersion === 1, `Unsupported toolchain lock schema ${lock.schemaVersion}`);
    invariant(`${process.platform}-${process.arch}` === lock.platform, `Toolchain lock requires ${lock.platform}`);
+ 
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp b/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp
+@@ -1168,7 +1168,8 @@
+     // convention that kills the mixed-pass flicker, §28aq/ar)
+     // keeps fog correct instead of saturating to the black fog
+     // colour (the §28b regression). OGL/D3D/SW untouched.
+-    if (!host_config.backend_reversed_depth_range && api_type != APIType::Vulkan)
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!host_config.backend_reversed_depth_range)
+       out.Write("\tint zCoord = int((1.0 - rawpos.z) * 16777216.0);\n");
+     else
+       out.Write("\tint zCoord = int(rawpos.z * 16777216.0);\n");
+@@ -1185,7 +1186,8 @@
+                            uid_data->ztest == EmulatedZ::EarlyWithZComplocHack;
+   if (uid_data->per_pixel_depth && early_ztest)
+   {
+-    if (!host_config.backend_reversed_depth_range && api_type != APIType::Vulkan)  // §28as
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!host_config.backend_reversed_depth_range)
+       out.Write("\tdepth = 1.0 - float(zCoord) / 16777216.0;\n");
+     else
+       out.Write("\tdepth = float(zCoord) / 16777216.0;\n");
+@@ -1207,7 +1209,8 @@
+ 
+   if (uid_data->per_pixel_depth && uid_data->ztest == EmulatedZ::Late)
+   {
+-    if (!host_config.backend_reversed_depth_range && api_type != APIType::Vulkan)  // §28as
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!host_config.backend_reversed_depth_range)
+       out.Write("\tdepth = 1.0 - float(zCoord) / 16777216.0;\n");
+     else
+       out.Write("\tdepth = float(zCoord) / 16777216.0;\n");
+@@ -1767,8 +1770,8 @@
+     // discarded fragment writes the FAR plane (1.0) so it can't
+     // occlude, independent of bSupportsReversedDepthRange.
+     out.Write("\t\tdepth = {};\n",
+-              (!g_backend_info.bSupportsReversedDepthRange &&
+-               api_type != APIType::Vulkan) ? "0.0" : "1.0");
++              // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++              !g_backend_info.bSupportsReversedDepthRange ? "0.0" : "1.0");
+   }
+ 
+   // ZCOMPLOC HACK:
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/UberShaderPixel.cpp b/vendor/dolphin/Source/Core/VideoCommon/UberShaderPixel.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/UberShaderPixel.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/UberShaderPixel.cpp
+@@ -955,7 +955,8 @@
+     // the ubershader fast-depth path — WebGPU/Vulkan emits native
+     // [0,1] clip-control window depth, independent of the depth-range
+     // flag. NO-OP at flag=true (else branch). OGL/D3D/SW untouched.
+-    if (!host_config.backend_reversed_depth_range && api_type != APIType::Vulkan)
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!host_config.backend_reversed_depth_range)
+       out.Write("  int zCoord = int((1.0 - rawpos.z) * 16777216.0);\n");
+     else
+       out.Write("  int zCoord = int(rawpos.z * 16777216.0);\n");
+@@ -1014,7 +1015,8 @@
+     // §28at: WebGPU/Vulkan per-pixel depth stays non-inverted
+     // (matches the flag-independent VS + de-inverted peek/clear).
+     // NO-OP at flag=true. OGL/D3D/SW untouched.
+-    if (!host_config.backend_reversed_depth_range && api_type != APIType::Vulkan)
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!host_config.backend_reversed_depth_range)
+       out.Write("  depth = 1.0 - float(zbuffer_zCoord) / 16777216.0;\n");
+     else
+       out.Write("  depth = float(zbuffer_zCoord) / 16777216.0;\n");
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/TextureConverterShaderGen.cpp b/vendor/dolphin/Source/Core/VideoCommon/TextureConverterShaderGen.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/TextureConverterShaderGen.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/TextureConverterShaderGen.cpp
+@@ -125,8 +125,8 @@
+     // §28at: WebGPU/Vulkan EFB-copy depth stays non-inverted to match
+     // the flag-independent VS + de-inverted peek/clear. NO-OP at
+     // flag=true. OGL/D3D/SW untouched.
+-    if (!g_backend_info.bSupportsReversedDepthRange &&
+-        g_backend_info.api_type != APIType::Vulkan)
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!g_backend_info.bSupportsReversedDepthRange)
+       out.Write("  tex_sample.x = 1.0 - tex_sample.x;\n");
+ 
+     out.Write("  uint depth = uint(tex_sample.x * 16777216.0);\n"
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/TextureConversionShader.cpp b/vendor/dolphin/Source/Core/VideoCommon/TextureConversionShader.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/TextureConversionShader.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/TextureConversionShader.cpp
+@@ -140,8 +140,8 @@
+     // §28at: WebGPU/Vulkan EFB-copy depth stays non-inverted to match
+     // the flag-independent VS + de-inverted peek/clear. NO-OP at
+     // flag=true. OGL/D3D/SW untouched.
+-    if (!g_backend_info.bSupportsReversedDepthRange &&
+-        g_backend_info.api_type != APIType::Vulkan)
++    // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++    if (!g_backend_info.bSupportsReversedDepthRange)
+       code.Write("  tex_sample.x = 1.0 - tex_sample.x;\n");
+ 
+     code.Write("  uint depth = uint(tex_sample.x * 16777216.0);\n"
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.cpp b/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.cpp
+@@ -85,8 +85,8 @@
+   // convention (the EFB clear utility draw must agree with the
+   // flag-independent VS geometry depth + the de-inverted EFB
+   // peek/poke). NO-OP at flag=true. OGL/D3D/SW untouched.
+-  if (!g_backend_info.bSupportsReversedDepthRange &&
+-      g_backend_info.api_type != APIType::Vulkan)
++  // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++  if (!g_backend_info.bSupportsReversedDepthRange)
+     uniforms.clear_depth = 1.0f - uniforms.clear_depth;
+   g_vertex_manager->UploadUtilityUniforms(&uniforms, sizeof(uniforms));
+ 
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/EFBInterface.cpp b/vendor/dolphin/Source/Core/VideoCommon/EFBInterface.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/EFBInterface.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/EFBInterface.cpp
+@@ -103,8 +103,8 @@
+   // either — under flag=false that split the convention and HUNG the
+   // core on this PushBlockingEvent peek (frozen ~frame 781, §28as).
+   // NO-OP at flag=true (branch not taken). OGL/D3D/SW untouched.
+-  if (!g_backend_info.bSupportsReversedDepthRange &&
+-      g_backend_info.api_type != APIType::Vulkan)
++  // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++  if (!g_backend_info.bSupportsReversedDepthRange)
+     depth = 1.0f - depth;
+ 
+   // Convert to 24bit depth
+@@ -161,8 +161,8 @@
+   // §28at: keep the WebGPU/Vulkan non-inverted depth convention
+   // (matches the de-inverted PeekDepth above + the flag-independent
+   // VS). NO-OP at flag=true. OGL/D3D/SW untouched.
+-  if (!g_backend_info.bSupportsReversedDepthRange &&
+-      g_backend_info.api_type != APIType::Vulkan)
++  // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++  if (!g_backend_info.bSupportsReversedDepthRange)
+     depth = 1.0f - depth;
+ 
+   AsyncRequests::GetInstance()->PushEvent([x, y, depth] {
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp b/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp
+@@ -294,10 +294,8 @@
+   // clear regardless of the depth-range flag (NO-OP at flag=true).
+   g_gfx->SetAndClearFramebuffer(
+       m_efb_framebuffer.get(), {{0.0f, 0.0f, 0.0f, 0.0f}},
+-      (g_backend_info.bSupportsReversedDepthRange ||
+-       g_backend_info.api_type == APIType::Vulkan)
+-          ? 1.0f
+-          : 0.0f);
++      // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++      g_backend_info.bSupportsReversedDepthRange ? 1.0f : 0.0f);
+ 
+   // Pixel Shader uses EFB scale as a constant, dirty that in case it changed
+   Core::System::GetInstance().GetPixelShaderManager().Dirty();
+@@ -1158,10 +1156,8 @@
+     // regardless of the depth-range flag (NO-OP at flag=true).
+     g_gfx->SetAndClearFramebuffer(
+         m_efb_framebuffer.get(), {{0.0f, 0.0f, 0.0f, 0.0f}},
+-        (g_backend_info.bSupportsReversedDepthRange ||
+-         g_backend_info.api_type == APIType::Vulkan)
+-            ? 1.0f
+-            : 0.0f);
++        // SNES Touch: the WebGPU backend was exempted from this conversion, but its vertex shader writes a reversed depth buffer (near = 1, see the pixel-centre depth transform in VertexShaderGen), so the standard conversion is right; the exemption fogged everything near the camera to the fog colour.
++        g_backend_info.bSupportsReversedDepthRange ? 1.0f : 0.0f);
+     return;
+   }
  

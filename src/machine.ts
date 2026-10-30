@@ -30,5 +30,7 @@ export interface Machine {
   saveFiles?(): Promise<Record<string, Uint8Array>>
   /** The game's sound as a stream, for emulators whose audio the app doesn't tap itself. */
   audioStream?(): MediaStream | undefined
+  /** Silences the game, for emulators whose audio the app doesn't route itself (see audio.ts). */
+  setMuted?(muted: boolean): void
   exit(): void
 }

@@ -1,0 +1,13302 @@
+// Copyright 2014 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
+#include "Core/PowerPC/CachedInterpreter/WasmDeferredCompileQueue.h"
+
+#include <algorithm>
+
+#include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <fmt/ostream.h>
+
+#include "Common/CommonTypes.h"
+#include "Common/GekkoDisassembler.h"
+#include "Common/Logging/Log.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
+#include "Core/Core.h"
+#include "Core/CoreTiming.h"
+#ifdef __EMSCRIPTEN__
+#include "Core/WasmTimingProfile.h"
+#endif
+#include "Core/HLE/HLE.h"
+#include "Core/HW/CPU.h"
+#include "Core/HW/GPFifo.h"
+#include "Core/HW/Memmap.h"
+#include "Core/HW/SystemTimers.h"
+#include "Core/Host.h"
+#include "Core/PowerPC/Gekko.h"
+#include "Core/PowerPC/Interpreter/ExceptionUtils.h"
+#include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
+#include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/Jit64Common/Jit64Constants.h"
+#include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PPCAnalyst.h"
+#include "Core/PowerPC/PPCTables.h"
+#include "Core/PowerPC/PowerPC.h"
+#include "Core/System.h"
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+namespace
+{
+StaticExitLinks::Stats s_static_link_stats;
+}  // namespace
+#endif
+#line 56
+#ifndef DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH
+#define DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH 0
+#endif
+// SNES Touch: dispatch compiled blocks second in the hot chain (and inline the call) instead of
+// after every interpreter callback comparison plus an indirect call. With ~6 PowerPC instructions
+// per compiled block, that chain was a large share of the emulation thread.
+#undef DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH
+#define DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH 1
+
+#ifdef __EMSCRIPTEN__
+#ifndef DOLPHIN_WEB_INLINE_FAST_BRANCH
+#define DOLPHIN_WEB_INLINE_FAST_BRANCH 1
+#endif
+
+#if DOLPHIN_WEB_INLINE_FAST_BRANCH
+#define DOLPHIN_WEB_FAST_BRANCH_INLINE __attribute__((always_inline))
+#else
+#define DOLPHIN_WEB_FAST_BRANCH_INLINE
+#endif
+
+#if DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH
+#define DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE __attribute__((always_inline))
+#else
+#define DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE
+#endif
+#else
+#define DOLPHIN_WEB_FAST_BRANCH_INLINE
+#define DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE
+#endif
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#include <mbedtls/sha256.h>
+
+#ifndef DOLPHIN_WEB_HOT_COUNTERS
+#define DOLPHIN_WEB_HOT_COUNTERS 1
+#endif
+
+#ifndef DOLPHIN_WEB_HOT_DISPATCH_ORDER
+#define DOLPHIN_WEB_HOT_DISPATCH_ORDER 1
+#endif
+
+#if DOLPHIN_WEB_HOT_COUNTERS
+#define DOLPHIN_WEB_HOT_COUNT(statement) \
+  do                                         \
+  {                                          \
+    statement;                               \
+  } while (false)
+#else
+#define DOLPHIN_WEB_HOT_COUNT(statement) \
+  do                                         \
+  {                                          \
+  } while (false)
+#endif
+
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wmissing-variable-declarations"
+#endif
+// Synchronous WASM JIT block compile, called from the pthread that owns
+// the cached interpreter. Day-6 attempted to move this off the pthread
+// onto the discio worker (so a persistent IndexedDB-backed
+// Map<hash, WebAssembly.Module> could short-circuit repeat compiles via
+// MAIN_THREAD_EM_ASM_INT) — that work is documented as a dead end in
+// patches/dolphin-wasm/SESSION-2026-05-12-DAY-6-NOTES.md. Bottom line:
+// the WebAssembly function table is not shared across pthreads in
+// current implementations, so growing/writing it on the worker side
+// does not update what the pthread sees, and call_indirect at the
+// returned index fails with "table index is out of bounds".
+EM_JS(int, DolphinWeb_CachedInterpreterCompileWasmBlock,
+      (const unsigned char* bytes_ptr, int bytes_len, const char* cache_key_ptr,
+       int read_u32_index, int write_u32_index,
+       int read_u8_index, int write_u8_index, int read_u16_index, int write_u16_index,
+       int lfs_index, int stfs_index, int lfd_index, int fmr_index, int system_index,
+       int fp_index, int fctiwz_index, int interpret_index, int fastcheck_gpfifo_index,
+       int fast_os_interrupt_call_index, int fast_melee_input_status_call_index,
+       int fast_melee_status_call_index, int fast_melee_service_poll_call_index), {
+  // Day-7 Phase B: cache lookup before WebAssembly.Module compilation.
+  // Module._dolphinJitCache is populated on each pthread by the pre-js
+  // receiver (tools/jit-cache-prejs.js) when the discio worker sends a
+  // "dolphin-jit-cache" postMessage at boot. Cache hits skip the expensive
+  // Module() constructor and go straight to Instance() with current imports.
+  let cacheKey = null;
+  let mod = null;
+  if (Module._dolphinJitCache && bytes_len > 0) {
+    // Native code hashes the exact generated bytes. The versioned domain is
+    // shared with the IDB/prebuilt verifier, so a claimed key can never alias
+    // different executable bytes as the legacy 32-bit FNV key could.
+    cacheKey = UTF8ToString(cache_key_ptr);
+    mod = Module._dolphinJitCache.get(cacheKey);
+  }
+  // §28cd spike audit: time the synchronous WebAssembly.Module compile
+  // and WebAssembly.Instance, the two main-thread-blocking calls on the
+  // pthread CPU loop. Track totals and worst-single events to attribute
+  // the 1515ms-class spikes observed in §28bz. Stored in C++ atomic globals
+  // (not Module._foo) because main-thread GetPpcWasmHelperStats and the
+  // CPU-pthread compile path are different pthreads with different Module
+  // contexts — JS-side state would never be visible across.
+  if (!mod) {
+    const bytes = Module.HEAPU8.slice(bytes_ptr, bytes_ptr + bytes_len);
+    const t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+    mod = new WebAssembly.Module(bytes);
+    const t1 = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+    const dt_us = Math.floor((t1 - t0) * 1000);
+    _DolphinWeb_RecordModuleUs(dt_us);
+    if (Module._dolphinJitCache && cacheKey) {
+      Module._dolphinJitCache.set(cacheKey, mod);
+      _DolphinWeb_RecordCacheMiss();
+      // Phase C: notify discio worker via self.postMessage so it can copy
+      // these bytes and write to IndexedDB for persistence across reloads.
+      try {
+        self.postMessage({
+          type: "dolphin-jit-new-compile",
+          hash: cacheKey,
+          bytes: bytes
+        });
+      } catch (e) {
+        // Non-fatal: the cache still works in-session.
+      }
+    }
+  } else {
+    _DolphinWeb_RecordCacheHit();
+  }
+  const inst_t0 = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+  const fn =
+      new WebAssembly.Instance(mod, {
+        env: {
+          memory: wasmMemory,
+          read_u32: wasmTable.get(read_u32_index),
+          write_u32: wasmTable.get(write_u32_index),
+          read_u8: wasmTable.get(read_u8_index),
+          write_u8: wasmTable.get(write_u8_index),
+          read_u16: wasmTable.get(read_u16_index),
+          write_u16: wasmTable.get(write_u16_index),
+          lfs: wasmTable.get(lfs_index),
+          stfs: wasmTable.get(stfs_index),
+          lfd: wasmTable.get(lfd_index),
+          fmr: wasmTable.get(fmr_index),
+          system: wasmTable.get(system_index),
+          fp: wasmTable.get(fp_index),
+          fctiwz: wasmTable.get(fctiwz_index),
+          interpret: wasmTable.get(interpret_index),
+          fastcheck_gpfifo: wasmTable.get(fastcheck_gpfifo_index),
+          fast_os_interrupt_call: wasmTable.get(fast_os_interrupt_call_index),
+          fast_melee_input_status_call: wasmTable.get(fast_melee_input_status_call_index),
+          fast_melee_status_call: wasmTable.get(fast_melee_status_call_index),
+          fast_melee_service_poll_call: wasmTable.get(fast_melee_service_poll_call_index)
+        }
+      }).exports.f;
+  const inst_t1 = (typeof performance !== "undefined" && performance.now) ? performance.now() : 0;
+  const inst_us = Math.floor((inst_t1 - inst_t0) * 1000);
+  _DolphinWeb_RecordInstanceUs(inst_us);
+  const index = wasmTable.length;
+  wasmTable.grow(1);
+  wasmTable.set(index, fn);
+  return index | 0;
+});
+
+static std::array<char, 86> DolphinWeb_MakeWasmBlockCacheKey(std::span<const u8> bytes)
+{
+  static constexpr std::string_view prefix = "wasm-block-sha256-v1:";
+  static constexpr char hex[] = "0123456789abcdef";
+  static_assert(prefix.size() + 64 + 1 == 86);
+
+  std::array<unsigned char, 32> digest{};
+  std::array<char, 86> key{};
+  if (mbedtls_sha256_ret(bytes.data(), bytes.size(), digest.data(), 0) != 0)
+    return key;
+  std::copy(prefix.begin(), prefix.end(), key.begin());
+  std::size_t offset = prefix.size();
+  for (const unsigned char byte : digest)
+  {
+    key[offset++] = hex[byte >> 4];
+    key[offset++] = hex[byte & 0x0f];
+  }
+  key[offset] = '\0';
+  return key;
+}
+
+
+EM_JS(int, DolphinWeb_CachedInterpreterRunWasmBlockForTest, (int handle, int state_ptr), {
+  return wasmTable.get(handle)(state_ptr) | 0;
+});
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+
+namespace
+{
+// Bitmask of CachedInterpreter fast-path categories the host has asked us to
+// skip. Set via the SetCachedInterpreterDisableMask extern "C" entry (wired
+// up through `?disable=...` URL flag → worker → Module → setter) so the same
+// build can bisect categories without rebuilding. Cleared = nothing disabled,
+// emit everything as usual. See enum DolphinWebDisableBit below.
+//
+// Atomic because the setter is callable from the JS main thread while the
+// JIT compiler runs on the Dolphin CPU thread. Relaxed ordering is fine —
+// we're toggling discrete categories that take effect on the next compile
+// attempt; we don't promise instant per-block synchronization.
+std::atomic<u32> s_dolphin_web_disable_mask{0};
+
+constexpr u32 DOLPHIN_WEB_DISABLE_MELEELOOP   = 1u << 0;  // MeleeIdlePollLoop + MeleeTitleLoop
+constexpr u32 DOLPHIN_WEB_DISABLE_MELEECALL   = 1u << 1;  // 5 Melee fast call-branch helpers
+constexpr u32 DOLPHIN_WEB_DISABLE_OSINTERRUPT = 1u << 2;  // OsInterruptFunction + call-branch
+constexpr u32 DOLPHIN_WEB_DISABLE_DCBXLOOP    = 1u << 3;  // DcbxLoop
+constexpr u32 DOLPHIN_WEB_DISABLE_FASTBRANCH  = 1u << 4;  // FastBranch + FastBranchBdnz
+constexpr u32 DOLPHIN_WEB_DISABLE_FASTFP      = 1u << 5;  // FastFloat emit path
+constexpr u32 DOLPHIN_WEB_DISABLE_FASTINT     = 1u << 6;  // FastInteger emit path
+constexpr u32 DOLPHIN_WEB_DISABLE_FASTSYSTEM  = 1u << 7;  // mfmsr/mtmsr/spr/sync/dcbx/etc
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMBLOCK   = 1u << 8;  // WASM JIT block emitter (all)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMCARRY   = 1u << 9;  // OPCD-31 carry ops (all 5)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMADDC    = 1u << 10; // addcx  only (SUBOP10=10)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMSUBFC   = 1u << 11; // subfcx only (SUBOP10=8)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMADDE    = 1u << 12; // addex  only (SUBOP10=138)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMSUBFE   = 1u << 13; // subfex only (SUBOP10=136)
+constexpr u32 DOLPHIN_WEB_DISABLE_WASMADDZE   = 1u << 14; // addzex only (SUBOP10=202)
+constexpr u32 DOLPHIN_WEB_DISABLE_BLOCK_REDISPATCH = 1u << 15; // §28bt in-place block re-dispatch
+constexpr u32 DOLPHIN_WEB_DISABLE_BLOCK_MERGE = 1u << 17; // §28bx adjacent-block merge (default-off)
+// SNES Touch: compiled blocks run on past not-taken conditional branches (default-on; ?sideexit=0
+// turns it off).
+constexpr u32 DOLPHIN_WEB_DISABLE_SIDE_EXITS = 1u << 18;
+// SNES Touch: a block that branches back to its own start loops inside its WASM function while
+// its cycle budget lasts (default-on; ?wasmloop=0 turns it off).
+constexpr u32 DOLPHIN_WEB_DISABLE_WASM_LOOPS = 1u << 16;
+constexpr u32 DOLPHIN_WEB_DISABLE_REGALLOC    = 1u << 20; // §28by GPR regalloc / dead-store-skip (default-off)
+constexpr u32 DOLPHIN_WEB_DISABLE_SHORT_PREFIX = 1u << 21; // §28ca lower JIT min-prefix 4→2 (default-off)
+constexpr u32 DOLPHIN_WEB_DISABLE_COMPILE_THROTTLE = 1u << 22; // §28ce cap JIT compiles/slice (default-off)
+// §28cz fastmem bounds-check HOIST. ENABLE polarity (NOT a disable bit): the
+// per-block range-check hoist is emitted ONLY when this bit is SET. Default
+// mask 0 → feature OFF → byte-identical codegen to today. ?fastmemhoist=1 opts
+// in. Scoped to 32-bit D-form int load/store (lwz/lwzu/stw/stwu, OPCD 32/33/36/37).
+constexpr u32 DOLPHIN_WEB_ENABLE_FASTMEM_HOIST = 1u << 23;
+// §28ce burst smearing: when ENABLED (gate bit CLEARED), TryWriteWasmBlock
+// returns false (falls to interpret) once this many compiles OR this much
+// compile wall time have happened in the current CoreTiming slice. Smears
+// the cold-start 1.6s compile burst across thousands of slices instead of
+// one freeze. Per-slice counter reset in CachedInterpreter::Run().
+constexpr u32 COMPILE_THROTTLE_MAX_PER_SLICE = 8;
+constexpr u32 COMPILE_THROTTLE_MAX_US_PER_SLICE = 5000;
+
+inline bool DolphinWebHelperDisabled(u32 bit)
+{
+  return (s_dolphin_web_disable_mask.load(std::memory_order_relaxed) & bit) != 0;
+}
+
+// §28cz ENABLE-polarity gate (opposite of DolphinWebHelperDisabled): the
+// fastmem-hoist feature is active only when its bit is SET in the mask.
+inline bool DolphinWebFeatureEnabled(u32 bit)
+{
+  return (s_dolphin_web_disable_mask.load(std::memory_order_relaxed) & bit) != 0;
+}
+
+u32 s_wasm_block_compile_count = 0;
+u32 s_wasm_block_merge_count = 0; // §28bx adjacent-block merges performed
+u32 s_wasm_regalloc_dead_store_skip_count = 0; // §28by GPR dead-store skips (per emit, sum across blocks)
+u32 s_wasm_block_run_count = 0;
+u32 s_wasm_block_reject_log_count = 0;
+u32 s_wasm_block_attempt_count = 0;
+u32 s_wasm_block_compile_fail_count = 0;
+u32 s_wasm_block_emit_fail_count = 0;
+u32 s_wasm_block_full_compile_count = 0;
+u32 s_wasm_block_partial_compile_count = 0;
+u32 s_wasm_block_mixed_compile_count = 0;
+u32 s_wasm_block_too_short_count = 0;
+u32 s_wasm_block_too_short_end_count = 0;
+u32 s_wasm_prefix_instruction_sum = 0;
+u32 s_wasm_prefix_instruction_max = 0;
+std::array<u32, 5> s_wasm_prefix_histogram{};
+u32 s_wasm_helper_call_count = 0;
+u32 s_wasm_helper_halt_count = 0;
+u32 s_wasm_system_call_count = 0;
+u32 s_wasm_fp_call_count = 0;
+u32 s_wasm_gpfifo_fastcheck_count = 0;
+u32 s_wasm_lfs_call_count = 0;
+u32 s_wasm_stfs_call_count = 0;
+u32 s_wasm_lfd_call_count = 0;
+u32 s_wasm_fmr_call_count = 0;
+u32 s_wasm_fctiwz_call_count = 0;
+u32 s_wasm_psq_fast_c_count = 0;
+// §28bz audit (transient, emit-time): state_ptr-indirected memory traffic the JIT emits.
+// These are proxies for GPR/FPR cross-block promotion EV — total static count, multiply by
+// per-block run frequency for a runtime estimate.
+u32 s_wasm_emit_state_load_u32_count = 0;   // GPR-loads + XER/u32 fields
+u32 s_wasm_emit_state_store_u32_count = 0;  // GPR-stores + XER/u32 fields
+u32 s_wasm_emit_state_load_f64_count = 0;   // FPR double-precision loads
+u32 s_wasm_emit_state_store_f64_count = 0;  // FPR double-precision stores
+u32 s_wasm_emit_state_load_i64_count = 0;   // PSI lower-half (paired-single) loads
+u32 s_wasm_emit_state_store_i64_count = 0;  // PSI lower-half stores
+// §28cy fastmem-hoist coverage audit (ZERO-RUNTIME-COST, compile-time-only static
+// measurement — NO codegen change, NO emitted WASM). Per compiled block, count how
+// many D-form integer guest memory accesses could be covered by a per-block
+// bounds-check hoist: consecutive D-form int load/stores sharing the same base reg
+// rA, where the run is terminated the moment any op writes that base reg (regsOut).
+// A run is "hoistable" if it has >=2 covered accesses and base != 0. u64 because
+// these accumulate across all blocks over a full session.
+u64 s_fmh_total_dform_accesses = 0;  // all D-form int load/store accesses seen (OPCD 32-45)
+u64 s_fmh_xform_accesses = 0;        // all X-form (excluded, OPCD-31 indexed) int load/store accesses
+u64 s_fmh_hoistable_groups = 0;      // number of hoistable groups (>=2 covered, base!=0)
+u64 s_fmh_covered_accesses = 0;      // sum of accesses inside hoistable groups
+u64 s_fmh_blocks_with_hoist = 0;     // blocks that had >=1 hoistable group
+// §28cz RUNTIME hoist-fire counters (compile-time tally, but they only advance
+// when the ?fastmemhoist=1 enable bit is set so the A/B can confirm the path
+// actually engaged). groups = range-checks emitted; fast = covered accesses that
+// got the in-bounds-proven path emitted; slow = covered accesses still on the
+// existing checked emitter (e.g. 8/16-bit members of a 32-bit-scoped group).
+u64 s_fmh_fire_groups = 0;
+u64 s_fmh_fire_fast = 0;
+u64 s_fmh_fire_slow = 0;
+// §28bz audit: §28bt re-dispatch chain depth. entry = outer for(;;) iterations,
+// iter = continue-edges taken inside the redispatch branch. avg depth = 1 + iter/entry.
+#if DOLPHIN_WEB_HOT_COUNTERS
+u32 s_wasm_redispatch_entry_count = 0;
+u32 s_wasm_redispatch_iter_count = 0;
+#endif
+// §28cd spike audit: WebAssembly.Module()/Instance() synchronous wall time
+// on the pthread CPU loop. Atomic because the EM_JS compile path runs on
+// the CPU pthread while GetPpcWasmHelperStats may be called from main.
+std::atomic<u32> s_wasm_module_us_total{0};
+std::atomic<u32> s_wasm_module_us_max{0};
+std::atomic<u32> s_wasm_instance_us_total{0};
+std::atomic<u32> s_wasm_instance_us_max{0};
+std::atomic<u32> s_wasm_cache_hit_count{0};
+std::atomic<u32> s_wasm_cache_miss_count{0};
+// §28ce per-slice budget tracking. Plain non-atomic because read+written
+// only from the CPU pthread (TryWriteWasmBlock, Record*, Run()).
+u32 s_wasm_compiles_this_slice = 0;
+u32 s_wasm_compile_us_this_slice = 0;
+// §28ce stats: cumulative throttle rejects, peak burst (max compiles
+// observed in any one slice), peak compile-time burst (max us observed
+// in any one slice). All atomic for cross-thread read by stats.
+std::atomic<u32> s_wasm_compile_throttle_reject_count{0};
+std::atomic<u32> s_wasm_compile_burst_max_per_slice{0};
+std::atomic<u32> s_wasm_compile_us_burst_max_per_slice{0};
+// §28cn per-slice CPU-pthread profiling. Times each iteration of the
+// Run() while loop (one CoreTiming slice = one Advance + downcount-many
+// ExecuteOneBlock calls). max_us captures the worst single slice — if
+// this is >16000us we've blown the 60Hz frame budget. compile_us is
+// already tracked via s_wasm_compile_us_this_slice (§28ce); subtract
+// from slice total to get pure-run time.
+std::atomic<u32> s_runloop_total_us{0};
+std::atomic<u32> s_runloop_max_per_slice_us{0};
+std::atomic<u32> s_runloop_max_run_only_us{0};   // total - compile
+std::atomic<u32> s_runloop_slice_count{0};
+// §28co: split the slice into Advance vs ExecuteOneBlock loop so we know
+// WHICH piece eats the budget on the worst slice. Advance runs scheduled
+// CoreTiming events (audio mixing, VI vsync, DSP, OS interrupts);
+// ExecuteOneBlock loops through JIT/interpret blocks until downcount=0.
+std::atomic<u32> s_runloop_advance_max_us{0};
+std::atomic<u32> s_runloop_exec_max_us{0};
+}  // namespace
+
+// §28cd spike audit recorders. Called from EM_JS compile-block JS body
+// (different pthread than the main thread that reads stats); routes
+// through atomic globals for cross-thread visibility.
+extern "C" void DolphinWeb_RecordModuleUs(int dt_us)
+{
+  if (dt_us < 0) return;
+  const u32 dt = static_cast<u32>(dt_us);
+  DolphinWeb::WasmTimingProfile::RecordCompileUs(dt);
+  s_wasm_module_us_total.fetch_add(dt, std::memory_order_relaxed);
+  u32 prev_max = s_wasm_module_us_max.load(std::memory_order_relaxed);
+  while (dt > prev_max &&
+         !s_wasm_module_us_max.compare_exchange_weak(prev_max, dt,
+                                                     std::memory_order_relaxed)) {}
+  // §28ce: accumulate into per-slice budget; recorded next time
+  // TryWriteWasmBlock asks "do we still have budget?" Each compile counts
+  // once. Always tracked (no gate) so peak-burst stats stay accurate
+  // regardless of throttle enablement — only the reject path is gated.
+  s_wasm_compiles_this_slice++;
+  s_wasm_compile_us_this_slice += dt;
+}
+extern "C" void DolphinWeb_RecordInstanceUs(int dt_us)
+{
+  if (dt_us < 0) return;
+  DolphinWeb::WasmTimingProfile::RecordCompileUs(static_cast<u32>(dt_us));
+  s_wasm_instance_us_total.fetch_add(static_cast<u32>(dt_us), std::memory_order_relaxed);
+  u32 prev_max = s_wasm_instance_us_max.load(std::memory_order_relaxed);
+  while (static_cast<u32>(dt_us) > prev_max &&
+         !s_wasm_instance_us_max.compare_exchange_weak(prev_max, static_cast<u32>(dt_us),
+                                                       std::memory_order_relaxed)) {}
+}
+extern "C" void DolphinWeb_RecordCacheHit()
+{
+  s_wasm_cache_hit_count.fetch_add(1, std::memory_order_relaxed);
+}
+extern "C" void DolphinWeb_RecordCacheMiss()
+{
+  s_wasm_cache_miss_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace
+{
+bool s_wasm_jit_enabled = false;
+// Requested by the host; effective code-generation policy is owned by the CPU.
+std::atomic<int> s_requested_wasm_policy{0};
+std::atomic<int> s_applied_wasm_policy{0};
+const CachedInterpreter* s_wasm_policy_owner = nullptr;
+void ApplyRequestedWasmPolicy(CachedInterpreter& cpu);
+
+// All accesses are on the owning CPU thread. Do not erase cached callbacks
+// until the previous timing slice has finished executing them.
+std::unordered_map<const CachedInterpreter*, DeferredJit::Queue> s_deferred_wasm_queues;
+
+void RetryDeferredWasmBlocks(CachedInterpreter& cpu)
+{
+  if (!s_wasm_jit_enabled)
+  {
+    s_deferred_wasm_queues.erase(&cpu);
+    return;
+  }
+  auto found = s_deferred_wasm_queues.find(&cpu);
+  if (found == s_deferred_wasm_queues.end())
+    return;
+  found->second.Drain(COMPILE_THROTTLE_MAX_PER_SLICE, [&cpu](const DeferredJit::Entry& entry) {
+    auto* cache = cpu.GetBlockCache();
+    const auto flags = static_cast<CPUEmuFeatureFlags>(entry.features);
+    auto* block = cache->GetBlockFromStartAddress(entry.address, flags);
+    if (block && block->normalEntry == entry.normal_entry)
+    {
+      cache->EraseSingleBlock(*block);
+    }
+  });
+  if (found->second.Empty())
+    s_deferred_wasm_queues.erase(found);
+}
+
+bool s_wasm_jit_direct_only = true;
+u32 s_wasm_direct_tier_reject_count = 0;
+// §28bj: was 2048 — far below Melee battle's ~6500 hot blocks, so
+// the mixed tier compiled only 2048 then stopped while the rest
+// still fell to the slow interpreter (measured: mixed:2048/2048,
+// short:2247, battle ~30%). Mixed keeps blocks alive with
+// per-instruction interpreter STUBS instead of guarded's
+// whole-block reject, so an adequate cap should eliminate the
+// §28bh short-block interpreter fallback that is the ~3× drain.
+// JIT cache cap is already 49152 (§28u) so memory headroom exists.
+constexpr u32 MAX_WASM_MIXED_COMPILED_BLOCKS = 32768;
+bool s_ppc_block_profile_enabled = false;
+u32 s_ppc_profile_total_blocks = 0;
+u32 s_ppc_profile_sample_blocks = 0;
+u32 s_ppc_profile_total_us = 0;
+u32 s_ppc_profile_max_us = 0;
+u32 s_ppc_profile_window_sample_blocks = 0;
+u32 s_ppc_profile_window_total_us = 0;
+u32 s_ppc_profile_window_max_us = 0;
+u32 s_ppc_profile_window_collision_count = 0;
+constexpr u32 PPC_PROFILE_SAMPLE_MASK = 1023;
+std::array<u32, 64 * 1024> s_wasm_direct_reject_key_counts{};
+std::array<u32, 64 * 1024> s_wasm_emit_fail_key_counts{};
+std::array<u32, 64 * 1024> s_wasm_emit_fail_sample_pcs{};
+std::array<u32, 64 * 1024> s_wasm_helper_key_counts{};
+std::array<u32, 64 * 1024> s_wasm_system_key_counts{};
+std::array<u32, 64 * 1024> s_wasm_fp_key_counts{};
+std::array<u32, 1024> s_wasm_helper_mfspr_counts{};
+std::array<u32, 1024> s_wasm_helper_mtspr_counts{};
+std::array<u32, 32 * 32> s_wasm_helper_branch_key_counts{};
+std::array<u32, 32 * 32> s_wasm_helper_branch_sample_insts{};
+std::array<u32, 32 * 32> s_wasm_helper_branch_sample_pcs{};
+std::array<u32, 16> s_wasm_psq_fallback_counts{};
+std::array<u32, 2 * 8 * 64> s_wasm_psq_type_scale_counts{};
+std::array<u32, 2 * 8 * 64> s_wasm_psq_type_scale_sample_addresses{};
+u32 s_fast_dcbx_loop_blocks = 0;
+u32 s_fast_dcbx_loop_extra_iterations = 0;
+u32 s_fast_dcbx_loop_lines = 0;
+u32 s_fast_dcbx_loop_skipped_large_invalidations = 0;
+u32 s_fast_dcbx_loop_skipped_large_lines = 0;
+u32 s_fast_float_ops = 0;
+u32 s_fast_float_fmr_ops = 0;
+u32 s_fast_float_fmuls_ops = 0;
+u32 s_fast_float_fmadds_ops = 0;
+u32 s_fast_float_lfs_ops = 0;
+u32 s_fast_float_lfsx_ops = 0;
+u32 s_fast_float_lfd_ops = 0;
+u32 s_fast_float_stfs_ops = 0;
+u32 s_fast_float_stfsx_ops = 0;
+u32 s_fast_float_stfiwx_ops = 0;
+u32 s_fast_float_fadds_ops = 0;
+u32 s_fast_float_fsubs_ops = 0;
+u32 s_fast_float_fnmsubs_ops = 0;
+u32 s_fast_float_fctiwz_ops = 0;
+u32 s_fast_float_fneg_ops = 0;
+u32 s_fast_float_fnabs_ops = 0;
+u32 s_fast_float_fabs_ops = 0;
+u32 s_fast_float_simple_fmuls_ops = 0;
+u32 s_fast_float_simple_fmadds_ops = 0;
+u32 s_fast_float_simple_fadds_ops = 0;
+u32 s_fast_float_simple_fsubs_ops = 0;
+u32 s_fast_float_simple_fnmsubs_ops = 0;
+u32 s_fast_float_simple_fctiwz_ops = 0;
+u32 s_fast_integer_mulli_ops = 0;
+u32 s_fast_integer_subfic_ops = 0;
+u32 s_fast_integer_addic_ops = 0;
+u32 s_fast_integer_addic_rc_ops = 0;
+u32 s_fast_system_isync_ops = 0;
+u32 s_fast_system_sync_ops = 0;
+u32 s_fast_word_mem_ops = 0;
+u32 s_fast_word_mem_lwz_ops = 0;
+u32 s_fast_word_mem_lwzu_ops = 0;
+u32 s_fast_word_mem_stw_ops = 0;
+u32 s_fast_word_mem_stwu_ops = 0;
+u32 s_fast_word_mem_lwzx_ops = 0;
+u32 s_fast_word_mem_lwzux_ops = 0;
+u32 s_fast_word_mem_stwx_ops = 0;
+u32 s_fast_word_mem_stwux_ops = 0;
+u32 s_fast_byte_half_mem_ops = 0;
+u32 s_fast_byte_mem_load_ops = 0;
+u32 s_fast_byte_mem_store_ops = 0;
+u32 s_fast_half_mem_load_ops = 0;
+u32 s_fast_half_mem_store_ops = 0;
+u32 s_fast_multiword_mem_ops = 0;
+u32 s_fast_melee_idle_poll_loop_compile_attempts = 0;
+u32 s_fast_melee_idle_poll_loop_compile_rejects = 0;
+u32 s_fast_melee_idle_poll_loop_mismatch_address = 0xffffffff;
+u32 s_fast_melee_idle_poll_loop_mismatch_expected = 0;
+u32 s_fast_melee_idle_poll_loop_mismatch_actual = 0;
+u32 s_fast_melee_idle_poll_loop_blocks = 0;
+u32 s_fast_melee_idle_poll_loop_iterations = 0;
+u32 s_fast_melee_idle_poll_loop_exits = 0;
+u32 s_fast_melee_idle_poll_loop_rejects = 0;
+u32 s_fast_melee_idle_poll_loop_fallbacks = 0;
+u32 s_fast_melee_idle_poll_loop_throttles = 0;
+u32 s_fast_melee_title_loop_compile_attempts = 0;
+u32 s_fast_melee_title_loop_compile_rejects = 0;
+u32 s_fast_melee_title_loop_mismatch_offset = 0xffffffff;
+u32 s_fast_melee_title_loop_mismatch_expected = 0;
+u32 s_fast_melee_title_loop_mismatch_actual = 0;
+u32 s_fast_melee_title_loop_blocks = 0;
+u32 s_fast_melee_title_loop_iterations = 0;
+u32 s_fast_melee_title_loop_rejects = 0;
+u32 s_fast_os_interrupt_compile_attempts = 0;
+u32 s_fast_os_interrupt_compile_rejects = 0;
+u32 s_fast_os_interrupt_mismatch_address = 0xffffffff;
+u32 s_fast_os_interrupt_mismatch_expected = 0;
+u32 s_fast_os_interrupt_mismatch_actual = 0;
+u32 s_fast_os_interrupt_disable_ops = 0;
+u32 s_fast_os_interrupt_enable_ops = 0;
+u32 s_fast_os_interrupt_restore_ops = 0;
+u32 s_fast_os_interrupt_inline_ops = 0;
+u32 s_fast_os_interrupt_inline_fallbacks = 0;
+u32 s_fast_os_interrupt_verified_modes = 0;
+u32 s_fast_melee_input_status_verify_attempts = 0;
+u32 s_fast_melee_input_status_verify_rejects = 0;
+u32 s_fast_melee_input_status_inline_ops = 0;
+u32 s_fast_melee_input_status_inline_fallbacks = 0;
+u32 s_fast_melee_input_status_cycles = 0;
+u32 s_fast_melee_input_status_loadstores = 0;
+bool s_fast_melee_input_status_verified = false;
+u32 s_fast_melee_status_fn_verify_attempts = 0;
+u32 s_fast_melee_status_fn_verify_rejects = 0;
+u32 s_fast_melee_status_fn_inline_ops = 0;
+u32 s_fast_melee_status_fn_inline_fallbacks = 0;
+bool s_fast_melee_status_fn_verified = false;
+u32 s_fast_melee_service_poll_verify_attempts = 0;
+u32 s_fast_melee_service_poll_verify_rejects = 0;
+u32 s_fast_melee_service_poll_inline_ops = 0;
+u32 s_fast_melee_service_poll_inline_fallbacks = 0;
+u32 s_fast_melee_service_poll_cycles = 0;
+u32 s_fast_melee_service_poll_loadstores = 0;
+bool s_fast_melee_service_poll_verified = false;
+u32 s_fast_melee_si_poll_verify_attempts = 0;
+u32 s_fast_melee_si_poll_verify_rejects = 0;
+u32 s_fast_melee_si_poll_inline_ops = 0;
+u32 s_fast_melee_si_poll_inline_fallbacks = 0;
+u32 s_fast_melee_si_poll_cycles = 0;
+u32 s_fast_melee_si_poll_loadstores = 0;
+bool s_fast_melee_si_poll_verified = false;
+u32 s_fast_melee_input_poll_verify_attempts = 0;
+u32 s_fast_melee_input_poll_verify_rejects = 0;
+u32 s_fast_melee_input_poll_inline_ops = 0;
+u32 s_fast_melee_input_poll_inline_fallbacks = 0;
+u32 s_fast_melee_input_poll_cycles = 0;
+u32 s_fast_melee_input_poll_loadstores = 0;
+bool s_fast_melee_input_poll_verified = false;
+u32 s_fast_branch_ops = 0;
+u32 s_fast_branch_bcx_ops = 0;
+u32 s_fast_branch_bx_ops = 0;
+u32 s_fast_branch_bclrx_ops = 0;
+u32 s_fast_branch_bcctrx_ops = 0;
+u32 s_fast_branch_bdnz_ops = 0;
+constexpr u32 OS_INTERRUPT_DISABLE = 0;
+constexpr u32 OS_INTERRUPT_ENABLE = 1;
+constexpr u32 OS_INTERRUPT_RESTORE = 2;
+constexpr u32 OS_INTERRUPT_DISABLE_PC = 0x80347364;
+constexpr u32 OS_INTERRUPT_ENABLE_PC = 0x80347378;
+constexpr u32 OS_INTERRUPT_RESTORE_PC = 0x8034738c;
+constexpr u32 MELEE_INPUT_STATUS_PC = 0x8037699c;
+constexpr u32 MELEE_INPUT_STATUS_BYTE_ADDRESS = 0x804c1f7b;
+constexpr u32 MELEE_STATUS_FN_PC = 0x80339b4c;
+constexpr u32 MELEE_STATUS_IDLE_POINTER = 0x804a75e0;
+constexpr u32 MELEE_SERVICE_POLL_PC = 0x800195d0;
+constexpr u32 MELEE_SI_POLL_PC = 0x8001cc84;
+constexpr u32 MELEE_SI_POLL_STATE_ADDRESS = 0x80433328;
+constexpr u32 MELEE_SI_POLL_PENDING_ADDRESS = 0x80433324;
+constexpr u32 MELEE_INPUT_POLL_PC = 0x80019894;
+constexpr u32 MELEE_INPUT_POLL_STATE_BASE = 0x804329f0;
+constexpr u32 MELEE_IDLE_POLL_LOOP_PC = 0x801a4da8;
+constexpr u32 MELEE_IDLE_POLL_LOOP_END_PC = 0x801a4db8;
+constexpr u32 MELEE_IDLE_POLL_LOOP_MAX_BATCH = 256;
+constexpr u32 MELEE_IDLE_POLL_LOOP_NO_EXIT_THROTTLE_BLOCKS = 8192;
+constexpr u32 MELEE_STATUS_COMMON_CYCLES = 28;
+constexpr u32 OS_INTERRUPT_DISABLE_CYCLES = 5;
+constexpr u32 OS_INTERRUPT_ENABLE_CYCLES = 5;
+constexpr u32 OS_INTERRUPT_RESTORE_ENABLE_CYCLES = 8;
+constexpr u32 OS_INTERRUPT_RESTORE_DISABLE_CYCLES = 7;
+constexpr u32 MSR_EE_MASK = 0x8000;
+constexpr u32 DCBX_LOOP_CTR = 0;
+constexpr u32 DCBX_LOOP_COUNT_GPR = 1;
+constexpr u32 LARGE_DCBX_DATA_FLUSH_SKIP_LINES = 64;
+
+struct OsInterruptInlineTarget
+{
+  u32 mode;
+  u32 cycles_primary;
+  u32 cycles_secondary;
+};
+
+std::optional<OsInterruptInlineTarget> GetOsInterruptInlineTarget(u32 destination)
+{
+  switch (destination)
+  {
+  case OS_INTERRUPT_DISABLE_PC:
+    return OsInterruptInlineTarget{OS_INTERRUPT_DISABLE, OS_INTERRUPT_DISABLE_CYCLES,
+                                   OS_INTERRUPT_DISABLE_CYCLES};
+  case OS_INTERRUPT_ENABLE_PC:
+    return OsInterruptInlineTarget{OS_INTERRUPT_ENABLE, OS_INTERRUPT_ENABLE_CYCLES,
+                                   OS_INTERRUPT_ENABLE_CYCLES};
+  case OS_INTERRUPT_RESTORE_PC:
+    return OsInterruptInlineTarget{OS_INTERRUPT_RESTORE, OS_INTERRUPT_RESTORE_ENABLE_CYCLES,
+                                   OS_INTERRUPT_RESTORE_DISABLE_CYCLES};
+  default:
+    return std::nullopt;
+  }
+}
+
+u32 GetOsInterruptTargetPc(u32 mode)
+{
+  switch (mode)
+  {
+  case OS_INTERRUPT_DISABLE:
+    return OS_INTERRUPT_DISABLE_PC;
+  case OS_INTERRUPT_ENABLE:
+    return OS_INTERRUPT_ENABLE_PC;
+  case OS_INTERRUPT_RESTORE:
+    return OS_INTERRUPT_RESTORE_PC;
+  default:
+    return 0;
+  }
+}
+
+void MarkOsInterruptModeVerified(u32 mode)
+{
+  if (mode <= OS_INTERRUPT_RESTORE)
+    s_fast_os_interrupt_verified_modes |= 1u << mode;
+}
+
+bool IsOsInterruptModeVerified(u32 mode)
+{
+  return mode <= OS_INTERRUPT_RESTORE &&
+         (s_fast_os_interrupt_verified_modes & (1u << mode)) != 0;
+}
+
+std::optional<OsInterruptInlineTarget> GetDirectBranchOsInterruptTarget(UGeckoInstruction inst,
+                                                                       u32 current_pc)
+{
+  if (inst.OPCD != 18 || !inst.LK)
+    return std::nullopt;
+
+  u32 destination = u32(SignExt26(inst.LI << 2));
+  if (!inst.AA)
+    destination += current_pc;
+  return GetOsInterruptInlineTarget(destination);
+}
+
+bool IsDirectBranchLinkTo(UGeckoInstruction inst, u32 current_pc, u32 target)
+{
+  if (inst.OPCD != 18 || !inst.LK)
+    return false;
+
+  u32 destination = u32(SignExt26(inst.LI << 2));
+  if (!inst.AA)
+    destination += current_pc;
+  return destination == target;
+}
+
+struct PpcBlockProfileEntry
+{
+  u32 pc = 0;
+  u32 count = 0;
+  u32 total_us = 0;
+  u32 max_us = 0;
+};
+
+std::array<PpcBlockProfileEntry, 4096> s_ppc_profile_entries{};
+
+enum class PsqFallbackReason : u32
+{
+  NoFp = 0,
+  LittleEndian = 1,
+  Lsqe = 2,
+  NonFloat = 3,
+  OutsideMem1 = 4,
+  UpdateRaZero = 5,
+  ShouldHaveInlined = 6,
+  Count = 7,
+};
+
+u32 PairedQuantizedElementBytes(u32 type)
+{
+  switch (type)
+  {
+  case QUANTIZE_U8:
+  case QUANTIZE_S8:
+    return sizeof(u8);
+  case QUANTIZE_U16:
+  case QUANTIZE_S16:
+    return sizeof(u16);
+  case QUANTIZE_FLOAT:
+  default:
+    return sizeof(u32);
+  }
+}
+
+u32 SaturatingAddU32(u32 lhs, u32 rhs)
+{
+  return rhs > std::numeric_limits<u32>::max() - lhs ? std::numeric_limits<u32>::max() :
+                                                       lhs + rhs;
+}
+
+u64 SaturatingAddU64(u64 lhs, u64 rhs)
+{
+  return rhs > std::numeric_limits<u64>::max() - lhs ? std::numeric_limits<u64>::max() :
+                                                       lhs + rhs;
+}
+
+void UpdatePerformanceMonitorIfNeeded(u32 cycles, u32 num_load_stores, u32 num_fp_inst,
+                                      PowerPC::PowerPCState& ppc_state)
+{
+  if ((ppc_state.feature_flags & FEATURE_FLAG_PERFMON) != 0)
+    PowerPC::UpdatePerformanceMonitor(cycles, num_load_stores, num_fp_inst, ppc_state);
+}
+
+bool ExecuteFastOsInterruptInline(PowerPC::PowerPCState& ppc_state,
+                                  PowerPC::PowerPCManager& power_pc, u32 function_pc,
+                                  u32 return_pc, u32 mode, u32 cycles_primary,
+                                  u32 cycles_secondary)
+{
+  if (!IsOsInterruptModeVerified(mode))
+    return false;
+
+  ppc_state.pc = function_pc;
+  ppc_state.npc = return_pc;
+
+  if (ppc_state.msr.PR)
+  {
+    GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+    power_pc.CheckExceptions();
+    return true;
+  }
+
+  const u32 old_msr = ppc_state.msr.Hex;
+  u32 new_msr = old_msr;
+  u32 cycles = cycles_primary;
+
+  switch (mode)
+  {
+  case OS_INTERRUPT_DISABLE:
+    new_msr = old_msr & ~MSR_EE_MASK;
+    ppc_state.gpr[3] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[4] = new_msr;
+    ++s_fast_os_interrupt_disable_ops;
+    break;
+  case OS_INTERRUPT_ENABLE:
+    new_msr = old_msr | MSR_EE_MASK;
+    ppc_state.gpr[3] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[4] = new_msr;
+    ++s_fast_os_interrupt_enable_ops;
+    break;
+  case OS_INTERRUPT_RESTORE:
+    if (ppc_state.gpr[3] != 0)
+    {
+      new_msr = old_msr | MSR_EE_MASK;
+    }
+    else
+    {
+      new_msr = old_msr & ~MSR_EE_MASK;
+      cycles = cycles_secondary;
+    }
+    ppc_state.gpr[4] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[5] = new_msr;
+    ++s_fast_os_interrupt_restore_ops;
+    break;
+  default:
+    return false;
+  }
+
+  ppc_state.msr.Hex = new_msr;
+  if ((new_msr & MSR_EE_MASK) != 0 &&
+      (ppc_state.Exceptions &
+       (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER)) != 0)
+  {
+    power_pc.CheckExceptions();
+  }
+
+  ppc_state.pc = ppc_state.npc;
+  ppc_state.downcount -= static_cast<int>(cycles);
+  UpdatePerformanceMonitorIfNeeded(cycles, 0, 0, ppc_state);
+  ++s_fast_os_interrupt_inline_ops;
+  return true;
+}
+
+bool VerifyMeleeInputStatusFunction()
+{
+  if (s_fast_melee_input_status_verified)
+    return true;
+
+  ++s_fast_melee_input_status_verify_attempts;
+  const std::array<std::pair<u32, u32>, 15> expected = {{
+      {0x8037699c, 0x7c0802a6},  // mflr r0
+      {0x803769a0, 0x90010004},  // stw r0, 4(sp)
+      {0x803769a4, 0x9421ffe8},  // stwu sp, -0x18(sp)
+      {0x803769a8, 0x93e10014},  // stw r31, 0x14(sp)
+      {0x803769ac, 0x4bfd09b9},  // bl OSDisableInterrupts
+      {0x803769b0, 0x3c80804c},  // lis r4, 0x804c
+      {0x803769b4, 0x38841f78},  // addi r4, r4, 0x1f78
+      {0x803769b8, 0x8be40003},  // lbz r31, 3(r4)
+      {0x803769bc, 0x4bfd09d1},  // bl OSRestoreInterrupts
+      {0x803769c0, 0x7fe3fb78},  // mr r3, r31
+      {0x803769c4, 0x8001001c},  // lwz r0, 0x1c(sp)
+      {0x803769c8, 0x83e10014},  // lwz r31, 0x14(sp)
+      {0x803769cc, 0x38210018},  // addi sp, sp, 0x18
+      {0x803769d0, 0x7c0803a6},  // mtlr r0
+      {0x803769d4, 0x4e800020},  // blr
+  }};
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  auto& mmu = Core::System::GetInstance().GetMMU();
+  for (const auto& [address, expected_hex] : expected)
+  {
+    const auto result = mmu.TryReadInstruction(address);
+    if (!result.valid || result.hex != expected_hex)
+    {
+      ++s_fast_melee_input_status_verify_rejects;
+      return false;
+    }
+
+    const UGeckoInstruction inst{result.hex};
+    const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, address);
+    cycles += opinfo->num_cycles;
+    if ((opinfo->flags & FL_LOADSTORE) != 0)
+      ++loadstores;
+  }
+
+  s_fast_melee_input_status_cycles = cycles;
+  s_fast_melee_input_status_loadstores = loadstores;
+  s_fast_melee_input_status_verified = true;
+  return true;
+}
+
+bool TryReadFastMeleeInputStatusByte(PowerPC::PowerPCState& ppc_state, u32* value)
+{
+  if (ppc_state.msr.LE)
+    return false;
+
+  auto& memory = Core::System::GetInstance().GetMemory();
+  u8* ram = memory.GetRAM();
+  const u32 offset = MELEE_INPUT_STATUS_BYTE_ADDRESS & 0x3fffffff;
+  const u32 ram_size = memory.GetRamSizeReal();
+  if (ram == nullptr || offset >= ram_size)
+    return false;
+
+  *value = ram[offset];
+  return true;
+}
+
+bool ExecuteFastMeleeInputStatusInline(PowerPC::PowerPCState& ppc_state,
+                                       PowerPC::PowerPCManager& power_pc, u32 current_pc)
+{
+  const u32 return_pc = current_pc + sizeof(u32);
+  LR(ppc_state) = return_pc;
+
+  if (!VerifyMeleeInputStatusFunction() || !IsOsInterruptModeVerified(OS_INTERRUPT_DISABLE) ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_RESTORE))
+  {
+    ppc_state.npc = MELEE_INPUT_STATUS_PC;
+    ++s_fast_melee_input_status_inline_fallbacks;
+    return false;
+  }
+
+  u32 status = 0;
+  if (!TryReadFastMeleeInputStatusByte(ppc_state, &status))
+  {
+    ppc_state.npc = MELEE_INPUT_STATUS_PC;
+    ++s_fast_melee_input_status_inline_fallbacks;
+    return false;
+  }
+
+  if (!ExecuteFastOsInterruptInline(ppc_state, power_pc, OS_INTERRUPT_DISABLE_PC, 0x803769b0,
+                                    OS_INTERRUPT_DISABLE, OS_INTERRUPT_DISABLE_CYCLES,
+                                    OS_INTERRUPT_DISABLE_CYCLES))
+  {
+    ppc_state.npc = MELEE_INPUT_STATUS_PC;
+    ++s_fast_melee_input_status_inline_fallbacks;
+    return false;
+  }
+
+  const u32 interrupt_state = ppc_state.gpr[3];
+  ppc_state.gpr[3] = interrupt_state;
+  if (!ExecuteFastOsInterruptInline(ppc_state, power_pc, OS_INTERRUPT_RESTORE_PC, 0x803769c0,
+                                    OS_INTERRUPT_RESTORE,
+                                    OS_INTERRUPT_RESTORE_ENABLE_CYCLES,
+                                    OS_INTERRUPT_RESTORE_DISABLE_CYCLES))
+  {
+    ppc_state.npc = MELEE_INPUT_STATUS_PC;
+    ++s_fast_melee_input_status_inline_fallbacks;
+    return false;
+  }
+
+  ppc_state.gpr[3] = status;
+  ppc_state.pc = return_pc;
+  ppc_state.npc = return_pc;
+  ppc_state.downcount -= static_cast<int>(s_fast_melee_input_status_cycles);
+  UpdatePerformanceMonitorIfNeeded(s_fast_melee_input_status_cycles,
+                                   s_fast_melee_input_status_loadstores, 0, ppc_state);
+  ++s_fast_melee_input_status_inline_ops;
+  return true;
+}
+
+bool VerifyMeleeStatusFunction()
+{
+  if (s_fast_melee_status_fn_verified)
+    return true;
+
+  ++s_fast_melee_status_fn_verify_attempts;
+  const std::array<std::pair<u32, u32>, 43> expected = {{
+      {0x80339b4c, 0x7c0802a6},  // mflr r0
+      {0x80339b50, 0x90010004},  // stw r0, 4(sp)
+      {0x80339b54, 0x9421ffe8},  // stwu sp, -0x18(sp)
+      {0x80339b58, 0x93e10014},  // stw r31, 0x14(sp)
+      {0x80339b5c, 0x93c10010},  // stw r30, 0x10(sp)
+      {0x80339b60, 0x4800d805},  // bl OSDisableInterrupts
+      {0x80339b64, 0x800dbc10},  // lwz r0, -0x43f0(r13)
+      {0x80339b68, 0x3bc30000},  // mr r30, r3
+      {0x80339b6c, 0x2c000000},  // cmpwi r0, 0
+      {0x80339b70, 0x4182000c},  // beq -> next flag
+      {0x80339b74, 0x3be0ffff},  // li r31, -1
+      {0x80339b78, 0x4800005c},  // b -> restore
+      {0x80339b7c, 0x800dbc08},  // lwz r0, -0x43f8(r13)
+      {0x80339b80, 0x2c000000},  // cmpwi r0, 0
+      {0x80339b84, 0x4182000c},  // beq -> status pointer
+      {0x80339b88, 0x3be00008},  // li r31, 8
+      {0x80339b8c, 0x48000048},  // b -> restore
+      {0x80339b90, 0x83edbbf8},  // lwz r31, -0x4408(r13)
+      {0x80339b94, 0x281f0000},  // cmplwi r31, 0
+      {0x80339b98, 0x4082000c},  // bne -> pointer check
+      {0x80339b9c, 0x3be00000},  // li r31, 0
+      {0x80339ba0, 0x48000034},  // b -> restore
+      {0x80339ba4, 0x3c60804a},  // lis r3, 0x804a
+      {0x80339ba8, 0x380375e0},  // addi r0, r3, 0x75e0
+      {0x80339bac, 0x7c1f0040},  // cmplw r31, r0
+      {0x80339bb0, 0x4082000c},  // bne -> nested path
+      {0x80339bb4, 0x3be00000},  // li r31, 0
+      {0x80339bb8, 0x4800001c},  // b -> restore
+      {0x80339bbc, 0x4800d7a9},  // bl nested status helper
+      {0x80339bc0, 0x83ff000c},  // lwz r31, 0xc(r31)
+      {0x80339bc4, 0x2c1f0003},  // cmpwi r31, 3
+      {0x80339bc8, 0x40820008},  // bne -> restore
+      {0x80339bcc, 0x3be00001},  // li r31, 1
+      {0x80339bd0, 0x4800d7bd},  // bl nested status helper
+      {0x80339bd4, 0x7fc3f378},  // mr r3, r30
+      {0x80339bd8, 0x4800d7b5},  // bl OSRestoreInterrupts
+      {0x80339bdc, 0x8001001c},  // lwz r0, 0x1c(sp)
+      {0x80339be0, 0x7fe3fb78},  // mr r3, r31
+      {0x80339be4, 0x83e10014},  // lwz r31, 0x14(sp)
+      {0x80339be8, 0x83c10010},  // lwz r30, 0x10(sp)
+      {0x80339bec, 0x7c0803a6},  // mtlr r0
+      {0x80339bf0, 0x38210018},  // addi sp, sp, 0x18
+      {0x80339bf4, 0x4e800020},  // blr
+  }};
+
+  auto& mmu = Core::System::GetInstance().GetMMU();
+  for (const auto& [address, expected_hex] : expected)
+  {
+    const auto result = mmu.TryReadInstruction(address);
+    if (!result.valid || result.hex != expected_hex)
+    {
+      ++s_fast_melee_status_fn_verify_rejects;
+      return false;
+    }
+  }
+
+  s_fast_melee_status_fn_verified = true;
+  return true;
+}
+
+bool TryReadFastRamU32Address(u32 address, u32* value)
+{
+  auto& memory = Core::System::GetInstance().GetMemory();
+  u8* ram = memory.GetRAM();
+  const u32 ram_size = memory.GetRamSizeReal();
+  const u32 offset = address & 0x3fffffff;
+  if (ram == nullptr || offset >= ram_size || ram_size - offset < sizeof(u32))
+    return false;
+
+  *value = (u32{ram[offset]} << 24) | (u32{ram[offset + 1]} << 16) |
+           (u32{ram[offset + 2]} << 8) | u32{ram[offset + 3]};
+  return true;
+}
+
+std::optional<u32> TryReadFastMeleeStatusResult(PowerPC::PowerPCState& ppc_state)
+{
+  u32 first_flag = 0;
+  u32 second_flag = 0;
+  u32 status_pointer = 0;
+  if (!TryReadFastRamU32Address(ppc_state.gpr[13] - 0x43f0, &first_flag) ||
+      !TryReadFastRamU32Address(ppc_state.gpr[13] - 0x43f8, &second_flag) ||
+      !TryReadFastRamU32Address(ppc_state.gpr[13] - 0x4408, &status_pointer))
+  {
+    return std::nullopt;
+  }
+
+  if (first_flag != 0)
+    return 0xffffffff;
+  if (second_flag != 0)
+    return 8;
+  if (status_pointer == 0 || status_pointer == MELEE_STATUS_IDLE_POINTER)
+    return 0;
+
+  u32 status_value = 0;
+  if (!TryReadFastRamU32Address(status_pointer + 0x0c, &status_value))
+    return std::nullopt;
+
+  return status_value == 3 ? 1 : status_value;
+}
+
+bool ExecuteFastMeleeStatusInline(PowerPC::PowerPCState& ppc_state, u32 current_pc)
+{
+  const u32 return_pc = current_pc + sizeof(u32);
+  LR(ppc_state) = return_pc;
+
+  const u32 pending_exceptions =
+      ppc_state.Exceptions &
+      (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER);
+  if (ppc_state.msr.LE || ppc_state.msr.PR || pending_exceptions != 0 ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_DISABLE) ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_RESTORE) || !VerifyMeleeStatusFunction())
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = MELEE_STATUS_FN_PC;
+    ++s_fast_melee_status_fn_inline_fallbacks;
+    return false;
+  }
+
+  const std::optional<u32> status = TryReadFastMeleeStatusResult(ppc_state);
+  if (!status)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = MELEE_STATUS_FN_PC;
+    ++s_fast_melee_status_fn_inline_fallbacks;
+    return false;
+  }
+
+  ppc_state.gpr[0] = return_pc;
+  ppc_state.gpr[3] = *status;
+  ppc_state.pc = return_pc;
+  ppc_state.npc = return_pc;
+  ppc_state.downcount -= static_cast<int>(MELEE_STATUS_COMMON_CYCLES);
+  UpdatePerformanceMonitorIfNeeded(MELEE_STATUS_COMMON_CYCLES, 4, 0, ppc_state);
+  ++s_fast_melee_status_fn_inline_ops;
+  return true;
+}
+
+bool VerifyMeleeSiPollFunction()
+{
+  if (s_fast_melee_si_poll_verified)
+    return true;
+
+  ++s_fast_melee_si_poll_verify_attempts;
+  const std::array<std::pair<u32, u32>, 35> expected = {{
+      {0x8001cc84, 0x7c0802a6},  // mflr r0
+      {0x8001cc88, 0x3c608043},  // lis r3, 0x8043
+      {0x8001cc8c, 0x90010004},  // stw r0, 4(sp)
+      {0x8001cc90, 0x3ca0803c},  // lis r5, 0x803c
+      {0x8001cc94, 0x3c80803c},  // lis r4, 0x803c
+      {0x8001cc98, 0x9421ffd0},  // stwu sp, -0x30(sp)
+      {0x8001cc9c, 0xbf010010},  // stmw r24, 0x10(sp)
+      {0x8001cca0, 0x3bc33318},  // addi r30, r3, 0x3318
+      {0x8001cca4, 0x3c608002},  // lis r3, 0x8002
+      {0x8001cca8, 0x3bbe0004},  // addi r29, r30, 4
+      {0x8001ccac, 0x3be5ac5c},  // addi r31, r5, -0x53a4
+      {0x8001ccb0, 0x3b24ab74},  // addi r25, r4, -0x548c
+      {0x8001ccb4, 0x3b43cc30},  // addi r26, r3, -0x33d0
+      {0x8001ccb8, 0x3b9e000c},  // addi r28, r30, 0xc
+      {0x8001ccbc, 0x3b7e0010},  // addi r27, r30, 0x10
+      {0x8001ccc0, 0x801b0000},  // lwz r0, 0(r27)
+      {0x8001ccc4, 0x2c000001},  // cmpwi r0, 1
+      {0x8001ccc8, 0x4182009c},  // beq -> active path
+      {0x8001cccc, 0x408000bc},  // bge -> tail
+      {0x8001ccd0, 0x2c000000},  // cmpwi r0, 0
+      {0x8001ccd4, 0x40800008},  // bge -> pending check
+      {0x8001ccdc, 0x801c0000},  // lwz r0, 0(r28)
+      {0x8001cce0, 0x2c000000},  // cmpwi r0, 0
+      {0x8001cce4, 0x418200a4},  // beq -> tail
+      {0x8001cd88, 0x801b0000},  // lwz r0, 0(r27)
+      {0x8001cd8c, 0x2c000001},  // cmpwi r0, 1
+      {0x8001cd90, 0x41820010},  // beq -> return
+      {0x8001cd94, 0x801e000c},  // lwz r0, 0xc(r30)
+      {0x8001cd98, 0x2c000000},  // cmpwi r0, 0
+      {0x8001cd9c, 0x4082ff24},  // bne -> loop
+      {0x8001cda0, 0xbb010010},  // lmw r24, 0x10(sp)
+      {0x8001cda4, 0x80010034},  // lwz r0, 0x34(sp)
+      {0x8001cda8, 0x38210030},  // addi sp, sp, 0x30
+      {0x8001cdac, 0x7c0803a6},  // mtlr r0
+      {0x8001cdb0, 0x4e800020},  // blr
+  }};
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  auto& mmu = Core::System::GetInstance().GetMMU();
+  for (const auto& [address, expected_hex] : expected)
+  {
+    const auto result = mmu.TryReadInstruction(address);
+    if (!result.valid || result.hex != expected_hex)
+    {
+      ++s_fast_melee_si_poll_verify_rejects;
+      return false;
+    }
+
+    const UGeckoInstruction inst{result.hex};
+    const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, address);
+    cycles += opinfo->num_cycles;
+    if ((opinfo->flags & FL_LOADSTORE) != 0)
+      ++loadstores;
+  }
+
+  s_fast_melee_si_poll_cycles = cycles;
+  s_fast_melee_si_poll_loadstores = loadstores;
+  s_fast_melee_si_poll_verified = true;
+  return true;
+}
+
+bool TryReadFastMeleeSiPollWords(u32* state, u32* pending)
+{
+  auto& memory = Core::System::GetInstance().GetMemory();
+  u8* ram = memory.GetRAM();
+  const u32 ram_size = memory.GetRamSizeReal();
+  const u32 state_offset = MELEE_SI_POLL_STATE_ADDRESS & 0x3fffffff;
+  const u32 pending_offset = MELEE_SI_POLL_PENDING_ADDRESS & 0x3fffffff;
+  if (ram == nullptr || state_offset >= ram_size || pending_offset >= ram_size ||
+      ram_size - state_offset < sizeof(u32) || ram_size - pending_offset < sizeof(u32))
+  {
+    return false;
+  }
+
+  const auto read_u32_be = [](const u8* base, u32 offset) {
+    return (u32{base[offset]} << 24) | (u32{base[offset + 1]} << 16) |
+           (u32{base[offset + 2]} << 8) | u32{base[offset + 3]};
+  };
+  *state = read_u32_be(ram, state_offset);
+  *pending = read_u32_be(ram, pending_offset);
+  return true;
+}
+
+bool ExecuteFastMeleeSiPollNoEventInline(PowerPC::PowerPCState& ppc_state, u32 current_pc)
+{
+  const u32 return_pc = current_pc + sizeof(u32);
+  LR(ppc_state) = return_pc;
+
+  u32 state = 0;
+  u32 pending = 0;
+  if (ppc_state.msr.LE || !VerifyMeleeSiPollFunction() ||
+      !TryReadFastMeleeSiPollWords(&state, &pending) || state != 0 || pending != 0)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = MELEE_SI_POLL_PC;
+    ++s_fast_melee_si_poll_inline_fallbacks;
+    return false;
+  }
+
+  ppc_state.pc = return_pc;
+  ppc_state.npc = return_pc;
+  ppc_state.downcount -= static_cast<int>(s_fast_melee_si_poll_cycles);
+  UpdatePerformanceMonitorIfNeeded(s_fast_melee_si_poll_cycles,
+                                   s_fast_melee_si_poll_loadstores, 0, ppc_state);
+  ++s_fast_melee_si_poll_inline_ops;
+  return true;
+}
+
+bool VerifyMeleeServicePollFunction()
+{
+  if (s_fast_melee_service_poll_verified)
+    return true;
+
+  ++s_fast_melee_service_poll_verify_attempts;
+  const std::array<std::pair<u32, u32>, 30> status_dispatch_expected = {{
+      {0x80019230, 0x7c0802a6}, {0x80019234, 0x90010004},
+      {0x80019238, 0x9421fff8}, {0x8001923c, 0x48320911},
+      {0x80019240, 0x38030001}, {0x80019244, 0x2800000c},
+      {0x80019248, 0x4181004c}, {0x8001924c, 0x3c60803c},
+      {0x80019250, 0x3863aaa8}, {0x80019254, 0x5400103a},
+      {0x80019258, 0x7c03002e}, {0x8001925c, 0x7c0903a6},
+      {0x80019260, 0x4e800420}, {0x80019264, 0x38600000},
+      {0x80019268, 0x48000030}, {0x8001926c, 0x38600001},
+      {0x80019270, 0x48000028}, {0x80019274, 0x38600002},
+      {0x80019278, 0x48000020}, {0x8001927c, 0x38600003},
+      {0x80019280, 0x48000018}, {0x80019284, 0x38600004},
+      {0x80019288, 0x48000010}, {0x8001928c, 0x38600005},
+      {0x80019290, 0x48000008}, {0x80019294, 0x3860ffff},
+      {0x80019298, 0x8001000c}, {0x8001929c, 0x38210008},
+      {0x800192a0, 0x7c0803a6}, {0x800192a4, 0x4e800020},
+  }};
+  const std::array<std::pair<u32, u32>, 19> service_poll_expected = {{
+      {0x800192a8, 0x7c0802a6}, {0x800192ac, 0x3c80803c},
+      {0x800192b0, 0x90010004}, {0x800192b4, 0x9421ffd0},
+      {0x800192b8, 0xbf61001c}, {0x800192bc, 0x3bc30000},
+      {0x800192c0, 0x3b84a708}, {0x800192c4, 0x3be0ffff},
+      {0x800192c8, 0x4bffff69}, {0x800192cc, 0x3b630000},
+      {0x800192d0, 0x2c1bffff}, {0x800192d4, 0x41820274},
+      {0x800192d8, 0x2c1b0005}, {0x800192dc, 0x4182026c},
+      {0x80019548, 0xbb61001c}, {0x8001954c, 0x80010034},
+      {0x80019550, 0x38210030}, {0x80019554, 0x7c0803a6},
+      {0x80019558, 0x4e800020},
+  }};
+  const std::array<std::pair<u32, u32>, 11> wrapper_expected = {{
+      {0x800195d0, 0x7c0802a6}, {0x800195d4, 0x3c608002},
+      {0x800195d8, 0x90010004}, {0x800195dc, 0x3863955c},
+      {0x800195e0, 0x9421fff8}, {0x800195e4, 0x4bfffcc5},
+      {0x800195e8, 0x4800369d}, {0x800195ec, 0x8001000c},
+      {0x800195f0, 0x38210008}, {0x800195f4, 0x7c0803a6},
+      {0x800195f8, 0x4e800020},
+  }};
+  const std::array<std::pair<u32, u32>, 46> common_cycle_expected = {{
+      {0x800195d0, 0x7c0802a6}, {0x800195d4, 0x3c608002},
+      {0x800195d8, 0x90010004}, {0x800195dc, 0x3863955c},
+      {0x800195e0, 0x9421fff8}, {0x800195e4, 0x4bfffcc5},
+      {0x800195e8, 0x4800369d}, {0x800195ec, 0x8001000c},
+      {0x800195f0, 0x38210008}, {0x800195f4, 0x7c0803a6},
+      {0x800195f8, 0x4e800020}, {0x800192a8, 0x7c0802a6},
+      {0x800192ac, 0x3c80803c}, {0x800192b0, 0x90010004},
+      {0x800192b4, 0x9421ffd0}, {0x800192b8, 0xbf61001c},
+      {0x800192bc, 0x3bc30000}, {0x800192c0, 0x3b84a708},
+      {0x800192c4, 0x3be0ffff}, {0x800192c8, 0x4bffff69},
+      {0x800192cc, 0x3b630000}, {0x800192d0, 0x2c1bffff},
+      {0x800192d4, 0x41820274}, {0x80019548, 0xbb61001c},
+      {0x8001954c, 0x80010034}, {0x80019550, 0x38210030},
+      {0x80019554, 0x7c0803a6}, {0x80019558, 0x4e800020},
+      {0x80019230, 0x7c0802a6}, {0x80019234, 0x90010004},
+      {0x80019238, 0x9421fff8}, {0x8001923c, 0x48320911},
+      {0x80019240, 0x38030001}, {0x80019244, 0x2800000c},
+      {0x80019248, 0x4181004c}, {0x8001924c, 0x3c60803c},
+      {0x80019250, 0x3863aaa8}, {0x80019254, 0x5400103a},
+      {0x80019258, 0x7c03002e}, {0x8001925c, 0x7c0903a6},
+      {0x80019260, 0x4e800420}, {0x80019294, 0x3860ffff},
+      {0x80019298, 0x8001000c}, {0x8001929c, 0x38210008},
+      {0x800192a0, 0x7c0803a6}, {0x800192a4, 0x4e800020},
+  }};
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  auto& mmu = Core::System::GetInstance().GetMMU();
+  const auto verify_expected = [&](const auto& expected) {
+    for (const auto& [address, expected_hex] : expected)
+    {
+      const auto result = mmu.TryReadInstruction(address);
+      if (!result.valid || result.hex != expected_hex)
+        return false;
+    }
+    return true;
+  };
+  const auto accumulate_expected = [&](const auto& expected) {
+    for (const auto& [address, expected_hex] : expected)
+    {
+      const UGeckoInstruction inst{expected_hex};
+      const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, address);
+      cycles += opinfo->num_cycles;
+      if ((opinfo->flags & FL_LOADSTORE) != 0)
+        ++loadstores;
+    }
+  };
+
+  if (!verify_expected(status_dispatch_expected) || !verify_expected(service_poll_expected) ||
+      !verify_expected(wrapper_expected) || !VerifyMeleeStatusFunction() ||
+      !VerifyMeleeSiPollFunction())
+  {
+    ++s_fast_melee_service_poll_verify_rejects;
+    return false;
+  }
+
+  accumulate_expected(common_cycle_expected);
+  s_fast_melee_service_poll_cycles =
+      cycles + MELEE_STATUS_COMMON_CYCLES + s_fast_melee_si_poll_cycles;
+  s_fast_melee_service_poll_loadstores = loadstores + 4 + s_fast_melee_si_poll_loadstores;
+  s_fast_melee_service_poll_verified = true;
+  return true;
+}
+
+u32 MapFastMeleeStatusDispatchResult(u32 raw_status)
+{
+  const u32 index = raw_status + 1;
+  if (index > 12)
+    return 0xffffffff;
+
+  switch (index)
+  {
+  case 0:
+    return 4;
+  case 2:
+    return 5;
+  case 5:
+    return 1;
+  case 6:
+    return 0;
+  case 7:
+    return 2;
+  case 12:
+    return 3;
+  default:
+    return 0xffffffff;
+  }
+}
+
+bool ExecuteFastMeleeServicePollInline(PowerPC::PowerPCState& ppc_state, u32 current_pc)
+{
+  const u32 return_pc = current_pc + sizeof(u32);
+  LR(ppc_state) = return_pc;
+
+  u32 state = 0;
+  u32 pending = 0;
+  const u32 pending_exceptions =
+      ppc_state.Exceptions &
+      (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER);
+  const std::optional<u32> raw_status = TryReadFastMeleeStatusResult(ppc_state);
+  const u32 mapped_status = raw_status ? MapFastMeleeStatusDispatchResult(*raw_status) : 0;
+  const bool status_dispatch_returns_early = raw_status && (mapped_status == 0xffffffff ||
+                                                            mapped_status == 5);
+  if (ppc_state.msr.LE || ppc_state.msr.PR || pending_exceptions != 0 ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_DISABLE) ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_RESTORE) || !VerifyMeleeServicePollFunction() ||
+      !status_dispatch_returns_early || !TryReadFastMeleeSiPollWords(&state, &pending) ||
+      state != 0 || pending != 0)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = MELEE_SERVICE_POLL_PC;
+    ++s_fast_melee_service_poll_inline_fallbacks;
+    return false;
+  }
+
+  ppc_state.gpr[0] = return_pc;
+  ppc_state.gpr[3] = mapped_status;
+  ppc_state.cr.SetField(0, PowerPC::CR_EQ | (ppc_state.GetXER_SO() ? PowerPC::CR_SO : 0));
+  ppc_state.pc = return_pc;
+  ppc_state.npc = return_pc;
+  ppc_state.downcount -= static_cast<int>(s_fast_melee_service_poll_cycles);
+  UpdatePerformanceMonitorIfNeeded(s_fast_melee_service_poll_cycles,
+                                   s_fast_melee_service_poll_loadstores, 0, ppc_state);
+  ++s_fast_melee_service_poll_inline_ops;
+  return true;
+}
+
+bool VerifyMeleeInputPollNoChangeFunction()
+{
+  if (s_fast_melee_input_poll_verified)
+    return true;
+
+  ++s_fast_melee_input_poll_verify_attempts;
+  const std::array<std::pair<u32, u32>, 38> expected = {{
+      {0x80019894, 0x7c0802a6},  // mflr r0
+      {0x80019898, 0x90010004},  // stw r0, 4(sp)
+      {0x8001989c, 0x9421fff0},  // stwu sp, -0x10(sp)
+      {0x800198a0, 0x93e1000c},  // stw r31, 0xc(sp)
+      {0x800198a4, 0x93c10008},  // stw r30, 8(sp)
+      {0x800198a8, 0x4832dabd},  // bl OSDisableInterrupts
+      {0x800198ac, 0x7c7e1b78},  // mr r30, r3
+      {0x800198b0, 0x4835d0ed},  // bl input status
+      {0x800198b4, 0x7c7f1b78},  // mr r31, r3
+      {0x800198b8, 0x4bfffd71},  // bl input housekeeping
+      {0x800198bc, 0x7fc3f378},  // mr r3, r30
+      {0x800198c0, 0x4832dacd},  // bl OSRestoreInterrupts
+      {0x800198c4, 0x7fe3fb78},  // mr r3, r31
+      {0x800198c8, 0x80010014},  // lwz r0, 0x14(sp)
+      {0x800198cc, 0x83e1000c},  // lwz r31, 0xc(sp)
+      {0x800198d0, 0x83c10008},  // lwz r30, 8(sp)
+      {0x800198d4, 0x38210010},  // addi sp, sp, 0x10
+      {0x800198d8, 0x7c0803a6},  // mtlr r0
+      {0x800198dc, 0x4e800020},  // blr
+      {0x80019628, 0x7c0802a6},  // mflr r0
+      {0x8001962c, 0x3c608043},  // lis r3, 0x8043
+      {0x80019630, 0x90010004},  // stw r0, 4(sp)
+      {0x80019634, 0x9421ffd8},  // stwu sp, -0x28(sp)
+      {0x80019638, 0xbf610014},  // stmw r27, 0x14(sp)
+      {0x8001963c, 0x3be329f0},  // addi r31, r3, 0x29f0
+      {0x80019640, 0x809f0038},  // lwz r4, 0x38(r31)
+      {0x80019644, 0x801f0000},  // lwz r0, 0(r31)
+      {0x80019648, 0x80bf003c},  // lwz r5, 0x3c(r31)
+      {0x8001964c, 0x807f0004},  // lwz r3, 4(r31)
+      {0x80019650, 0x7c800278},  // xor r0, r4, r0
+      {0x80019654, 0x7ca31a78},  // xor r3, r5, r3
+      {0x80019658, 0x7c600379},  // or. r0, r3, r0
+      {0x8001965c, 0x41820210},  // beq -> no-change return
+      {0x8001986c, 0xbb610014},  // lmw r27, 0x14(sp)
+      {0x80019870, 0x8001002c},  // lwz r0, 0x2c(sp)
+      {0x80019874, 0x38210028},  // addi sp, sp, 0x28
+      {0x80019878, 0x7c0803a6},  // mtlr r0
+      {0x8001987c, 0x4e800020},  // blr
+  }};
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  auto& mmu = Core::System::GetInstance().GetMMU();
+  for (const auto& [address, expected_hex] : expected)
+  {
+    const auto result = mmu.TryReadInstruction(address);
+    if (!result.valid || result.hex != expected_hex)
+    {
+      ++s_fast_melee_input_poll_verify_rejects;
+      return false;
+    }
+
+    const UGeckoInstruction inst{result.hex};
+    const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, address);
+    cycles += opinfo->num_cycles;
+    if ((opinfo->flags & FL_LOADSTORE) != 0)
+      ++loadstores;
+  }
+
+  if (!VerifyMeleeInputStatusFunction())
+  {
+    ++s_fast_melee_input_poll_verify_rejects;
+    return false;
+  }
+
+  s_fast_melee_input_poll_cycles =
+      cycles + s_fast_melee_input_status_cycles + OS_INTERRUPT_DISABLE_CYCLES +
+      OS_INTERRUPT_DISABLE_CYCLES + OS_INTERRUPT_RESTORE_DISABLE_CYCLES;
+  s_fast_melee_input_poll_loadstores = loadstores + s_fast_melee_input_status_loadstores;
+  s_fast_melee_input_poll_verified = true;
+  return true;
+}
+
+bool TryReadFastMeleeInputPollNoChangeWords(u32* old_high, u32* old_low, u32* new_high,
+                                            u32* new_low)
+{
+  auto& memory = Core::System::GetInstance().GetMemory();
+  u8* ram = memory.GetRAM();
+  const u32 ram_size = memory.GetRamSizeReal();
+  const std::array<u32, 4> offsets = {{
+      (MELEE_INPUT_POLL_STATE_BASE + 0x00) & 0x3fffffff,
+      (MELEE_INPUT_POLL_STATE_BASE + 0x04) & 0x3fffffff,
+      (MELEE_INPUT_POLL_STATE_BASE + 0x38) & 0x3fffffff,
+      (MELEE_INPUT_POLL_STATE_BASE + 0x3c) & 0x3fffffff,
+  }};
+  if (ram == nullptr)
+    return false;
+  for (const u32 offset : offsets)
+  {
+    if (offset >= ram_size || ram_size - offset < sizeof(u32))
+      return false;
+  }
+
+  const auto read_u32_be = [](const u8* base, u32 offset) {
+    return (u32{base[offset]} << 24) | (u32{base[offset + 1]} << 16) |
+           (u32{base[offset + 2]} << 8) | u32{base[offset + 3]};
+  };
+  *old_high = read_u32_be(ram, offsets[0]);
+  *old_low = read_u32_be(ram, offsets[1]);
+  *new_high = read_u32_be(ram, offsets[2]);
+  *new_low = read_u32_be(ram, offsets[3]);
+  return true;
+}
+
+bool ExecuteFastMeleeInputPollNoChangeInline(PowerPC::PowerPCState& ppc_state, u32 current_pc)
+{
+  const u32 return_pc = current_pc + sizeof(u32);
+  LR(ppc_state) = return_pc;
+
+  u32 old_high = 0;
+  u32 old_low = 0;
+  u32 new_high = 0;
+  u32 new_low = 0;
+  u32 status = 0;
+  const u32 pending_exceptions =
+      ppc_state.Exceptions &
+      (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER);
+  if (ppc_state.msr.LE || ppc_state.msr.PR || pending_exceptions != 0 ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_DISABLE) ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_RESTORE) ||
+      !VerifyMeleeInputPollNoChangeFunction() ||
+      !TryReadFastMeleeInputPollNoChangeWords(&old_high, &old_low, &new_high, &new_low) ||
+      old_high != new_high || old_low != new_low ||
+      !TryReadFastMeleeInputStatusByte(ppc_state, &status))
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = MELEE_INPUT_POLL_PC;
+    ++s_fast_melee_input_poll_inline_fallbacks;
+    return false;
+  }
+
+  const u32 restore_cycles =
+      (ppc_state.msr.Hex & MSR_EE_MASK) != 0 ? OS_INTERRUPT_RESTORE_ENABLE_CYCLES :
+                                               OS_INTERRUPT_RESTORE_DISABLE_CYCLES;
+  const u32 cycles = s_fast_melee_input_poll_cycles + restore_cycles;
+  ppc_state.cr.SetField(0, PowerPC::CR_EQ | (ppc_state.GetXER_SO() ? PowerPC::CR_SO : 0));
+  ppc_state.gpr[3] = status;
+  ppc_state.pc = return_pc;
+  ppc_state.npc = return_pc;
+  ppc_state.downcount -= static_cast<int>(cycles);
+  UpdatePerformanceMonitorIfNeeded(cycles, s_fast_melee_input_poll_loadstores, 0, ppc_state);
+  ++s_fast_melee_input_poll_inline_ops;
+  return true;
+}
+
+s32 DecodeConditionalBranchDisplacement(UGeckoInstruction inst)
+{
+  return static_cast<s32>(static_cast<s16>(inst.BD << 2));
+}
+
+bool IsConditionalBranchTo(UGeckoInstruction inst, u32 branch_address, u32 target_address)
+{
+  if (inst.OPCD != 16 || inst.LK_2 || inst.AA_2)
+    return false;
+
+  return branch_address + static_cast<u32>(DecodeConditionalBranchDisplacement(inst)) ==
+         target_address;
+}
+
+bool IsDcbxLoopAddressStep(UGeckoInstruction inst, u32 address_gpr)
+{
+  return (inst.hex & 0xfc00ffff) == 0x38000020 && inst.RA_6 == address_gpr &&
+         inst.RD_2 == address_gpr;
+}
+
+bool IsCtrDcbxLoopBranch(UGeckoInstruction inst, u32 branch_address, u32 target_address)
+{
+  return (inst.BO == 16 || inst.BO == 17) && inst.BI == 0 &&
+         IsConditionalBranchTo(inst, branch_address, target_address);
+}
+
+std::optional<u32> GetCountedDcbxLoopRegister(UGeckoInstruction inst, u32 address_gpr)
+{
+  if (inst.OPCD != 13 || inst.SIMM_16 != -32 || inst.RA == 0 || inst.RA == address_gpr ||
+      inst.RD != inst.RA)
+  {
+    return std::nullopt;
+  }
+
+  return static_cast<u32>(inst.RA);
+}
+
+bool IsCountedDcbxLoopBranch(UGeckoInstruction inst, u32 branch_address, u32 target_address)
+{
+  return (inst.BO == 12 || inst.BO == 13) && inst.BI == 1 &&
+         IsConditionalBranchTo(inst, branch_address, target_address);
+}
+
+u32 ElapsedMicros(std::chrono::steady_clock::time_point start,
+                  std::chrono::steady_clock::time_point end)
+{
+  return static_cast<u32>(
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+
+void ResetPpcBlockProfile()
+{
+  s_ppc_profile_total_blocks = 0;
+  s_ppc_profile_sample_blocks = 0;
+  s_ppc_profile_total_us = 0;
+  s_ppc_profile_max_us = 0;
+  s_ppc_profile_window_sample_blocks = 0;
+  s_ppc_profile_window_total_us = 0;
+  s_ppc_profile_window_max_us = 0;
+  s_ppc_profile_window_collision_count = 0;
+  s_ppc_profile_entries = {};
+}
+
+void RecordPpcBlockProfile(u32 pc, u32 elapsed_us)
+{
+  if (!s_ppc_block_profile_enabled)
+    return;
+
+  ++s_ppc_profile_sample_blocks;
+  s_ppc_profile_total_us = SaturatingAddU32(s_ppc_profile_total_us, elapsed_us);
+  s_ppc_profile_max_us = std::max(s_ppc_profile_max_us, elapsed_us);
+  ++s_ppc_profile_window_sample_blocks;
+  s_ppc_profile_window_total_us = SaturatingAddU32(s_ppc_profile_window_total_us, elapsed_us);
+  s_ppc_profile_window_max_us = std::max(s_ppc_profile_window_max_us, elapsed_us);
+
+  constexpr u32 probe_count = 8;
+  const u32 first_slot =
+      ((pc >> 2) * 2654435761u) & static_cast<u32>(s_ppc_profile_entries.size() - 1);
+  for (u32 probe = 0; probe < probe_count; ++probe)
+  {
+    PpcBlockProfileEntry& entry =
+        s_ppc_profile_entries[(first_slot + probe) & (s_ppc_profile_entries.size() - 1)];
+    if (entry.count == 0)
+      entry.pc = pc;
+
+    if (entry.pc != pc)
+      continue;
+
+    ++entry.count;
+    entry.total_us = SaturatingAddU32(entry.total_us, elapsed_us);
+    entry.max_us = std::max(entry.max_us, elapsed_us);
+    return;
+  }
+
+  ++s_ppc_profile_window_collision_count;
+}
+
+void ResetPpcBlockProfileWindow()
+{
+  s_ppc_profile_window_sample_blocks = 0;
+  s_ppc_profile_window_total_us = 0;
+  s_ppc_profile_window_max_us = 0;
+  s_ppc_profile_window_collision_count = 0;
+  s_ppc_profile_entries = {};
+}
+
+std::string DescribePpcProfilePc(u32 pc)
+{
+  const auto result = Core::System::GetInstance().GetMMU().TryReadInstruction(pc);
+  if (!result.valid)
+    return "invalid";
+
+  const UGeckoInstruction inst{result.hex};
+  const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, pc);
+  std::ostringstream out;
+  out << opinfo->opname << "@0x" << std::hex << result.hex << " "
+      << Common::GekkoDisassembler::Disassemble(result.hex, pc);
+  return out.str();
+}
+
+u32 DecodeMfsprIndex(UGeckoInstruction inst)
+{
+  return ((inst.SPR & 0x1f) << 5) | ((inst.SPR >> 5) & 0x1f);
+}
+
+u32 DecodeMtsprIndex(UGeckoInstruction inst)
+{
+  return (inst.SPRU << 5) | (inst.SPRL & 0x1f);
+}
+
+extern "C" u32 DolphinWeb_CachedInterpreterReadU32(int state_ptr, u32 address)
+{
+  (void)state_ptr;
+  return Core::System::GetInstance().GetMMU().Read<u32>(address);
+}
+
+extern "C" void DolphinWeb_CachedInterpreterWriteU32(int state_ptr, u32 address, u32 value)
+{
+  (void)state_ptr;
+  Core::System::GetInstance().GetMMU().Write<u32>(value, address);
+}
+
+extern "C" u32 DolphinWeb_CachedInterpreterReadU8(int state_ptr, u32 address)
+{
+  (void)state_ptr;
+  return Core::System::GetInstance().GetMMU().Read<u8>(address);
+}
+
+extern "C" void DolphinWeb_CachedInterpreterWriteU8(int state_ptr, u32 address, u32 value)
+{
+  (void)state_ptr;
+  Core::System::GetInstance().GetMMU().Write<u8>(value, address);
+}
+
+extern "C" u32 DolphinWeb_CachedInterpreterReadU16(int state_ptr, u32 address)
+{
+  (void)state_ptr;
+  return Core::System::GetInstance().GetMMU().Read<u16>(address);
+}
+
+extern "C" void DolphinWeb_CachedInterpreterWriteU16(int state_ptr, u32 address, u32 value)
+{
+  (void)state_ptr;
+  Core::System::GetInstance().GetMMU().Write<u16>(value, address);
+}
+
+bool DolphinWeb_CachedInterpreterCheckFpu(PowerPC::PowerPCState& ppc_state, u32 current_pc,
+                                          u32 downcount)
+{
+  if (ppc_state.msr.FP)
+    return false;
+
+  ppc_state.pc = current_pc;
+  ppc_state.downcount -= downcount;
+  ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
+  Core::System::GetInstance().GetPowerPC().CheckExceptions();
+  ++s_wasm_helper_halt_count;
+  return true;
+}
+
+bool DolphinWeb_CachedInterpreterCheckProgramOrDsi(PowerPC::PowerPCState& ppc_state,
+                                                   u32 current_pc, u32 downcount)
+{
+  if ((ppc_state.Exceptions & (EXCEPTION_DSI | EXCEPTION_PROGRAM)) == 0)
+    return false;
+
+  ppc_state.pc = current_pc;
+  ppc_state.downcount -= downcount;
+  Core::System::GetInstance().GetPowerPC().CheckExceptions();
+  ++s_wasm_helper_halt_count;
+  return true;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterLfs(int state_ptr, u32 address, u32 fd,
+                                                u32 current_pc, u32 downcount)
+{
+  ++s_wasm_lfs_call_count;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  if ((address & 0b11) != 0)
+  {
+    GenerateAlignmentException(ppc_state, address);
+  }
+  else
+  {
+    const u32 temp = Core::System::GetInstance().GetMMU().Read<u32>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+      ppc_state.ps[fd].Fill(ConvertToDouble(temp));
+  }
+
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterStfs(int state_ptr, u32 address, u32 fs,
+                                                 u32 current_pc, u32 downcount)
+{
+  ++s_wasm_stfs_call_count;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  if ((address & 0b11) != 0)
+  {
+    GenerateAlignmentException(ppc_state, address);
+  }
+  else
+  {
+    Core::System::GetInstance().GetMMU().Write<u32>(ConvertToSingle(ppc_state.ps[fs].PS0AsU64()),
+                                                    address);
+  }
+
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterLfd(int state_ptr, u32 address, u32 fd,
+                                                u32 current_pc, u32 downcount)
+{
+  ++s_wasm_lfd_call_count;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  if ((address & 0b11) != 0)
+  {
+    GenerateAlignmentException(ppc_state, address);
+  }
+  else
+  {
+    const u64 temp = Core::System::GetInstance().GetMMU().Read<u64>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+      ppc_state.ps[fd].SetPS0(temp);
+  }
+
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFmr(int state_ptr, u32 fd, u32 fb, u32 current_pc,
+                                                u32 downcount)
+{
+  ++s_wasm_fmr_call_count;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  ppc_state.ps[fd].SetPS0(ppc_state.ps[fb].PS0AsU64());
+  return 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFctiwz(int state_ptr, u32 inst_hex, u32 current_pc,
+                                                   u32 downcount, u32 unused)
+{
+  ++s_wasm_fctiwz_call_count;
+  (void)unused;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  const UGeckoInstruction inst{inst_hex};
+  Interpreter::fctiwzx(Core::System::GetInstance().GetInterpreter(), inst);
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" void DolphinWeb_CachedInterpreterFastCheckGatherPipe(int state_ptr, u32 unused_a,
+                                                                 u32 unused_b)
+{
+  (void)state_ptr;
+  (void)unused_a;
+  (void)unused_b;
+  ++s_wasm_gpfifo_fastcheck_count;
+  Core::System::GetInstance().GetGPFifo().FastCheckGatherPipe();
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFastOsInterruptCall(int state_ptr, u32 current_pc,
+                                                               u32 mode, u32 cycles_primary,
+                                                               u32 cycles_secondary)
+{
+  auto& system = Core::System::GetInstance();
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  const u32 function_pc = GetOsInterruptTargetPc(mode);
+  const u32 return_pc = current_pc + sizeof(u32);
+
+  LR(ppc_state) = return_pc;
+  if (function_pc == 0 ||
+      !ExecuteFastOsInterruptInline(ppc_state, system.GetPowerPC(), function_pc, return_pc, mode,
+                                    cycles_primary, cycles_secondary))
+  {
+    ppc_state.npc = function_pc;
+    ++s_fast_os_interrupt_inline_fallbacks;
+  }
+  return 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFastMeleeInputStatusCall(int state_ptr, u32 current_pc)
+{
+  auto& system = Core::System::GetInstance();
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  ExecuteFastMeleeInputStatusInline(ppc_state, system.GetPowerPC(), current_pc);
+  return 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFastMeleeStatusCall(int state_ptr, u32 current_pc,
+                                                               u32 downcount, u32 unused_a,
+                                                               u32 unused_b)
+{
+  (void)unused_a;
+  (void)unused_b;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (ExecuteFastMeleeStatusInline(ppc_state, current_pc))
+    return 0;
+
+  ppc_state.downcount -= downcount;
+  ++s_wasm_helper_halt_count;
+  return 1;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFastMeleeServicePollCall(int state_ptr, u32 current_pc,
+                                                                    u32 downcount, u32 unused_a,
+                                                                    u32 unused_b)
+{
+  (void)unused_a;
+  (void)unused_b;
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (ExecuteFastMeleeServicePollInline(ppc_state, current_pc))
+    return 0;
+
+  ppc_state.downcount -= downcount;
+  ++s_wasm_helper_halt_count;
+  return 1;
+}
+
+u16 ReadRamU16BE(const u8* ram, u32 offset)
+{
+  return static_cast<u16>((u16{ram[offset]} << 8) | ram[offset + 1]);
+}
+
+u32 ReadRamU32BE(const u8* ram, u32 offset)
+{
+  return (u32{ram[offset]} << 24) | (u32{ram[offset + 1]} << 16) |
+         (u32{ram[offset + 2]} << 8) | u32{ram[offset + 3]};
+}
+
+u64 ReadRamU64BE(const u8* ram, u32 offset)
+{
+  return (u64{ReadRamU32BE(ram, offset)} << 32) | ReadRamU32BE(ram, offset + sizeof(u32));
+}
+
+void WriteRamU16BE(u8* ram, u32 offset, u16 value)
+{
+  ram[offset] = static_cast<u8>(value >> 8);
+  ram[offset + 1] = static_cast<u8>(value);
+}
+
+void WriteRamU32BE(u8* ram, u32 offset, u32 value)
+{
+  ram[offset] = static_cast<u8>(value >> 24);
+  ram[offset + 1] = static_cast<u8>(value >> 16);
+  ram[offset + 2] = static_cast<u8>(value >> 8);
+  ram[offset + 3] = static_cast<u8>(value);
+}
+
+float PairedQuantizeScale(u32 scale)
+{
+  return std::ldexp(1.0f, scale < 32 ? static_cast<int>(scale) :
+                                             -static_cast<int>(64 - scale));
+}
+
+float PairedDequantizeScale(u32 scale)
+{
+  return std::ldexp(1.0f, scale < 32 ? -static_cast<int>(scale) :
+                                             static_cast<int>(64 - scale));
+}
+
+template <typename T>
+double LoadQuantizedLane(const u8* ram, u32 offset, u32 scale)
+{
+  using U = std::make_unsigned_t<T>;
+  U value;
+  if constexpr (sizeof(T) == 1)
+    value = ram[offset];
+  else
+    value = ReadRamU16BE(ram, offset);
+
+  return static_cast<double>(static_cast<float>(static_cast<T>(value)) *
+                             PairedDequantizeScale(scale));
+}
+
+template <typename T>
+std::make_unsigned_t<T> QuantizeLane(double value, u32 scale)
+{
+  using U = std::make_unsigned_t<T>;
+  const float converted = static_cast<float>(value) * PairedQuantizeScale(scale);
+  constexpr float min_value = static_cast<float>(std::numeric_limits<T>::min());
+  constexpr float max_value = static_cast<float>(std::numeric_limits<T>::max());
+  return static_cast<U>(static_cast<T>(std::clamp(converted, min_value, max_value)));
+}
+
+template <typename T>
+void StoreQuantizedLane(u8* ram, u32 offset, double value, u32 scale)
+{
+  const auto quantized = QuantizeLane<T>(value, scale);
+
+  if constexpr (sizeof(T) == 1)
+    ram[offset] = quantized;
+  else
+    WriteRamU16BE(ram, offset, quantized);
+}
+
+bool TryFastPairedQuantizedMemory(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                  UGeckoInstruction inst)
+{
+  const bool load = inst.OPCD == 56 || inst.OPCD == 57;
+  const bool store = inst.OPCD == 60 || inst.OPCD == 61;
+  if (!load && !store)
+    return false;
+
+  const bool update = inst.OPCD == 57 || inst.OPCD == 61;
+  if (update && inst.RA == 0)
+    return false;
+
+  if (!HID2(ppc_state).LSQE)
+  {
+    GenerateProgramException(ppc_state, ProgramExceptionCause::IllegalInstruction);
+    return true;
+  }
+
+  const u32 address =
+      update ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_12) :
+               (inst.RA ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_12) : u32(inst.SIMM_12));
+  const UGQR gqr(ppc_state.spr[SPR_GQR0 + inst.I]);
+  const EQuantizeType type = static_cast<EQuantizeType>(load ? gqr.ld_type : gqr.st_type);
+  const u32 scale = load ? gqr.ld_scale : gqr.st_scale;
+
+  const u32 element_bytes = PairedQuantizedElementBytes(type);
+  const u32 bytes = inst.W ? element_bytes : element_bytes * 2;
+  const u32 offset = address & 0x3fffffff;
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  if (offset > ram_size - bytes)
+    return false;
+
+  u8* ram = system.GetMemory().GetRAM();
+
+  if (load)
+  {
+    double ps0 = 0.0;
+    double ps1 = 1.0;
+    switch (type)
+    {
+    case QUANTIZE_FLOAT:
+      ps0 = std::bit_cast<double>(ConvertToDouble(ReadRamU32BE(ram, offset)));
+      if (!inst.W)
+        ps1 = std::bit_cast<double>(ConvertToDouble(ReadRamU32BE(ram, offset + sizeof(u32))));
+      break;
+    case QUANTIZE_U8:
+      ps0 = LoadQuantizedLane<u8>(ram, offset, scale);
+      if (!inst.W)
+        ps1 = LoadQuantizedLane<u8>(ram, offset + sizeof(u8), scale);
+      break;
+    case QUANTIZE_U16:
+      ps0 = LoadQuantizedLane<u16>(ram, offset, scale);
+      if (!inst.W)
+        ps1 = LoadQuantizedLane<u16>(ram, offset + sizeof(u16), scale);
+      break;
+    case QUANTIZE_S8:
+      ps0 = LoadQuantizedLane<s8>(ram, offset, scale);
+      if (!inst.W)
+        ps1 = LoadQuantizedLane<s8>(ram, offset + sizeof(s8), scale);
+      break;
+    case QUANTIZE_S16:
+      ps0 = LoadQuantizedLane<s16>(ram, offset, scale);
+      if (!inst.W)
+        ps1 = LoadQuantizedLane<s16>(ram, offset + sizeof(s16), scale);
+      break;
+    default:
+      return false;
+    }
+
+    ppc_state.ps[inst.RD].SetBoth(ps0, ps1);
+  }
+  else
+  {
+    const double ps0 = ppc_state.ps[inst.RS].PS0AsDouble();
+    const double ps1 = ppc_state.ps[inst.RS].PS1AsDouble();
+    switch (type)
+    {
+    case QUANTIZE_FLOAT:
+      WriteRamU32BE(ram, offset, ConvertToSingleFTZ(ppc_state.ps[inst.RS].PS0AsU64()));
+      if (!inst.W)
+        WriteRamU32BE(ram, offset + sizeof(u32),
+                      ConvertToSingleFTZ(ppc_state.ps[inst.RS].PS1AsU64()));
+      break;
+    case QUANTIZE_U8:
+      StoreQuantizedLane<u8>(ram, offset, ps0, scale);
+      if (!inst.W)
+        StoreQuantizedLane<u8>(ram, offset + sizeof(u8), ps1, scale);
+      break;
+    case QUANTIZE_U16:
+      StoreQuantizedLane<u16>(ram, offset, ps0, scale);
+      if (!inst.W)
+        StoreQuantizedLane<u16>(ram, offset + sizeof(u16), ps1, scale);
+      break;
+    case QUANTIZE_S8:
+      StoreQuantizedLane<s8>(ram, offset, ps0, scale);
+      if (!inst.W)
+        StoreQuantizedLane<s8>(ram, offset + sizeof(s8), ps1, scale);
+      break;
+    case QUANTIZE_S16:
+      StoreQuantizedLane<s16>(ram, offset, ps0, scale);
+      if (!inst.W)
+        StoreQuantizedLane<s16>(ram, offset + sizeof(s16), ps1, scale);
+      break;
+    default:
+      return false;
+    }
+  }
+
+  if (update)
+    ppc_state.gpr[inst.RA] = address;
+
+  ++s_wasm_psq_fast_c_count;
+  return true;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterFpOp(int state_ptr, u32 inst_hex, u32 current_pc,
+                                                 u32 downcount, u32 unused)
+{
+  ++s_wasm_fp_call_count;
+  (void)unused;
+  auto& system = Core::System::GetInstance();
+  auto& interpreter = system.GetInterpreter();
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  if (DolphinWeb_CachedInterpreterCheckFpu(ppc_state, current_pc, downcount))
+    return 1;
+
+  const UGeckoInstruction inst{inst_hex};
+  ++s_wasm_fp_key_counts[(inst.OPCD << 10) | inst.SUBOP10];
+  if (inst.OPCD == 56 || inst.OPCD == 57 || inst.OPCD == 60 || inst.OPCD == 61)
+  {
+    auto reason = PsqFallbackReason::ShouldHaveInlined;
+    const bool load = inst.OPCD == 56 || inst.OPCD == 57;
+    const bool update = inst.OPCD == 57 || inst.OPCD == 61;
+    const u32 address =
+        update ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_12) :
+                 (inst.RA ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_12) : u32(inst.SIMM_12));
+    const u32 gqr = ppc_state.spr[SPR_GQR0 + inst.I];
+    const u32 type = load ? ((gqr >> 16) & 7) : (gqr & 7);
+    const u32 scale = load ? ((gqr >> 24) & 0x3f) : ((gqr >> 8) & 0x3f);
+    const u32 element_bytes = PairedQuantizedElementBytes(type);
+    const u32 bytes = inst.W ? element_bytes : element_bytes * 2;
+    const u32 ram_size = system.GetMemory().GetRamSizeReal();
+
+    if (!ppc_state.msr.FP)
+      reason = PsqFallbackReason::NoFp;
+    else if (ppc_state.msr.LE)
+      reason = PsqFallbackReason::LittleEndian;
+    else if (!HID2(ppc_state).LSQE)
+      reason = PsqFallbackReason::Lsqe;
+    else if (type != QUANTIZE_FLOAT)
+      reason = PsqFallbackReason::NonFloat;
+    else if ((address & 0x3fffffff) > ram_size - bytes)
+      reason = PsqFallbackReason::OutsideMem1;
+    else if (update && inst.RA == 0)
+      reason = PsqFallbackReason::UpdateRaZero;
+
+    ++s_wasm_psq_fallback_counts[static_cast<u32>(reason)];
+    const u32 type_scale_key = (load ? 0 : 8 * 64) + type * 64 + scale;
+    ++s_wasm_psq_type_scale_counts[type_scale_key];
+    if (s_wasm_psq_type_scale_sample_addresses[type_scale_key] == 0)
+      s_wasm_psq_type_scale_sample_addresses[type_scale_key] = address;
+    if (TryFastPairedQuantizedMemory(system, ppc_state, inst))
+      return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 :
+                                                                                               0;
+  }
+  Interpreter::GetInterpreterOp(inst)(interpreter, inst);
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterSystem(int state_ptr, u32 inst_hex, u32 current_pc,
+                                                   u32 downcount, u32 unused)
+{
+  ++s_wasm_system_call_count;
+  (void)unused;
+  auto& system = Core::System::GetInstance();
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  const UGeckoInstruction inst{inst_hex};
+  ++s_wasm_system_key_counts[(inst.OPCD << 10) | inst.SUBOP10];
+
+  if (inst.OPCD == 46 || inst.OPCD == 47)
+  {
+    u32 address = inst.RA ? (ppc_state.gpr[inst.RA] + u32(inst.SIMM_16)) : u32(inst.SIMM_16);
+    if ((address & 0b11) != 0 || ppc_state.msr.LE)
+    {
+      GenerateAlignmentException(ppc_state, address);
+    }
+    else if (inst.OPCD == 46)
+    {
+      for (u32 i = inst.RD; i <= 31; ++i, address += 4)
+      {
+        const u32 value = system.GetMMU().Read<u32>(address);
+        if ((ppc_state.Exceptions & EXCEPTION_DSI) != 0)
+          break;
+        ppc_state.gpr[i] = value;
+      }
+    }
+    else
+    {
+      for (u32 i = inst.RS; i <= 31; ++i, address += 4)
+      {
+        system.GetMMU().Write<u32>(ppc_state.gpr[i], address);
+        if ((ppc_state.Exceptions & EXCEPTION_DSI) != 0)
+          break;
+      }
+    }
+    return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+  }
+
+  switch (inst.SUBOP10)
+  {
+  case 0:  // mcrf
+    ppc_state.cr.SetField(inst.CRFD, ppc_state.cr.GetField(inst.CRFS));
+    break;
+  case 19:  // mfcr
+    ppc_state.gpr[inst.RD] = ppc_state.cr.Get();
+    break;
+  case 50:  // rfi
+  {
+    ppc_state.pc = current_pc;
+    if (ppc_state.msr.PR)
+    {
+      GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+      break;
+    }
+    constexpr u32 mask = 0x87c0ffff;
+    ppc_state.msr.Hex = (ppc_state.msr.Hex & ~mask) | (SRR1(ppc_state) & mask);
+    ppc_state.msr.Hex &= 0xfffbffff;
+    ppc_state.npc = SRR0(ppc_state);
+    system.GetPowerPC().MSRUpdated();
+    break;
+  }
+  case 83:  // mfmsr
+    if (ppc_state.msr.PR)
+    {
+      GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+      break;
+    }
+    ppc_state.gpr[inst.RD] = ppc_state.msr.Hex;
+    break;
+  case 144:  // mtcrf
+  {
+    const u32 crm = inst.CRM;
+    if (crm == 0xff)
+    {
+      ppc_state.cr.Set(ppc_state.gpr[inst.RS]);
+    }
+    else
+    {
+      u32 mask = 0;
+      for (u32 i = 0; i < 8; ++i)
+      {
+        if ((crm & (1 << i)) != 0)
+          mask |= 0xf << (i * 4);
+      }
+      ppc_state.cr.Set((ppc_state.cr.Get() & ~mask) | (ppc_state.gpr[inst.RS] & mask));
+    }
+    break;
+  }
+  case 146:  // mtmsr
+    ppc_state.pc = current_pc;
+    ppc_state.npc = current_pc + 4;
+    if (ppc_state.msr.PR)
+    {
+      GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+      break;
+    }
+    ppc_state.msr.Hex = ppc_state.gpr[inst.RS];
+    system.GetPowerPC().MSRUpdated();
+    break;
+  case 371:  // mftb
+  {
+    const u32 index = (inst.TBR >> 5) | ((inst.TBR & 0x1f) << 5);
+    if (ppc_state.msr.PR && index != SPR_TL && index != SPR_TU)
+    {
+      GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+      break;
+    }
+    system.GetPowerPC().WriteFullTimeBaseValue(system.GetSystemTimers().GetFakeTimeBase());
+    ppc_state.gpr[inst.RD] = ppc_state.spr[index];
+    break;
+  }
+  case 339:  // mfspr
+    Interpreter::mfspr(system.GetInterpreter(), inst);
+    break;
+  case 467:  // mtspr
+    Interpreter::mtspr(system.GetInterpreter(), inst);
+    break;
+  case 54:   // dcbst
+  case 86:   // dcbf
+  case 470:  // dcbi
+  {
+    const u32 address = (inst.RA ? ppc_state.gpr[inst.RA] : 0) + ppc_state.gpr[inst.RB];
+    if (inst.SUBOP10 == 470 && ppc_state.msr.PR)
+    {
+      GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+      break;
+    }
+
+    if (!ppc_state.m_enable_dcache)
+    {
+      system.GetJitInterface().InvalidateICacheLine(address);
+      break;
+    }
+
+    if (inst.SUBOP10 == 54)
+      system.GetMMU().StoreDCacheLine(address);
+    else if (inst.SUBOP10 == 86)
+      system.GetMMU().FlushDCacheLine(address);
+    else
+      system.GetMMU().InvalidateDCacheLine(address);
+    break;
+  }
+  case 33:   // crnor
+  case 129:  // crandc
+  case 193:  // crxor
+  case 225:  // crnand
+  case 257:  // crand
+  case 289:  // creqv
+  case 417:  // crorc
+  case 449:  // cror
+  {
+    const u32 a = ppc_state.cr.GetBit(inst.CRBA);
+    const u32 b = ppc_state.cr.GetBit(inst.CRBB);
+    u32 value = 0;
+    switch (inst.SUBOP10)
+    {
+    case 33:
+      value = 1 ^ (a | b);
+      break;
+    case 129:
+      value = a & (1 ^ b);
+      break;
+    case 193:
+      value = a ^ b;
+      break;
+    case 225:
+      value = 1 ^ (a & b);
+      break;
+    case 257:
+      value = a & b;
+      break;
+    case 289:
+      value = 1 ^ (a ^ b);
+      break;
+    case 417:
+      value = a | (1 ^ b);
+      break;
+    case 449:
+      value = a | b;
+      break;
+    }
+    ppc_state.cr.SetBit(inst.CRBD, value);
+    break;
+  }
+  case 1014:  // dcbz
+  {
+    if (inst.OPCD != 31)
+      return 0;
+
+    const u32 address = (inst.RA ? ppc_state.gpr[inst.RA] : 0) + ppc_state.gpr[inst.RB];
+    if (!HID0(ppc_state).DCE)
+    {
+      GenerateAlignmentException(ppc_state, address);
+      break;
+    }
+
+    if (!ppc_state.m_enable_dcache && address < 0x80008000 && address >= 0x80000000 &&
+        Config::Get(Config::MAIN_LOW_DCBZ_HACK))
+    {
+      break;
+    }
+
+    system.GetMMU().ClearDCacheLine(address & ~31u);
+    break;
+  }
+  default:
+    return 0;
+  }
+
+  return DolphinWeb_CachedInterpreterCheckProgramOrDsi(ppc_state, current_pc, downcount) ? 1 : 0;
+}
+
+extern "C" int DolphinWeb_CachedInterpreterInterpret(int state_ptr, u32 current_pc, u32 inst_hex,
+                                                      int write_pc, u32 downcount)
+{
+  auto& system = Core::System::GetInstance();
+  auto& interpreter = system.GetInterpreter();
+  auto& ppc_state = *reinterpret_cast<PowerPC::PowerPCState*>(
+      static_cast<std::uintptr_t>(state_ptr));
+  const UGeckoInstruction inst{inst_hex};
+  const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, current_pc);
+  ++s_wasm_helper_call_count;
+  ++s_wasm_helper_key_counts[(inst.OPCD << 10) | inst.SUBOP10];
+  if (inst.OPCD == 31 && inst.SUBOP10 == 339)
+    ++s_wasm_helper_mfspr_counts[DecodeMfsprIndex(inst)];
+  else if (inst.OPCD == 31 && inst.SUBOP10 == 467)
+    ++s_wasm_helper_mtspr_counts[DecodeMtsprIndex(inst)];
+  if (inst.OPCD == 16)
+  {
+    const u32 branch_key = (inst.BO << 5) | inst.BI;
+    ++s_wasm_helper_branch_key_counts[branch_key];
+    if (s_wasm_helper_branch_sample_insts[branch_key] == 0)
+    {
+      s_wasm_helper_branch_sample_insts[branch_key] = inst.hex;
+      s_wasm_helper_branch_sample_pcs[branch_key] = current_pc;
+    }
+  }
+
+  if (write_pc)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = current_pc + 4;
+  }
+
+  if ((opinfo->flags & FL_USE_FPU) != 0 && !ppc_state.msr.FP)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.downcount -= downcount;
+    ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
+    system.GetPowerPC().CheckExceptions();
+    ++s_wasm_helper_halt_count;
+    return 1;
+  }
+
+  Interpreter::GetInterpreterOp(inst)(interpreter, inst);
+  if ((ppc_state.Exceptions & (EXCEPTION_DSI | EXCEPTION_PROGRAM)) != 0)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.downcount -= downcount;
+    system.GetPowerPC().CheckExceptions();
+    ++s_wasm_helper_halt_count;
+    return 1;
+  }
+  return 0;
+}
+
+void EmitU32Leb(std::vector<u8>& bytes, u32 value)
+{
+  do
+  {
+    u8 byte = value & 0x7f;
+    value >>= 7;
+    if (value != 0)
+      byte |= 0x80;
+    bytes.push_back(byte);
+  } while (value != 0);
+}
+
+void EmitI32Leb(std::vector<u8>& bytes, s32 value)
+{
+  bool more = true;
+  while (more)
+  {
+    u8 byte = value & 0x7f;
+    value >>= 7;
+    const bool sign_bit = (byte & 0x40) != 0;
+    if ((value == 0 && !sign_bit) || (value == -1 && sign_bit))
+      more = false;
+    else
+      byte |= 0x80;
+    bytes.push_back(byte);
+  }
+}
+
+void EmitSection(std::vector<u8>& bytes, u8 id, std::span<const u8> content)
+{
+  bytes.push_back(id);
+  EmitU32Leb(bytes, static_cast<u32>(content.size()));
+  bytes.insert(bytes.end(), content.begin(), content.end());
+}
+
+void EmitSection(std::vector<u8>& bytes, u8 id, std::initializer_list<u8> content)
+{
+  EmitSection(bytes, id, std::span<const u8>{content.begin(), content.size()});
+}
+
+void EmitName(std::vector<u8>& bytes, std::string_view name)
+{
+  EmitU32Leb(bytes, static_cast<u32>(name.size()));
+  bytes.insert(bytes.end(), name.begin(), name.end());
+}
+
+void EmitEnvFunctionImport(std::vector<u8>& imports, std::string_view name, u32 type_index)
+{
+  EmitName(imports, "env");
+  EmitName(imports, name);
+  imports.push_back(0x00);
+  EmitU32Leb(imports, type_index);
+}
+
+struct WasmStateLayout
+{
+  u32 npc_offset;
+  u32 gpr_offset;
+  u32 ps_offset;
+  u32 cr_offset;
+  u32 spr_offset;
+  u32 msr_offset;
+  u32 fpscr_offset;
+  u32 feature_flags_offset;
+  u32 pagetable_update_pending_offset;
+  u32 xer_ca_offset;
+  u32 xer_so_ov_offset;
+  u32 xer_stringctrl_offset;
+  u32 dcache_enabled_offset;
+  u32 gather_pipe_ptr_offset;
+  u32 gather_pipe_base_ptr_offset;
+  u32 ram_base;
+  u32 ram_size_real;
+  u32 l1_base;
+  u32 l1_size;
+};
+
+constexpr u32 WASM_IMPORT_FASTCHECK_GPFIFO_INDEX = 14;
+constexpr u32 WASM_IMPORT_INTERPRET_INDEX = 13;
+constexpr u32 WASM_IMPORT_FAST_OS_INTERRUPT_CALL_INDEX = 15;
+constexpr u32 WASM_IMPORT_FAST_MELEE_INPUT_STATUS_CALL_INDEX = 16;
+constexpr u32 WASM_IMPORT_FAST_MELEE_STATUS_CALL_INDEX = 17;
+constexpr u32 WASM_IMPORT_FAST_MELEE_SERVICE_POLL_CALL_INDEX = 18;
+// SNES Touch: flush at one burst (32 bytes), as GPFifo::CheckGatherPipe does, not when the whole
+// slack buffer is nearly full. Commands left sitting in the pipe never reach the GPU, and a game
+// that writes a few words and then waits for them (a draw-sync token) hangs: Need for Speed:
+// Underground 2 did exactly that once stw/sth/stb took the fast path.
+constexpr u32 WASM_GATHER_PIPE_FLUSH_THRESHOLD = GPFifo::GATHER_PIPE_SIZE;
+
+void EmitLocalGet(std::vector<u8>& body, u32 index)
+{
+  body.push_back(0x20);
+  EmitU32Leb(body, index);
+}
+
+void EmitLocalSet(std::vector<u8>& body, u32 index)
+{
+  body.push_back(0x21);
+  EmitU32Leb(body, index);
+}
+
+// ─── §28cx C1: GPR register cache in WASM locals ───────────────────────────
+// Keep PowerPC GPRs in WASM locals across a block instead of reloading them
+// from the guest-state struct on every access. The prior §28by "regalloc" only
+// skipped dead *stores*; the ~15 *reloads*/block were untouched, which is why
+// it measured neutral. Locals WASM_GPR_LOCAL_BASE+i map 1:1 to GPR i. Every
+// referenced GPR is eagerly loaded at the block prologue (eager, not lazy, so a
+// load that would otherwise sit inside a conditional WASM block can't be
+// skipped on the other path). `dirty` is sticky (never cleared) so the
+// unconditional block-end flush is always correct even when stores or
+// state-touching calls sit inside conditional WASM blocks. Gated by the
+// regalloc disable bit — this is the real implementation of ?regalloc=1 and
+// supersedes ShouldSkipGprStore.
+constexpr u32 WASM_GPR_LOCAL_BASE = 8;
+struct WasmGprRegCache
+{
+  bool active = false;
+  u32 gpr_base = 0;       // == layout.gpr_offset
+  bool present[32] = {};  // GPR loaded into local WASM_GPR_LOCAL_BASE+i at prologue
+  bool dirty[32] = {};    // GPR local written since prologue (sticky, never cleared)
+};
+static WasmGprRegCache s_gpr_rc;
+
+// §28cz fastmem bounds-check hoist plan. Built per block (gated on the enable
+// bit) BEFORE the emit loop by AnalyzeFastmemHoistPlan, which re-runs the exact
+// s_fmh_ grouping logic and records, per CodeOp, whether the op is the first
+// covered access of a hoistable group (→ emit the range check + flag.set) and
+// whether it is any covered access (→ emit the if(flag) fast/slow split).
+// Keyed by CodeOp* (stable for the lifetime of one BuildWasmCachedInterpreterBlock
+// call — the same `ops` span is what the emit loop iterates). One i32 flag local
+// (WASM_FMH_FLAG_LOCAL) is reused across groups: groups never nest and are
+// emitted strictly in order, so each group recomputes the flag before its first
+// access. Scoped to 32-bit D-form (lwz/lwzu/stw/stwu); other widths in a group
+// still emit their existing checked path (counted as "slow").
+constexpr u32 WASM_FMH_FLAG_LOCAL = 40;  // i32 scratch local appended after GPR locals 8..39
+struct WasmFastmemHoistPlan
+{
+  bool active = false;
+  // Per covered CodeOp: emit_check=this op leads its group (emit range check),
+  // group base reg b, omin/omax (sign-extended SIMM16 min/max over the group).
+  struct OpInfo
+  {
+    bool covered = false;     // op is inside a hoistable group
+    bool emit_check = false;  // op is the first covered access → emit the flag recompute
+    int base = 0;             // group base GPR (b)
+    s32 omin = 0;
+    s32 omax = 0;
+  };
+  std::unordered_map<const PPCAnalyst::CodeOp*, OpInfo> ops;
+};
+static WasmFastmemHoistPlan s_fmh_plan;
+
+inline bool RegCacheGprIndex(u32 offset, u32* out_index)
+{
+  if (!s_gpr_rc.active || offset < s_gpr_rc.gpr_base)
+    return false;
+  const u32 rel = offset - s_gpr_rc.gpr_base;
+  if (rel >= 32u * sizeof(u32) || (rel % sizeof(u32)) != 0)
+    return false;
+  *out_index = rel / sizeof(u32);
+  return true;
+}
+
+// Flush every dirty GPR local back to the guest-state struct. Stack-neutral, so
+// it is safe to splice before any state-touching import call and before the
+// block-end return. Dirty stays set on purpose (see struct comment).
+void EmitRegCacheFlushDirty(std::vector<u8>& body)
+{
+  if (!s_gpr_rc.active)
+    return;
+  for (u32 i = 0; i < 32; ++i)
+  {
+    if (!s_gpr_rc.present[i] || !s_gpr_rc.dirty[i])
+      continue;
+    EmitLocalGet(body, 0);
+    EmitLocalGet(body, WASM_GPR_LOCAL_BASE + i);
+    body.push_back(0x36);  // i32.store
+    body.push_back(0x02);  // align=2
+    EmitU32Leb(body, s_gpr_rc.gpr_base + i * static_cast<u32>(sizeof(u32)));
+  }
+}
+
+// Reload all cached GPR locals from memory after a call that may have written
+// arbitrary GPRs (interpret/system/HLE helpers). Stack-neutral.
+void EmitRegCacheReloadAll(std::vector<u8>& body)
+{
+  if (!s_gpr_rc.active)
+    return;
+  for (u32 i = 0; i < 32; ++i)
+  {
+    if (!s_gpr_rc.present[i])
+      continue;
+    EmitLocalGet(body, 0);
+    body.push_back(0x28);  // i32.load
+    body.push_back(0x02);
+    EmitU32Leb(body, s_gpr_rc.gpr_base + i * static_cast<u32>(sizeof(u32)));
+    EmitLocalSet(body, WASM_GPR_LOCAL_BASE + i);
+  }
+}
+
+// Reload only the GPRs a known op writes (its regsOut) — used after calls whose
+// GPR effect is exactly the op's outputs (fp ops, which write ~no GPRs), so the
+// fp-heavy path doesn't pay a full reload per call.
+void EmitRegCacheReloadMask(std::vector<u8>& body, BitSet32 gprs)
+{
+  if (!s_gpr_rc.active)
+    return;
+  for (int bit : gprs)
+  {
+    if (bit < 0 || bit >= 32 || !s_gpr_rc.present[bit])
+      continue;
+    EmitLocalGet(body, 0);
+    body.push_back(0x28);  // i32.load
+    body.push_back(0x02);
+    EmitU32Leb(body, s_gpr_rc.gpr_base + static_cast<u32>(bit) * static_cast<u32>(sizeof(u32)));
+    EmitLocalSet(body, WASM_GPR_LOCAL_BASE + static_cast<u32>(bit));
+  }
+}
+
+void EmitI32Const(std::vector<u8>& body, u32 value)
+{
+  body.push_back(0x41);
+  EmitI32Leb(body, static_cast<s32>(value));
+}
+
+void EmitF64ConstBits(std::vector<u8>& body, u64 bits)
+{
+  body.push_back(0x44);
+  for (u32 i = 0; i < sizeof(bits); ++i)
+    body.push_back(static_cast<u8>(bits >> (i * 8)));
+}
+
+u32 GprOffset(const WasmStateLayout& layout, u32 index)
+{
+  return layout.gpr_offset + index * sizeof(u32);
+}
+
+u32 PsOffset(const WasmStateLayout& layout, u32 index, u32 lane)
+{
+  return layout.ps_offset + index * sizeof(PowerPC::PairedSingle) + lane * sizeof(u64);
+}
+
+u32 CrFieldOffset(const WasmStateLayout& layout, u32 index)
+{
+  return layout.cr_offset + index * sizeof(u64);
+}
+
+u32 SprOffset(const WasmStateLayout& layout, u32 index)
+{
+  return layout.spr_offset + index * sizeof(u32);
+}
+
+bool IsDirectSimpleMfspr(u32 index)
+{
+  return index == SPR_LR || index == SPR_CTR || index == SPR_SRR0 || index == SPR_SRR1 ||
+         (index >= SPR_SPRG0 && index <= SPR_SPRG3) || index == SPR_HID0 ||
+         index == SPR_HID2 ||
+         (index >= SPR_GQR0 && index < SPR_GQR0 + 8);
+}
+
+bool IsDirectSimpleMtspr(u32 index)
+{
+  return index == SPR_LR || index == SPR_CTR || index == SPR_SRR0 || index == SPR_SRR1 ||
+         (index >= SPR_SPRG0 && index <= SPR_SPRG3) ||
+         (index >= SPR_GQR0 && index < SPR_GQR0 + 8);
+}
+
+void EmitStateLoadU32(std::vector<u8>& body, u32 offset)
+{
+  u32 gpr_index;
+  if (RegCacheGprIndex(offset, &gpr_index) && s_gpr_rc.present[gpr_index])
+  {
+    // §28cx C1: GPR is resident in a WASM local — read it directly.
+    EmitLocalGet(body, WASM_GPR_LOCAL_BASE + gpr_index);
+    return;
+  }
+  ++s_wasm_emit_state_load_u32_count;
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateLoadF64(std::vector<u8>& body, u32 offset)
+{
+  ++s_wasm_emit_state_load_f64_count;
+  EmitLocalGet(body, 0);
+  body.push_back(0x2b);
+  body.push_back(0x03);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateLoadI64(std::vector<u8>& body, u32 offset)
+{
+  ++s_wasm_emit_state_load_i64_count;
+  EmitLocalGet(body, 0);
+  body.push_back(0x29);
+  body.push_back(0x03);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateLoadU8(std::vector<u8>& body, u32 offset)
+{
+  EmitLocalGet(body, 0);
+  body.push_back(0x2d);
+  body.push_back(0x00);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateLoadU16(std::vector<u8>& body, u32 offset)
+{
+  EmitLocalGet(body, 0);
+  body.push_back(0x2f);
+  body.push_back(0x01);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateStoreU32Prefix(std::vector<u8>& body)
+{
+  EmitLocalGet(body, 0);
+}
+
+void EmitStateStoreU32Suffix(std::vector<u8>& body, u32 offset)
+{
+  u32 gpr_index;
+  if (RegCacheGprIndex(offset, &gpr_index) && s_gpr_rc.present[gpr_index])
+  {
+    // §28cx C1: stack is [state_ptr (from the prefix), value]. Move the value
+    // into the GPR local and drop the state_ptr the prefix pushed — so the 129
+    // EmitStateStoreU32Prefix call sites need no change.
+    EmitLocalSet(body, WASM_GPR_LOCAL_BASE + gpr_index);
+    body.push_back(0x1a);  // drop (the now-unused state_ptr)
+    s_gpr_rc.dirty[gpr_index] = true;
+    return;
+  }
+  ++s_wasm_emit_state_store_u32_count;
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateStoreF64Suffix(std::vector<u8>& body, u32 offset)
+{
+  ++s_wasm_emit_state_store_f64_count;
+  body.push_back(0x39);
+  body.push_back(0x03);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateStoreI64Suffix(std::vector<u8>& body, u32 offset)
+{
+  ++s_wasm_emit_state_store_i64_count;
+  body.push_back(0x37);
+  body.push_back(0x03);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateStoreU8Suffix(std::vector<u8>& body, u32 offset)
+{
+  body.push_back(0x3a);
+  body.push_back(0x00);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStateStoreU16Suffix(std::vector<u8>& body, u32 offset)
+{
+  body.push_back(0x3b);
+  body.push_back(0x01);
+  EmitU32Leb(body, offset);
+}
+
+void EmitStoreStateU32Const(std::vector<u8>& body, u32 offset, u32 value)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, value);
+  EmitStateStoreU32Suffix(body, offset);
+}
+
+void EmitStoreNpcConst(std::vector<u8>& body, const WasmStateLayout& layout, u32 value)
+{
+  EmitStoreStateU32Const(body, layout.npc_offset, value);
+}
+
+void EmitLoadXer(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitStateLoadU16(body, layout.xer_stringctrl_offset);
+  EmitStateLoadU8(body, layout.xer_ca_offset);
+  EmitI32Const(body, XER_CA_SHIFT);
+  body.push_back(0x74);
+  body.push_back(0x72);
+  EmitStateLoadU8(body, layout.xer_so_ov_offset);
+  EmitI32Const(body, XER_OV_SHIFT);
+  body.push_back(0x74);
+  body.push_back(0x72);
+}
+
+void EmitStoreXerFromLocal(std::vector<u8>& body, const WasmStateLayout& layout, u32 local_index)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0x7f);
+  body.push_back(0x71);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0xff00);
+  body.push_back(0x71);
+  body.push_back(0x72);
+  EmitStateStoreU16Suffix(body, layout.xer_stringctrl_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, XER_CA_SHIFT);
+  body.push_back(0x76);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, XER_OV_SHIFT);
+  body.push_back(0x76);
+  EmitI32Const(body, 3);
+  body.push_back(0x71);
+  EmitStateStoreU8Suffix(body, layout.xer_so_ov_offset);
+}
+
+void EmitGprOrZero(std::vector<u8>& body, const WasmStateLayout& layout, u32 index)
+{
+  if (index == 0)
+    EmitI32Const(body, 0);
+  else
+    EmitStateLoadU32(body, GprOffset(layout, index));
+}
+
+// §28by GPR dead-store skip — when the destination GPR's value is statically
+// dead after this instruction (PPCAnalyst's gprDiscardable bit set on rd), AND
+// the regalloc gate is enabled (default-OFF, ?regalloc=1 to opt in), replace
+// the final i32.store with a drop. Caller MUST omit the prefix
+// (EmitStateStoreU32Prefix) when this returns true — otherwise the state_ptr
+// push is left dangling on the WASM operand stack. Returns true when the
+// store was skipped.
+inline bool ShouldSkipGprStore(const PPCAnalyst::CodeOp& op, u32 rd)
+{
+  // §28cx C1: the GPR RegCache (active under the same regalloc gate) writes
+  // GPRs to locals and flushes at block end, so the dead-store-skip must NOT
+  // also fire — otherwise the prefix's state_ptr push would be left dangling.
+  if (s_gpr_rc.active)
+    return false;
+  return !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_REGALLOC) &&
+         op.gprDiscardable[rd];
+}
+
+void EmitStoreCrField(std::vector<u8>& body, const WasmStateLayout& layout, u32 cr_field,
+                      u32 ppc_cr)
+{
+  const u64 internal = PowerPC::ConditionRegister::PPCToInternal(static_cast<u8>(ppc_cr));
+  const u32 low = static_cast<u32>(internal);
+  const u32 high_without_so = static_cast<u32>(internal >> 32) & ~(1u << 27);
+  const u32 field_offset = CrFieldOffset(layout, cr_field);
+
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, low);
+  EmitStateStoreU32Suffix(body, field_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, high_without_so);
+  EmitStateLoadU8(body, layout.xer_so_ov_offset);
+  EmitI32Const(body, 2);
+  body.push_back(0x71);
+  EmitI32Const(body, 26);
+  body.push_back(0x74);
+  body.push_back(0x72);
+  EmitStateStoreU32Suffix(body, field_offset + sizeof(u32));
+}
+
+void EmitCompareImmediate(std::vector<u8>& body, const WasmStateLayout& layout,
+                          UGeckoInstruction inst, bool is_signed)
+{
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitI32Const(body, is_signed ? static_cast<u32>(static_cast<s32>(inst.SIMM_16)) : inst.UIMM);
+  body.push_back(is_signed ? 0x48 : 0x49);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_LT);
+  body.push_back(0x05);
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitI32Const(body, is_signed ? static_cast<u32>(static_cast<s32>(inst.SIMM_16)) : inst.UIMM);
+  body.push_back(is_signed ? 0x4a : 0x4b);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_GT);
+  body.push_back(0x05);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_EQ);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitUpdateCr0FromLocal(std::vector<u8>& body, const WasmStateLayout& layout, u32 local_index)
+{
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0);
+  body.push_back(0x48);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, 0, PowerPC::CR_LT);
+  body.push_back(0x05);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0);
+  body.push_back(0x4a);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, 0, PowerPC::CR_GT);
+  body.push_back(0x05);
+  EmitStoreCrField(body, layout, 0, PowerPC::CR_EQ);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitAddic(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst,
+               bool update_cr0)
+{
+  // See the note on addex below: store new XER.CA BEFORE storing the result
+  // to GprOffset(RD), because RD may alias RA and the CA recomputation
+  // re-reads RA from memory.
+  const u32 immediate = static_cast<u32>(static_cast<s32>(inst.SIMM_16));
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitI32Const(body, immediate);
+  body.push_back(0x6a);
+  EmitLocalSet(body, 3);
+
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, immediate);
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitI32Const(body, 0xffffffff);
+  body.push_back(0x73);
+  body.push_back(0x4b);
+  EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 3);
+  EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+  if (update_cr0)
+    EmitUpdateCr0FromLocal(body, layout, 3);
+}
+
+void EmitCompareRegister(std::vector<u8>& body, const WasmStateLayout& layout,
+                         UGeckoInstruction inst, bool is_signed)
+{
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+  body.push_back(is_signed ? 0x48 : 0x49);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_LT);
+  body.push_back(0x05);
+  EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+  body.push_back(is_signed ? 0x4a : 0x4b);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_GT);
+  body.push_back(0x05);
+  EmitStoreCrField(body, layout, inst.CRFD, PowerPC::CR_EQ);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitCrBit(std::vector<u8>& body, const WasmStateLayout& layout, u32 bit)
+{
+  const u32 field_offset = CrFieldOffset(layout, bit >> 2);
+  switch (bit & 3)
+  {
+  case 0:  // LT
+    EmitStateLoadU32(body, field_offset + sizeof(u32));
+    EmitI32Const(body, 30);
+    body.push_back(0x76);
+    EmitI32Const(body, 1);
+    body.push_back(0x71);
+    break;
+  case 1:  // GT
+    EmitStateLoadU32(body, field_offset + sizeof(u32));
+    EmitI32Const(body, 0x80000000);
+    body.push_back(0x71);
+    body.push_back(0x45);
+    EmitStateLoadU32(body, field_offset + sizeof(u32));
+    EmitStateLoadU32(body, field_offset);
+    body.push_back(0x72);
+    EmitI32Const(body, 0);
+    body.push_back(0x47);
+    body.push_back(0x71);
+    break;
+  case 2:  // EQ
+    EmitStateLoadU32(body, field_offset);
+    body.push_back(0x45);
+    break;
+  case 3:  // SO
+    EmitStateLoadU32(body, field_offset + sizeof(u32));
+    EmitI32Const(body, 27);
+    body.push_back(0x76);
+    EmitI32Const(body, 1);
+    body.push_back(0x71);
+    break;
+  }
+}
+
+void EmitCrFieldToPpcBits(std::vector<u8>& body, const WasmStateLayout& layout, u32 field)
+{
+  const u32 field_offset = CrFieldOffset(layout, field);
+
+  EmitStateLoadU32(body, field_offset + sizeof(u32));
+  EmitI32Const(body, 27);
+  body.push_back(0x76);
+  EmitI32Const(body, PowerPC::CR_LT | PowerPC::CR_SO);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, field_offset);
+  body.push_back(0x45);
+  EmitI32Const(body, PowerPC::CR_EQ_BIT);
+  body.push_back(0x74);
+  body.push_back(0x72);
+
+  EmitStateLoadU32(body, field_offset + sizeof(u32));
+  EmitI32Const(body, 0x80000000);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  EmitI32Const(body, PowerPC::CR_GT_BIT);
+  body.push_back(0x74);
+  body.push_back(0x72);
+}
+
+void EmitMfcr(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst)
+{
+  EmitI32Const(body, 0);
+  EmitLocalSet(body, 3);
+
+  for (u32 field = 0; field < 8; ++field)
+  {
+    EmitLocalGet(body, 3);
+    EmitCrFieldToPpcBits(body, layout, field);
+    EmitI32Const(body, 28 - field * 4);
+    body.push_back(0x74);
+    body.push_back(0x72);
+    EmitLocalSet(body, 3);
+  }
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 3);
+  EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+}
+
+void EmitStoreCrFieldFromPpcLocal(std::vector<u8>& body, const WasmStateLayout& layout, u32 field,
+                                  u32 local_index)
+{
+  const u32 field_offset = CrFieldOffset(layout, field);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, PowerPC::CR_EQ);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  EmitStateStoreU32Suffix(body, field_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, 1);
+
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, PowerPC::CR_SO);
+  body.push_back(0x71);
+  EmitI32Const(body, 27);
+  body.push_back(0x74);
+  body.push_back(0x72);
+
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, PowerPC::CR_GT);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  EmitI32Const(body, 31);
+  body.push_back(0x74);
+  body.push_back(0x72);
+
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, PowerPC::CR_LT);
+  body.push_back(0x71);
+  EmitI32Const(body, 27);
+  body.push_back(0x74);
+  body.push_back(0x72);
+
+  EmitStateStoreU32Suffix(body, field_offset + sizeof(u32));
+}
+
+void EmitMtcrf(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst)
+{
+  for (u32 field = 0; field < 8; ++field)
+  {
+    if ((inst.CRM & (1u << (7 - field))) == 0)
+      continue;
+
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, 28 - field * 4);
+    body.push_back(0x76);
+    EmitI32Const(body, 0xf);
+    body.push_back(0x71);
+    EmitLocalSet(body, 2);
+    EmitStoreCrFieldFromPpcLocal(body, layout, field, 2);
+  }
+}
+
+void EmitCrLogical(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst)
+{
+  const u32 destination_shift = 3 - (inst.CRBD & 3);
+  const u32 destination_mask = 1u << destination_shift;
+
+  EmitCrBit(body, layout, inst.CRBA);
+  EmitCrBit(body, layout, inst.CRBB);
+  switch (inst.SUBOP10)
+  {
+  case 33:  // crnor
+    body.push_back(0x72);
+    EmitI32Const(body, 1);
+    body.push_back(0x73);
+    break;
+  case 129:  // crandc
+    EmitI32Const(body, 1);
+    body.push_back(0x73);
+    body.push_back(0x71);
+    break;
+  case 193:  // crxor
+    body.push_back(0x73);
+    break;
+  case 225:  // crnand
+    body.push_back(0x71);
+    EmitI32Const(body, 1);
+    body.push_back(0x73);
+    break;
+  case 257:  // crand
+    body.push_back(0x71);
+    break;
+  case 289:  // creqv
+    body.push_back(0x73);
+    EmitI32Const(body, 1);
+    body.push_back(0x73);
+    break;
+  case 417:  // crorc
+    EmitI32Const(body, 1);
+    body.push_back(0x73);
+    body.push_back(0x72);
+    break;
+  case 449:  // cror
+    body.push_back(0x72);
+    break;
+  default:
+    EmitI32Const(body, 0);
+    break;
+  }
+  EmitLocalSet(body, 2);
+
+  EmitCrFieldToPpcBits(body, layout, inst.CRBD >> 2);
+  EmitLocalSet(body, 3);
+
+  EmitLocalGet(body, 3);
+  EmitI32Const(body, ~destination_mask);
+  body.push_back(0x71);
+  EmitLocalGet(body, 2);
+  EmitI32Const(body, destination_shift);
+  body.push_back(0x74);
+  body.push_back(0x72);
+  EmitLocalSet(body, 2);
+
+  EmitStoreCrFieldFromPpcLocal(body, layout, inst.CRBD >> 2, 2);
+}
+
+void EmitSystemCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount);
+void EmitFastOsInterruptCall(std::vector<u8>& body, u32 current_pc,
+                             const OsInterruptInlineTarget& target);
+void EmitFastMeleeInputStatusCall(std::vector<u8>& body, u32 current_pc);
+void EmitFastMeleeStatusCall(std::vector<u8>& body, u32 current_pc, u32 downcount);
+void EmitFastMeleeServicePollCall(std::vector<u8>& body, u32 current_pc, u32 downcount);
+
+void EmitMfmsr(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+               u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 14);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitSystemCall(body, op, downcount);
+  body.push_back(0x05);
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+  body.push_back(0x0b);
+}
+
+void EmitApplyMsrFromLocal(std::vector<u8>& body, const WasmStateLayout& layout, u32 local_index)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, local_index);
+  EmitStateStoreU32Suffix(body, layout.msr_offset);
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, layout.feature_flags_offset);
+  EmitI32Const(body, FEATURE_FLAG_PERFMON);
+  body.push_back(0x71);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 4);
+  body.push_back(0x76);
+  EmitI32Const(body, FEATURE_FLAG_MSR_DR | FEATURE_FLAG_MSR_IR);
+  body.push_back(0x71);
+  body.push_back(0x72);
+  EmitStateStoreU32Suffix(body, layout.feature_flags_offset);
+}
+
+void EmitPendingPageTableUpdateForMsrLocal(std::vector<u8>& body, const WasmStateLayout& layout,
+                                           u32 local_index)
+{
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 1u << 4);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x45);
+  EmitStateLoadU8(body, layout.pagetable_update_pending_offset);
+  body.push_back(0x71);
+}
+
+void EmitMtmsr(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+               u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+  EmitLocalSet(body, 2);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 14);
+  body.push_back(0x71);
+  EmitPendingPageTableUpdateForMsrLocal(body, layout, 2);
+  body.push_back(0x72);
+
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitSystemCall(body, op, downcount);
+  body.push_back(0x05);
+  EmitApplyMsrFromLocal(body, layout, 2);
+  EmitStoreNpcConst(body, layout, op.address + 4);
+  body.push_back(0x0b);
+}
+
+void EmitRfi(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+             u32 downcount)
+{
+  constexpr u32 mask = 0x87c0ffff;
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, ~mask);
+  body.push_back(0x71);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_SRR1));
+  EmitI32Const(body, mask);
+  body.push_back(0x71);
+  body.push_back(0x72);
+  EmitI32Const(body, 0xfffbffff);
+  body.push_back(0x71);
+  EmitLocalSet(body, 2);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 14);
+  body.push_back(0x71);
+  EmitPendingPageTableUpdateForMsrLocal(body, layout, 2);
+  body.push_back(0x72);
+
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitSystemCall(body, op, downcount);
+  body.push_back(0x05);
+  EmitApplyMsrFromLocal(body, layout, 2);
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_SRR0));
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+  body.push_back(0x0b);
+}
+
+void EmitConditionalBranch(std::vector<u8>& body, const WasmStateLayout& layout,
+                           const PPCAnalyst::CodeOp& op)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 ctr_offset = SprOffset(layout, SPR_CTR);
+  const u32 lr_offset = SprOffset(layout, SPR_LR);
+
+  if ((inst.BO & BO_DONT_DECREMENT_FLAG) == 0)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, ctr_offset);
+    EmitI32Const(body, 1);
+    body.push_back(0x6b);
+    EmitStateStoreU32Suffix(body, ctr_offset);
+  }
+
+  if ((inst.BO >> 2) & 1)
+  {
+    EmitI32Const(body, 1);
+  }
+  else
+  {
+    EmitStateLoadU32(body, ctr_offset);
+    EmitI32Const(body, 0);
+    body.push_back(0x47);
+    EmitI32Const(body, (inst.BO >> 1) & 1);
+    body.push_back(0x73);
+    EmitI32Const(body, 1);
+    body.push_back(0x71);
+  }
+
+  if ((inst.BO >> 4) & 1)
+  {
+    EmitI32Const(body, 1);
+  }
+  else
+  {
+    EmitCrBit(body, layout, inst.BI);
+    EmitI32Const(body, (inst.BO >> 3) & 1);
+    body.push_back(0x46);
+  }
+
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  if (inst.LK_2)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitI32Const(body, op.address + 4);
+    EmitStateStoreU32Suffix(body, lr_offset);
+  }
+
+  const u32 displacement = static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.BD << 2)));
+  const u32 destination = inst.AA_2 ? displacement : op.address + displacement;
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, destination);
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+
+  body.push_back(0x05);
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, op.address + 4);
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+  body.push_back(0x0b);
+}
+
+// SNES Touch: the port's blocks ended at every branch, so they averaged six instructions and
+// the per-block dispatch dominated the emulation thread. Blocks now run on past conditional
+// branches (bc, bclr), the way Dolphin's native JITs do. A conditional branch in the middle of a
+// block is a side exit: taken, it writes the cached GPRs back, sets npc to the target and returns
+// its cycles so far flagged with WASM_SIDE_EXIT_FLAG, and RunWasmBlock ends the block with that
+// partial downcount; not taken, the block carries on.
+constexpr u32 WASM_SIDE_EXIT_FLAG = 0x40000000;
+
+bool IsConditionalBranchBo(u32 bo)
+{
+  return (bo & BO_DONT_DECREMENT_FLAG) == 0 || (bo & BO_DONT_CHECK_CONDITION) == 0;
+}
+
+bool IsWasmSideExitBranch(const PPCAnalyst::CodeOp& op)
+{
+  const UGeckoInstruction inst = op.inst;
+  if (!op.canEndBlock || op.branchIsIdleLoop)
+    return false;
+  if (inst.OPCD == 16)
+    return IsConditionalBranchBo(inst.BO);
+  return inst.OPCD == 19 && inst.SUBOP10 == 16 && !inst.LK_3 && IsConditionalBranchBo(inst.BO_2);
+}
+
+void EmitBranchRegisterCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                 UGeckoInstruction inst, bool check_counter);
+
+void EmitConditionalSideExit(std::vector<u8>& body, const WasmStateLayout& layout,
+                             const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 ctr_offset = SprOffset(layout, SPR_CTR);
+  const u32 lr_offset = SprOffset(layout, SPR_LR);
+  const bool to_lr = inst.OPCD == 19;
+  const u32 bo = to_lr ? inst.BO_2 : inst.BO;
+
+  if ((bo & BO_DONT_DECREMENT_FLAG) == 0)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, ctr_offset);
+    EmitI32Const(body, 1);
+    body.push_back(0x6b);
+    EmitStateStoreU32Suffix(body, ctr_offset);
+  }
+  EmitBranchRegisterCondition(body, layout, inst, true);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  EmitRegCacheFlushDirty(body);
+  EmitStateStoreU32Prefix(body);
+  if (to_lr)
+  {
+    EmitStateLoadU32(body, lr_offset);
+    EmitI32Const(body, ~3u);
+    body.push_back(0x71);
+  }
+  else
+  {
+    const u32 displacement = static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.BD << 2)));
+    EmitI32Const(body, inst.AA_2 ? displacement : op.address + displacement);
+  }
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+  if (!to_lr && inst.LK_2)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitI32Const(body, op.address + 4);
+    EmitStateStoreU32Suffix(body, lr_offset);
+  }
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG | downcount);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
+}
+
+// SNES Touch: offset of PowerPCState::downcount, for blocks that loop inside their function.
+static u32 s_wasm_downcount_offset = 0;
+
+bool IsWasmLoopBackBranch(const PPCAnalyst::CodeOp& op, u32 loop_pc)
+{
+  const UGeckoInstruction inst = op.inst;
+  if (loop_pc == 0 || inst.OPCD != 16 || inst.LK_2 || op.branchIsIdleLoop)
+    return false;
+  const u32 displacement = static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.BD << 2)));
+  return (inst.AA_2 ? displacement : op.address + displacement) == loop_pc;
+}
+
+// The block's own back edge (bdnz, bne to the top). Taken, the iteration's cycles come off the
+// downcount here, and while budget is left the WASM loop around the block runs it again without
+// returning to the dispatcher; once the budget is spent it leaves like a side exit with nothing
+// more to charge. Not taken, the block falls through and RunWasmBlock charges the last iteration.
+void EmitWasmLoopBackBranch(std::vector<u8>& body, const WasmStateLayout& layout,
+                            const PPCAnalyst::CodeOp& op, u32 downcount, u32 loop_pc)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 ctr_offset = SprOffset(layout, SPR_CTR);
+  if ((inst.BO & BO_DONT_DECREMENT_FLAG) == 0)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, ctr_offset);
+    EmitI32Const(body, 1);
+    body.push_back(0x6b);
+    EmitStateStoreU32Suffix(body, ctr_offset);
+  }
+  EmitBranchRegisterCondition(body, layout, inst, true);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, s_wasm_downcount_offset);
+    EmitI32Const(body, downcount);
+    body.push_back(0x6b);  // i32.sub
+    EmitStateStoreU32Suffix(body, s_wasm_downcount_offset);
+    EmitStateLoadU32(body, s_wasm_downcount_offset);
+    EmitI32Const(body, 0);
+    body.push_back(0x4a);  // i32.gt_s
+    body.push_back(0x0d);  // br_if to the loop
+    EmitU32Leb(body, 1);
+    EmitRegCacheFlushDirty(body);
+    EmitStateStoreU32Prefix(body);
+    EmitI32Const(body, loop_pc);
+    EmitStateStoreU32Suffix(body, layout.npc_offset);
+    EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+    body.push_back(0x0f);
+  }
+  body.push_back(0x05);
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, op.address + 4);
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+  body.push_back(0x0b);
+}
+
+void EmitBranchRegisterCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                 UGeckoInstruction inst, bool check_counter)
+{
+  if (check_counter)
+  {
+    if ((inst.BO_2 >> 2) & 1)
+    {
+      EmitI32Const(body, 1);
+    }
+    else
+    {
+      EmitStateLoadU32(body, SprOffset(layout, SPR_CTR));
+      EmitI32Const(body, 0);
+      body.push_back(0x47);
+      EmitI32Const(body, (inst.BO_2 >> 1) & 1);
+      body.push_back(0x73);
+      EmitI32Const(body, 1);
+      body.push_back(0x71);
+    }
+  }
+
+  if ((inst.BO_2 >> 4) & 1)
+  {
+    EmitI32Const(body, 1);
+  }
+  else
+  {
+    EmitCrBit(body, layout, inst.BI_2);
+    EmitI32Const(body, (inst.BO_2 >> 3) & 1);
+    body.push_back(0x46);
+  }
+
+  if (check_counter)
+    body.push_back(0x71);
+}
+
+void EmitBranchToRegister(std::vector<u8>& body, const WasmStateLayout& layout,
+                          const PPCAnalyst::CodeOp& op, u32 spr_index, bool check_counter)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 ctr_offset = SprOffset(layout, SPR_CTR);
+  const u32 lr_offset = SprOffset(layout, SPR_LR);
+
+  if (check_counter && (inst.BO_2 & BO_DONT_DECREMENT_FLAG) == 0)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, ctr_offset);
+    EmitI32Const(body, 1);
+    body.push_back(0x6b);
+    EmitStateStoreU32Suffix(body, ctr_offset);
+  }
+
+  EmitBranchRegisterCondition(body, layout, inst, check_counter);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, SprOffset(layout, spr_index));
+  EmitI32Const(body, ~3u);
+  body.push_back(0x71);
+  EmitStateStoreU32Suffix(body, layout.npc_offset);
+
+  if (inst.LK_3)
+    EmitStoreStateU32Const(body, lr_offset, op.address + 4);
+
+  body.push_back(0x05);
+  EmitStoreNpcConst(body, layout, op.address + 4);
+  body.push_back(0x0b);
+}
+
+void EmitUnconditionalBranch(std::vector<u8>& body, const WasmStateLayout& layout,
+                             const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  if (const auto os_interrupt_target = GetDirectBranchOsInterruptTarget(inst, op.address))
+  {
+    EmitFastOsInterruptCall(body, op.address, *os_interrupt_target);
+    return;
+  }
+  if (IsDirectBranchLinkTo(inst, op.address, MELEE_INPUT_STATUS_PC))
+  {
+    EmitFastMeleeInputStatusCall(body, op.address);
+    return;
+  }
+  if (IsDirectBranchLinkTo(inst, op.address, MELEE_STATUS_FN_PC))
+  {
+    EmitFastMeleeStatusCall(body, op.address, downcount);
+    return;
+  }
+  if (IsDirectBranchLinkTo(inst, op.address, MELEE_SERVICE_POLL_PC))
+  {
+    EmitFastMeleeServicePollCall(body, op.address, downcount);
+    return;
+  }
+
+  if (inst.LK)
+    EmitStoreStateU32Const(body, SprOffset(layout, SPR_LR), op.address + 4);
+
+  u32 destination = u32(SignExt26(inst.LI << 2));
+  if (!inst.AA)
+    destination += op.address;
+  EmitStoreNpcConst(body, layout, destination);
+}
+
+void EmitEffectiveAddress(std::vector<u8>& body, const WasmStateLayout& layout,
+                          UGeckoInstruction inst)
+{
+  EmitGprOrZero(body, layout, inst.RA);
+  EmitI32Const(body, static_cast<u32>(static_cast<s32>(inst.SIMM_16)));
+  body.push_back(0x6a);
+}
+
+void EmitEffectiveAddress12(std::vector<u8>& body, const WasmStateLayout& layout,
+                            UGeckoInstruction inst, bool update)
+{
+  if (update)
+    EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+  else
+    EmitGprOrZero(body, layout, inst.RA);
+  EmitI32Const(body, static_cast<u32>(static_cast<s32>(inst.SIMM_12)));
+  body.push_back(0x6a);
+}
+
+void EmitEffectiveAddressX(std::vector<u8>& body, const WasmStateLayout& layout,
+                           UGeckoInstruction inst)
+{
+  EmitGprOrZero(body, layout, inst.RA);
+  EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+  body.push_back(0x6a);
+}
+
+void EmitSetEffectiveAddressLocal(std::vector<u8>& body, const WasmStateLayout& layout,
+                                  UGeckoInstruction inst)
+{
+  EmitEffectiveAddress(body, layout, inst);
+  EmitLocalSet(body, 1);
+}
+
+void EmitSetEffectiveAddressXLocal(std::vector<u8>& body, const WasmStateLayout& layout,
+                                   UGeckoInstruction inst)
+{
+  EmitEffectiveAddressX(body, layout, inst);
+  EmitLocalSet(body, 1);
+}
+
+void EmitIsMem1Address(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u32));
+  body.push_back(0x4d);
+}
+
+void EmitIsMem1AddressForSize(std::vector<u8>& body, const WasmStateLayout& layout, u32 bytes)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  EmitI32Const(body, layout.ram_size_real - bytes);
+  body.push_back(0x4d);
+}
+
+void EmitIsL1CacheAddressForSize(std::vector<u8>& body, const WasmStateLayout& layout, u32 bytes)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0xe0000000);
+  body.push_back(0x4f);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0xe0000000 + layout.l1_size - bytes);
+  body.push_back(0x4d);
+  body.push_back(0x71);
+}
+
+void EmitIsMem1LineAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  EmitI32Const(body, layout.ram_size_real - 32);
+  body.push_back(0x4d);
+}
+
+void EmitIsOutsideLowDcbzHackRange(std::vector<u8>& body)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x80000000);
+  body.push_back(0x49);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x80008000);
+  body.push_back(0x4f);
+  body.push_back(0x72);
+}
+
+void EmitRamOffset(std::vector<u8>& body)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+}
+
+void EmitRamAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitI32Const(body, layout.ram_base);
+  EmitRamOffset(body);
+  body.push_back(0x6a);
+}
+
+void EmitL1Address(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitI32Const(body, layout.l1_base);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x0fffffff);
+  body.push_back(0x71);
+  body.push_back(0x6a);
+}
+
+void EmitBswap32FromLocal(std::vector<u8>& body, u32 local_index)
+{
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0xff);
+  body.push_back(0x71);
+  EmitI32Const(body, 24);
+  body.push_back(0x74);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0xff00);
+  body.push_back(0x71);
+  EmitI32Const(body, 8);
+  body.push_back(0x74);
+  body.push_back(0x72);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 8);
+  body.push_back(0x76);
+  EmitI32Const(body, 0xff00);
+  body.push_back(0x71);
+  body.push_back(0x72);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 24);
+  body.push_back(0x76);
+  body.push_back(0x72);
+}
+
+void EmitBswap16FromLocal(std::vector<u8>& body, u32 local_index)
+{
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 0xff);
+  body.push_back(0x71);
+  EmitI32Const(body, 8);
+  body.push_back(0x74);
+  EmitLocalGet(body, local_index);
+  EmitI32Const(body, 8);
+  body.push_back(0x76);
+  EmitI32Const(body, 0xff);
+  body.push_back(0x71);
+  body.push_back(0x72);
+}
+
+void EmitLoadU32BigEndianFromRamAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitRamAddress(body, layout);
+  body.push_back(0x28);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitLocalSet(body, 2);
+  EmitBswap32FromLocal(body, 2);
+}
+
+void EmitLoadU32BigEndianFromRamAddressOffset(std::vector<u8>& body,
+                                              const WasmStateLayout& layout, u32 byte_offset)
+{
+  EmitRamAddress(body, layout);
+  body.push_back(0x28);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+  EmitLocalSet(body, 2);
+  EmitBswap32FromLocal(body, 2);
+}
+
+void EmitLoadU32BigEndianFromL1AddressOffset(std::vector<u8>& body,
+                                             const WasmStateLayout& layout, u32 byte_offset)
+{
+  EmitL1Address(body, layout);
+  body.push_back(0x28);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+  EmitLocalSet(body, 2);
+  EmitBswap32FromLocal(body, 2);
+}
+
+void EmitLoadU16BigEndianFromRamAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitRamAddress(body, layout);
+  body.push_back(0x2f);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitLocalSet(body, 2);
+  EmitBswap16FromLocal(body, 2);
+}
+
+void EmitLoadU16BigEndianFromRamAddressOffset(std::vector<u8>& body,
+                                              const WasmStateLayout& layout, u32 byte_offset)
+{
+  EmitRamAddress(body, layout);
+  body.push_back(0x2f);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+  EmitLocalSet(body, 2);
+  EmitBswap16FromLocal(body, 2);
+}
+
+void EmitStoreU32BigEndianToRamAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitBswap32FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitRamAddress(body, layout);
+  EmitLocalGet(body, 3);
+  body.push_back(0x36);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+}
+
+void EmitStoreU32BigEndianToRamAddressOffset(std::vector<u8>& body,
+                                             const WasmStateLayout& layout, u32 byte_offset)
+{
+  EmitBswap32FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitRamAddress(body, layout);
+  EmitLocalGet(body, 3);
+  body.push_back(0x36);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+}
+
+void EmitStoreU32BigEndianToL1AddressOffset(std::vector<u8>& body,
+                                            const WasmStateLayout& layout, u32 byte_offset)
+{
+  EmitBswap32FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitL1Address(body, layout);
+  EmitLocalGet(body, 3);
+  body.push_back(0x36);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+}
+
+void EmitStoreU32BigEndianToGatherPipe(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitBswap32FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitLocalGet(body, 3);
+  body.push_back(0x36);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitI32Const(body, sizeof(u32));
+  body.push_back(0x6a);
+  EmitStateStoreU32Suffix(body, layout.gather_pipe_ptr_offset);
+}
+
+void EmitFastCheckGatherPipeIfFull(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitStateLoadU32(body, layout.gather_pipe_base_ptr_offset);
+  body.push_back(0x6b);
+  EmitI32Const(body, WASM_GATHER_PIPE_FLUSH_THRESHOLD);
+  body.push_back(0x4f);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, 0);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_FASTCHECK_GPFIFO_INDEX);
+  body.push_back(0x0b);
+}
+
+void EmitStoreU16BigEndianToRamAddress(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitBswap16FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitRamAddress(body, layout);
+  EmitLocalGet(body, 3);
+  body.push_back(0x3b);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+}
+
+void EmitStoreU8ToL1AddressOffset(std::vector<u8>& body, const WasmStateLayout& layout,
+                                   u32 byte_offset)
+{
+  EmitL1Address(body, layout);
+  EmitLocalGet(body, 2);
+  body.push_back(0x3a);
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+}
+
+void EmitStoreZeroU32ToRamAddress(std::vector<u8>& body, const WasmStateLayout& layout,
+                                  u32 byte_offset)
+{
+  EmitRamAddress(body, layout);
+  EmitI32Const(body, 0);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, byte_offset);
+}
+
+void EmitReadU32MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u32));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x7f);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  body.push_back(0x28);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitLocalSet(body, 2);
+  EmitBswap32FromLocal(body, 2);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  body.push_back(0x10);
+  EmitU32Leb(body, 0);
+  body.push_back(0x0b);
+}
+
+void EmitReadU8MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u8));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x7f);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  body.push_back(0x2d);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  body.push_back(0x10);
+  EmitU32Leb(body, 2);
+  body.push_back(0x0b);
+}
+
+void EmitReadU16MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u16));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x7f);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  body.push_back(0x2f);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitLocalSet(body, 2);
+  EmitBswap16FromLocal(body, 2);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  body.push_back(0x10);
+  EmitU32Leb(body, 4);
+  body.push_back(0x0b);
+}
+
+void EmitSignExtendI16(std::vector<u8>& body)
+{
+  EmitI32Const(body, 16);
+  body.push_back(0x74);
+  EmitI32Const(body, 16);
+  body.push_back(0x75);
+}
+
+void EmitReadS16MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitReadU16MaybeDirect(body, layout);
+  EmitSignExtendI16(body);
+}
+
+// SNES Touch: a store whose address is in the write-gather pipe page goes into the pipe directly,
+// as the stfs and psq_st fast paths already do. Games write their GX command streams with stw,
+// sth and stb as well, and each of those went through the memory helper, the MMU's hardware
+// path and UpdateGatherPipe. Address in local 1, value in local 2, local 3 scratch.
+void EmitIsGatherPipeAddress(std::vector<u8>& body)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x0ffff000);
+  body.push_back(0x71);
+  EmitI32Const(body, GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS);
+  body.push_back(0x46);
+}
+
+void EmitAdvanceGatherPipe(std::vector<u8>& body, const WasmStateLayout& layout, u32 bytes)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitI32Const(body, bytes);
+  body.push_back(0x6a);
+  EmitStateStoreU32Suffix(body, layout.gather_pipe_ptr_offset);
+}
+
+void EmitStoreU16BigEndianToGatherPipe(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitBswap16FromLocal(body, 2);
+  EmitLocalSet(body, 3);
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitLocalGet(body, 3);
+  body.push_back(0x3b);  // i32.store16
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitAdvanceGatherPipe(body, layout, sizeof(u16));
+}
+
+void EmitStoreU8ToGatherPipe(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitStateLoadU32(body, layout.gather_pipe_ptr_offset);
+  EmitLocalGet(body, 2);
+  body.push_back(0x3a);  // i32.store8
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  EmitAdvanceGatherPipe(body, layout, sizeof(u8));
+}
+
+void EmitWriteU32MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u32));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitBswap32FromLocal(body, 2);
+  EmitLocalSet(body, 2);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  EmitLocalGet(body, 2);
+  body.push_back(0x36);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  body.push_back(0x05);
+  EmitIsGatherPipeAddress(body);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreU32BigEndianToGatherPipe(body, layout);
+  EmitFastCheckGatherPipeIfFull(body, layout);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitLocalGet(body, 2);
+  body.push_back(0x10);
+  EmitU32Leb(body, 1);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitWriteU8MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u8));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  EmitLocalGet(body, 2);
+  body.push_back(0x3a);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  body.push_back(0x05);
+  EmitIsGatherPipeAddress(body);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreU8ToGatherPipe(body, layout);
+  EmitFastCheckGatherPipeIfFull(body, layout);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitLocalGet(body, 2);
+  body.push_back(0x10);
+  EmitU32Leb(body, 3);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitWriteU16MaybeDirect(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);
+  body.push_back(0x22);
+  EmitU32Leb(body, 3);
+  EmitI32Const(body, layout.ram_size_real - sizeof(u16));
+  body.push_back(0x4d);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitBswap16FromLocal(body, 2);
+  EmitLocalSet(body, 2);
+  EmitI32Const(body, layout.ram_base);
+  EmitLocalGet(body, 3);
+  body.push_back(0x6a);
+  EmitLocalGet(body, 2);
+  body.push_back(0x3b);
+  body.push_back(0x00);
+  EmitU32Leb(body, 0);
+  body.push_back(0x05);
+  EmitIsGatherPipeAddress(body);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStoreU16BigEndianToGatherPipe(body, layout);
+  EmitFastCheckGatherPipeIfFull(body, layout);
+  body.push_back(0x05);
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitLocalGet(body, 2);
+  body.push_back(0x10);
+  EmitU32Leb(body, 5);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+// §28cz Emit the once-per-group bounds-check that sets the flag local. After
+// this runs, WASM_FMH_FLAG_LOCAL is 1 iff EVERY address in [base+omin, base+omax]
+// (each masked to the low 30 bits, the same 0x3FFFFFFF RAM mask the checked path
+// uses) is a valid maxsize-byte MEM1 access. CORRECTNESS: the `lo <= hi` term
+// rejects the case where masking makes base+omin and base+omax straddle the
+// 30-bit boundary — without it a wrapped pair could falsely look in-range. The
+// `hi <= ram_size_real - maxsize` term is the same upper bound the per-access
+// checked emitters use. Stack-neutral (produces no operand-stack value); uses
+// scratch local 3 transiently to hold `hi`.
+void EmitFmhRangeCheck(std::vector<u8>& body, const WasmStateLayout& layout, int base, s32 omin,
+                       s32 omax, u32 maxsize)
+{
+  // lo = (gpr[base] + omin) & 0x3FFFFFFF  -> leave on stack
+  EmitGprOrZero(body, layout, static_cast<u32>(base));
+  EmitI32Const(body, static_cast<u32>(omin));
+  body.push_back(0x6a);  // i32.add
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);  // i32.and
+  // hi = (gpr[base] + omax) & 0x3FFFFFFF  -> local 3
+  EmitGprOrZero(body, layout, static_cast<u32>(base));
+  EmitI32Const(body, static_cast<u32>(omax));
+  body.push_back(0x6a);  // i32.add
+  EmitI32Const(body, 0x3fffffff);
+  body.push_back(0x71);  // i32.and
+  EmitLocalSet(body, 3);
+  // (lo <= hi)
+  EmitLocalGet(body, 3);
+  body.push_back(0x4d);  // i32.le_u   (stack: lo, hi)
+  // (hi <= ram_size_real - maxsize)
+  EmitLocalGet(body, 3);
+  EmitI32Const(body, layout.ram_size_real - maxsize);
+  body.push_back(0x4d);  // i32.le_u
+  body.push_back(0x71);  // i32.and  -> flag value
+  EmitLocalSet(body, WASM_FMH_FLAG_LOCAL);
+}
+
+// §28cz Flag-gated 32-bit LOAD. Leaves the big-endian loaded value on the stack
+// (same as EmitReadU32MaybeDirect). then-arm = in-bounds-proven direct masked
+// load (no per-access bounds check). else-arm = the EXISTING checked emitter, so
+// any hoist miss (flag==0) degrades to the safe full path — never an unchecked
+// OOB access. EA must already be in local 1.
+void EmitFmhReadU32(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, WASM_FMH_FLAG_LOCAL);
+  body.push_back(0x04);  // if
+  body.push_back(0x7f);  // (result i32)
+  EmitLoadU32BigEndianFromRamAddress(body, layout);
+  body.push_back(0x05);  // else
+  EmitReadU32MaybeDirect(body, layout);
+  body.push_back(0x0b);  // end
+}
+
+// §28cz Flag-gated 32-bit STORE. Stores the value in local 2 to EA (local 1).
+// then-arm = direct masked store; else-arm = existing checked emitter. Void.
+void EmitFmhWriteU32(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitLocalGet(body, WASM_FMH_FLAG_LOCAL);
+  body.push_back(0x04);  // if
+  body.push_back(0x40);  // (void)
+  EmitStoreU32BigEndianToRamAddress(body, layout);
+  body.push_back(0x05);  // else
+  EmitWriteU32MaybeDirect(body, layout);
+  body.push_back(0x0b);  // end
+}
+
+// §28cz Look up the per-block plan for a 32-bit D-form op (lwz/lwzu/stw/stwu).
+// Returns true if the op is a covered fast-path access. When it leads its group
+// (emit_check), first emits the once-per-group range check (which must be placed
+// BEFORE the op's EA setup and any GPR write — true for these handlers, called
+// at the top of the case). Advances the fmhfire runtime counters. When this
+// returns false, the caller emits its normal (checked) path unchanged.
+bool EmitFmhTryRangeCheck(std::vector<u8>& body, const WasmStateLayout& layout,
+                          const PPCAnalyst::CodeOp& op)
+{
+  if (!s_fmh_plan.active)
+    return false;
+  const auto it = s_fmh_plan.ops.find(&op);
+  if (it == s_fmh_plan.ops.end() || !it->second.covered)
+    return false;
+  const WasmFastmemHoistPlan::OpInfo& info = it->second;
+  if (info.emit_check)
+  {
+    // maxsize is the largest access in the group; 32-bit scope fixes it at 4 —
+    // the group's omin/omax already bound every member's base+offset, and a
+    // 4-byte high-end check is conservative for the (only) 32-bit fast members.
+    EmitFmhRangeCheck(body, layout, info.base, info.omin, info.omax, sizeof(u32));
+    s_fmh_fire_groups = SaturatingAddU64(s_fmh_fire_groups, 1);
+  }
+  s_fmh_fire_fast = SaturatingAddU64(s_fmh_fire_fast, 1);
+  return true;
+}
+
+void EmitImportedHaltCheck(std::vector<u8>& body)
+{
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitI32Const(body, 1);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
+}
+
+void EmitSystemCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: helper reads GPRs from memory
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, op.inst.hex);
+  EmitI32Const(body, op.address);
+  EmitI32Const(body, downcount);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, 10);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // helper may have written arbitrary GPRs
+}
+
+void EmitInterpretCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount,
+                       bool write_pc)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: interpret reads op.regsIn from memory
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, op.address);
+  EmitI32Const(body, op.inst.hex);
+  EmitI32Const(body, write_pc ? 1 : 0);
+  EmitI32Const(body, downcount);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_INTERPRET_INDEX);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // interpret may have written arbitrary GPRs
+}
+
+void EmitFastOsInterruptCall(std::vector<u8>& body, u32 current_pc,
+                             const OsInterruptInlineTarget& target)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, target.mode);
+  EmitI32Const(body, target.cycles_primary);
+  EmitI32Const(body, target.cycles_secondary);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_FAST_OS_INTERRUPT_CALL_INDEX);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // interrupt handler may write arbitrary GPRs
+}
+
+void EmitFastMeleeInputStatusCall(std::vector<u8>& body, u32 current_pc)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, current_pc);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_FAST_MELEE_INPUT_STATUS_CALL_INDEX);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // HLE call may write arbitrary GPRs
+}
+
+void EmitFastMeleeStatusCall(std::vector<u8>& body, u32 current_pc, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, downcount);
+  EmitI32Const(body, 0);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_FAST_MELEE_STATUS_CALL_INDEX);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // HLE call may write arbitrary GPRs
+}
+
+void EmitFastMeleeServicePollCall(std::vector<u8>& body, u32 current_pc, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, downcount);
+  EmitI32Const(body, 0);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, WASM_IMPORT_FAST_MELEE_SERVICE_POLL_CALL_INDEX);
+  EmitImportedHaltCheck(body);
+  EmitRegCacheReloadAll(body);  // HLE call may write arbitrary GPRs
+}
+
+void EmitFpCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, op.inst.hex);
+  EmitI32Const(body, op.address);
+  EmitI32Const(body, downcount);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, 11);
+  EmitImportedHaltCheck(body);
+  // FP ops write FPRs (+CR/FPSCR), not GPRs — reload only the op's GPR outputs
+  // (normally none), so the FP-heavy Melee path doesn't pay a full reload.
+  EmitRegCacheReloadMask(body, op.regsOut);
+}
+
+void EmitLfsImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 current_pc, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: can halt → commit earlier GPR writes
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, inst.FD);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, downcount);
+  body.push_back(0x10);
+  EmitU32Leb(body, 6);
+  EmitImportedHaltCheck(body);
+}
+
+void EmitStfsImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 current_pc,
+                        u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: can halt → commit earlier GPR writes
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, inst.FS);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, downcount);
+  body.push_back(0x10);
+  EmitU32Leb(body, 7);
+  EmitImportedHaltCheck(body);
+}
+
+void EmitLfdImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 current_pc, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: can halt → commit earlier GPR writes
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, inst.FD);
+  EmitI32Const(body, current_pc);
+  EmitI32Const(body, downcount);
+  body.push_back(0x10);
+  EmitU32Leb(body, 8);
+  EmitImportedHaltCheck(body);
+}
+
+void EmitFctiwzImportCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  EmitRegCacheFlushDirty(body);  // §28cx C1: can halt → commit earlier GPR writes
+  EmitLocalGet(body, 0);
+  EmitI32Const(body, op.inst.hex);
+  EmitI32Const(body, op.address);
+  EmitI32Const(body, downcount);
+  EmitI32Const(body, 0);
+  body.push_back(0x10);
+  EmitU32Leb(body, 12);
+  EmitImportedHaltCheck(body);
+}
+
+void EmitFctiwzFast(std::vector<u8>& body, const WasmStateLayout& layout,
+                    const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  if (inst.Rc)
+  {
+    EmitFctiwzImportCall(body, op, downcount);
+    return;
+  }
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  EmitLocalSet(body, 6);
+
+  EmitLocalGet(body, 6);
+  EmitLocalGet(body, 6);
+  body.push_back(0x61);
+  EmitLocalGet(body, 6);
+  EmitF64ConstBits(body, std::bit_cast<u64>(-2147483648.0));
+  body.push_back(0x66);
+  body.push_back(0x71);
+  EmitLocalGet(body, 6);
+  EmitF64ConstBits(body, std::bit_cast<u64>(2147483648.0));
+  body.push_back(0x63);
+  body.push_back(0x71);
+
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitLocalGet(body, 6);
+  body.push_back(0xfc);
+  EmitU32Leb(body, 2);
+  EmitLocalSet(body, 2);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 2);
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitI32Const(body, 0xfff80000);
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0) + sizeof(u32));
+
+  body.push_back(0x05);
+  EmitFctiwzImportCall(body, op, downcount);
+  body.push_back(0x0b);
+
+  body.push_back(0x05);
+  EmitFctiwzImportCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitFpuAvailableOrFallback(std::vector<u8>& body, const PPCAnalyst::CodeOp& op,
+                                const WasmStateLayout& layout, u32 downcount);
+
+void EmitFrsp(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+              u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  body.push_back(0xb6);
+  body.push_back(0xbb);
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 1));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitUnaryFpBitExact(std::vector<u8>& body, const WasmStateLayout& layout,
+                         const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, PsOffset(layout, inst.FB, 0));
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, PsOffset(layout, inst.FB, 0) + sizeof(u32));
+  if (inst.SUBOP10 == 40)
+  {
+    EmitI32Const(body, 0x80000000);
+    body.push_back(0x73);
+  }
+  else if (inst.SUBOP10 == 136)
+  {
+    EmitI32Const(body, 0x80000000);
+    body.push_back(0x72);
+  }
+  else
+  {
+    EmitI32Const(body, 0x7fffffff);
+    body.push_back(0x71);
+  }
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0) + sizeof(u32));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitFloatCompareResult(std::vector<u8>& body, const WasmStateLayout& layout,
+                            UGeckoInstruction inst, u32 compare_value)
+{
+  EmitI32Const(body, compare_value);
+  EmitLocalSet(body, 2);
+  EmitStoreCrFieldFromPpcLocal(body, layout, inst.CRFD, 2);
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, layout.fpscr_offset);
+  EmitI32Const(body, ~static_cast<u32>(FPRF_MASK));
+  body.push_back(0x71);
+  EmitI32Const(body, compare_value << FPRF_SHIFT);
+  body.push_back(0x72);
+  EmitStateStoreU32Suffix(body, layout.fpscr_offset);
+}
+
+void EmitFloatCompare(std::vector<u8>& body, const WasmStateLayout& layout,
+                      const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  body.push_back(0x61);
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  body.push_back(0x61);
+  body.push_back(0x71);
+
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  body.push_back(0x63);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitFloatCompareResult(body, layout, inst, PowerPC::CR_LT);
+  body.push_back(0x05);
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  body.push_back(0x64);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitFloatCompareResult(body, layout, inst, PowerPC::CR_GT);
+  body.push_back(0x05);
+  EmitFloatCompareResult(body, layout, inst, PowerPC::CR_EQ);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitAlignedFloatFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                       bool l1_cache, u32 bytes = sizeof(u32))
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 3);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  if (l1_cache)
+    EmitIsL1CacheAddressForSize(body, layout, bytes);
+  else
+    EmitIsMem1AddressForSize(body, layout, bytes);
+  body.push_back(0x71);
+}
+
+void EmitGatherPipeFloatStoreCondition(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 3);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x0ffff000);
+  body.push_back(0x71);
+  EmitI32Const(body, GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS);
+  body.push_back(0x46);
+  body.push_back(0x71);
+}
+
+void EmitDirectLfs(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst,
+                   bool l1_cache)
+{
+  if (l1_cache)
+    EmitLoadU32BigEndianFromL1AddressOffset(body, layout, 0);
+  else
+    EmitLoadU32BigEndianFromRamAddressOffset(body, layout, 0);
+  body.push_back(0xbe);
+  body.push_back(0xbb);
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 1));
+}
+
+void EmitDirectStfs(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst,
+                    bool l1_cache)
+{
+  EmitStateLoadF64(body, PsOffset(layout, inst.FS, 0));
+  body.push_back(0xb6);
+  body.push_back(0xbc);
+  EmitLocalSet(body, 2);
+  if (l1_cache)
+    EmitStoreU32BigEndianToL1AddressOffset(body, layout, 0);
+  else
+    EmitStoreU32BigEndianToRamAddressOffset(body, layout, 0);
+}
+
+void EmitDirectStfsToGatherPipe(std::vector<u8>& body, const WasmStateLayout& layout,
+                                UGeckoInstruction inst)
+{
+  EmitStateLoadF64(body, PsOffset(layout, inst.FS, 0));
+  body.push_back(0xb6);
+  body.push_back(0xbc);
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToGatherPipe(body, layout);
+  EmitFastCheckGatherPipeIfFull(body, layout);
+}
+
+void EmitDirectLfdFromRam(std::vector<u8>& body, const WasmStateLayout& layout,
+                          UGeckoInstruction inst)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU32BigEndianFromRamAddressOffset(body, layout, sizeof(u32));
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU32BigEndianFromRamAddressOffset(body, layout, 0);
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0) + sizeof(u32));
+}
+
+void EmitDirectLfdFromL1(std::vector<u8>& body, const WasmStateLayout& layout,
+                         UGeckoInstruction inst)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU32BigEndianFromL1AddressOffset(body, layout, sizeof(u32));
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU32BigEndianFromL1AddressOffset(body, layout, 0);
+  EmitStateStoreU32Suffix(body, PsOffset(layout, inst.FD, 0) + sizeof(u32));
+}
+
+void EmitDirectStfdToRam(std::vector<u8>& body, const WasmStateLayout& layout,
+                         UGeckoInstruction inst)
+{
+  EmitStateLoadU32(body, PsOffset(layout, inst.FS, 0) + sizeof(u32));
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToRamAddressOffset(body, layout, 0);
+
+  EmitStateLoadU32(body, PsOffset(layout, inst.FS, 0));
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToRamAddressOffset(body, layout, sizeof(u32));
+}
+
+void EmitDirectStfdToL1(std::vector<u8>& body, const WasmStateLayout& layout,
+                        UGeckoInstruction inst)
+{
+  EmitStateLoadU32(body, PsOffset(layout, inst.FS, 0) + sizeof(u32));
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToL1AddressOffset(body, layout, 0);
+
+  EmitStateLoadU32(body, PsOffset(layout, inst.FS, 0));
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToL1AddressOffset(body, layout, sizeof(u32));
+}
+
+void EmitFloatLoadStore(std::vector<u8>& body, const WasmStateLayout& layout,
+                        const PPCAnalyst::CodeOp& op, u32 downcount, bool load, bool update)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitAlignedFloatFastPathCondition(body, layout, false);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  if (load)
+    EmitDirectLfs(body, layout, inst, false);
+  else
+    EmitDirectStfs(body, layout, inst, false);
+
+  body.push_back(0x05);
+  EmitAlignedFloatFastPathCondition(body, layout, true);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  if (load)
+    EmitDirectLfs(body, layout, inst, true);
+  else
+    EmitDirectStfs(body, layout, inst, true);
+
+  body.push_back(0x05);
+  if (!load)
+  {
+    EmitGatherPipeFloatStoreCondition(body, layout);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitDirectStfsToGatherPipe(body, layout, inst);
+    body.push_back(0x05);
+  }
+  if (load)
+    EmitLfsImportCall(body, inst, op.address, downcount);
+  else
+    EmitStfsImportCall(body, inst, op.address, downcount);
+  body.push_back(0x0b);
+  if (!load)
+    body.push_back(0x0b);
+  body.push_back(0x0b);
+
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  }
+}
+
+void EmitHighMem1FloatCondition(std::vector<u8>& body, const WasmStateLayout& layout, u32 bytes)
+{
+  EmitAlignedFloatFastPathCondition(body, layout, false, bytes);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x80000000);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  body.push_back(0x71);
+}
+
+void EmitLfdLoad(std::vector<u8>& body, const WasmStateLayout& layout,
+                 const PPCAnalyst::CodeOp& op, u32 downcount, bool update)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitHighMem1FloatCondition(body, layout, sizeof(u64));
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectLfdFromRam(body, layout, inst);
+
+  body.push_back(0x05);
+  EmitAlignedFloatFastPathCondition(body, layout, true, sizeof(u64));
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectLfdFromL1(body, layout, inst);
+
+  body.push_back(0x05);
+  EmitLfdImportCall(body, inst, op.address, downcount);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  }
+}
+
+void EmitStfdStore(std::vector<u8>& body, const WasmStateLayout& layout,
+                   const PPCAnalyst::CodeOp& op, u32 downcount, bool update)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitHighMem1FloatCondition(body, layout, sizeof(u64));
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectStfdToRam(body, layout, inst);
+
+  body.push_back(0x05);
+  EmitAlignedFloatFastPathCondition(body, layout, true, sizeof(u64));
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectStfdToL1(body, layout, inst);
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  }
+}
+
+void EmitMultipleWordMemory(std::vector<u8>& body, const WasmStateLayout& layout,
+                            const PPCAnalyst::CodeOp& op, u32 downcount, bool load)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 first_reg = load ? inst.RD : inst.RS;
+  const u32 bytes = (32 - first_reg) * sizeof(u32);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 3);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitIsMem1AddressForSize(body, layout, bytes);
+  body.push_back(0x71);
+
+  body.push_back(0x04);
+  body.push_back(0x40);
+  for (u32 reg = first_reg; reg <= 31; ++reg)
+  {
+    const u32 byte_offset = (reg - first_reg) * sizeof(u32);
+    if (load)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitLoadU32BigEndianFromRamAddressOffset(body, layout, byte_offset);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, reg));
+    }
+    else
+    {
+      EmitStateLoadU32(body, GprOffset(layout, reg));
+      EmitLocalSet(body, 2);
+      EmitStoreU32BigEndianToRamAddressOffset(body, layout, byte_offset);
+    }
+  }
+  body.push_back(0x05);
+  EmitSystemCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitDirectStfiwx(std::vector<u8>& body, const WasmStateLayout& layout, UGeckoInstruction inst,
+                      bool l1_cache)
+{
+  EmitStateLoadU32(body, PsOffset(layout, inst.FS, 0));
+  EmitLocalSet(body, 2);
+  if (l1_cache)
+    EmitStoreU32BigEndianToL1AddressOffset(body, layout, 0);
+  else
+    EmitStoreU32BigEndianToRamAddressOffset(body, layout, 0);
+}
+
+void EmitStfiwx(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+                u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitAlignedFloatFastPathCondition(body, layout, false);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectStfiwx(body, layout, inst, false);
+
+  body.push_back(0x05);
+  EmitAlignedFloatFastPathCondition(body, layout, true);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitDirectStfiwx(body, layout, inst, true);
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitFpuAvailableOrFallback(std::vector<u8>& body, const PPCAnalyst::CodeOp& op,
+                                const WasmStateLayout& layout, u32 downcount)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+}
+
+void EmitPairedSingleMerge(std::vector<u8>& body, const WasmStateLayout& layout,
+                           const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 lhs_lane = inst.SUBOP10 >= 592 ? 1 : 0;
+  const u32 rhs_lane = (inst.SUBOP10 == 560 || inst.SUBOP10 == 624) ? 1 : 0;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  EmitStateLoadI64(body, PsOffset(layout, inst.FA, lhs_lane));
+  EmitLocalSet(body, 4);
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, rhs_lane));
+  EmitLocalSet(body, 5);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 4);
+  EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 5);
+  EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 1));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitPairedSingleAddSub(std::vector<u8>& body, const WasmStateLayout& layout,
+                            const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u8 opcode = inst.SUBOP5 == 21 ? 0xa0 : 0xa1;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+    body.push_back(opcode);
+    body.push_back(0xb6);
+    body.push_back(0xbb);
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitPairedSingleMulAddSub(std::vector<u8>& body, const WasmStateLayout& layout,
+                               const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool multiply_only = inst.SUBOP5 == 25;
+  const bool add = inst.SUBOP5 == 29 || inst.SUBOP5 == 31;
+  const bool negate = inst.SUBOP5 == 30 || inst.SUBOP5 == 31;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FC, lane));
+    body.push_back(0xa2);
+    if (!multiply_only)
+    {
+      EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+      body.push_back(add ? 0xa0 : 0xa1);
+    }
+    body.push_back(0xb6);
+    body.push_back(0xbb);
+    if (negate)
+      body.push_back(0x9a);
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitPairedSingleScalarMulAdd(std::vector<u8>& body, const WasmStateLayout& layout,
+                                  const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 scalar_lane = (inst.SUBOP5 == 13 || inst.SUBOP5 == 15) ? 1 : 0;
+  const bool add = inst.SUBOP5 == 14 || inst.SUBOP5 == 15;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FC, scalar_lane));
+    body.push_back(0xa2);
+    if (add)
+    {
+      EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+      body.push_back(0xa0);
+    }
+    body.push_back(0xb6);
+    body.push_back(0xbb);
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// SNES Touch: more paired-single and FP instructions compiled natively. Each of these used to end
+// a block's compiled prefix, which dropped the rest of the block into the interpreter (Need for
+// Speed: Underground 2 spent a third of its CPU thread there). Same conventions as the emitters
+// above: non-fused math, results rounded to single, no FPSCR flags, Rc forms stay interpreted.
+
+// ps_sum0 (SUBOP5 10): ps0 = single(a.ps0 + b.ps1), ps1 = single(c.ps1)
+// ps_sum1 (SUBOP5 11): ps0 = single(c.ps0), ps1 = single(a.ps0 + b.ps1)
+void EmitPairedSingleSum(std::vector<u8>& body, const WasmStateLayout& layout,
+                         const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const u32 sum_lane = inst.SUBOP5 == 11 ? 1 : 0;
+  const u32 copy_lane = sum_lane ^ 1;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  // The sum first, into a local: the destination may alias an input.
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 1));
+  body.push_back(0xa0);
+  body.push_back(0xb6);
+  body.push_back(0xbb);
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadF64(body, PsOffset(layout, inst.FC, copy_lane));
+  body.push_back(0xb6);
+  body.push_back(0xbb);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, copy_lane));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, sum_lane));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// ps_sel (OPCD 4) on both lanes, fsel (OPCD 63) on lane 0: d = (a >= -0.0) ? c : b, so a NaN
+// picks b like the interpreter does.
+void EmitFloatSelect(std::vector<u8>& body, const WasmStateLayout& layout,
+                     const PPCAnalyst::CodeOp& op, u32 downcount, u32 lanes)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < lanes; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FC, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+    body.push_back(0x44);  // f64.const -0.0
+    for (int i = 0; i < 7; ++i)
+      body.push_back(0x00);
+    body.push_back(0x80);
+    body.push_back(0x66);  // f64.ge
+    body.push_back(0x1b);  // select
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// ps_neg (SUBOP10 40), ps_nabs (136), ps_abs (264): sign-bit operations on both lanes. WebAssembly
+// defines f64.abs and f64.neg bitwise, so NaN payloads come through like the interpreter's XORs.
+void EmitPairedSingleSign(std::vector<u8>& body, const WasmStateLayout& layout,
+                          const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+    if (inst.SUBOP10 != 40)
+      body.push_back(0x99);  // f64.abs
+    if (inst.SUBOP10 != 264)
+      body.push_back(0x9a);  // f64.neg
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// ps_mr (SUBOP10 72): both lanes copied bit-exactly.
+void EmitPairedSingleMove(std::vector<u8>& body, const WasmStateLayout& layout,
+                          const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 0));
+  EmitLocalSet(body, 4);
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 1));
+  EmitLocalSet(body, 5);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 4);
+  EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 5);
+  EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 1));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// ps_div (SUBOP5 18): single(a / b) per lane.
+void EmitPairedSingleDiv(std::vector<u8>& body, const WasmStateLayout& layout,
+                         const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+    body.push_back(0xa3);
+    body.push_back(0xb6);
+    body.push_back(0xbb);
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// The X-form sign and move ops above (their SUBOP5 is 8, which no A-form op uses).
+bool IsPairedSingleUnarySubop(u32 subop10)
+{
+  return subop10 == 40 || subop10 == 72 || subop10 == 136 || subop10 == 264;
+}
+
+bool IsPairedSingleMergeSubop(u32 subop10)
+{
+  return subop10 == 528 || subop10 == 560 || subop10 == 592 || subop10 == 624;
+}
+
+bool IsPairedSingleArithmeticSubop(u32 subop5)
+{
+  return subop5 == 10 || subop5 == 11 || subop5 == 12 || subop5 == 13 || subop5 == 14 ||
+         subop5 == 15 || subop5 == 18 || subop5 == 20 || subop5 == 21 || subop5 == 23 ||
+         subop5 == 25 || subop5 == 28 || subop5 == 29 || subop5 == 30 || subop5 == 31;
+}
+
+bool IsSinglePrecisionArithmeticSubop(u32 subop5)
+{
+  return subop5 == 18 || subop5 == 20 || subop5 == 21 || subop5 == 25 || subop5 == 28 ||
+         subop5 == 29 || subop5 == 30 || subop5 == 31;
+}
+
+bool IsDoublePrecisionArithmeticSubop(u32 subop5)
+{
+  return subop5 == 18 || subop5 == 20 || subop5 == 21 || subop5 == 25 || subop5 == 28 ||
+         subop5 == 29 || subop5 == 30 || subop5 == 31;
+}
+
+void EmitSinglePrecisionArithmetic(std::vector<u8>& body, const WasmStateLayout& layout,
+                                   const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool divide = inst.SUBOP5 == 18;
+  const bool multiply_only = inst.SUBOP5 == 25;
+  const bool add_or_madd = inst.SUBOP5 == 21 || inst.SUBOP5 == 29 || inst.SUBOP5 == 31;
+  const bool negative = inst.SUBOP5 == 30 || inst.SUBOP5 == 31;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  if (divide)
+  {
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+    body.push_back(0xa3);
+  }
+  else
+  {
+    if (multiply_only || inst.SUBOP5 >= 28)
+    {
+      EmitStateLoadF64(body, PsOffset(layout, inst.FC, 0));
+      body.push_back(0xa2);
+    }
+    if (!multiply_only)
+    {
+      EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+      body.push_back(add_or_madd ? 0xa0 : 0xa1);
+    }
+  }
+  body.push_back(0xb6);
+  body.push_back(0xbb);
+  if (negative)
+    body.push_back(0x9a);
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 1));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitDoublePrecisionArithmetic(std::vector<u8>& body, const WasmStateLayout& layout,
+                                   const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool divide = inst.SUBOP5 == 18;
+  const bool multiply_only = inst.SUBOP5 == 25;
+  const bool add_or_madd = inst.SUBOP5 == 21 || inst.SUBOP5 == 29 || inst.SUBOP5 == 31;
+  const bool negative = inst.SUBOP5 == 30 || inst.SUBOP5 == 31;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  if (divide)
+  {
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+    body.push_back(0xa3);
+  }
+  else if (multiply_only || inst.SUBOP5 >= 28)
+  {
+    EmitStateLoadF64(body, PsOffset(layout, inst.FC, 0));
+    body.push_back(0xa2);
+    if (!multiply_only)
+    {
+      EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+      body.push_back(add_or_madd ? 0xa0 : 0xa1);
+    }
+  }
+  else
+  {
+    EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+    body.push_back(add_or_madd ? 0xa0 : 0xa1);
+  }
+  if (negative)
+    body.push_back(0x9a);
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void EmitFrsqrte(std::vector<u8>& body, const WasmStateLayout& layout,
+                 const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitFpuAvailableOrFallback(body, op, layout, downcount);
+
+  EmitF64ConstBits(body, std::bit_cast<u64>(1.0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  body.push_back(0x9f);  // f64.sqrt
+  body.push_back(0xa3);  // f64.div
+  EmitLocalSet(body, 6);
+
+  EmitStateStoreU32Prefix(body);
+  EmitLocalGet(body, 6);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+bool IsPairedQuantizedFloatMemoryCandidate(UGeckoInstruction inst)
+{
+  switch (inst.OPCD)
+  {
+  case 56:  // psq_l
+  case 60:  // psq_st
+    return true;
+  case 57:  // psq_lu
+  case 61:  // psq_stu
+    return inst.RA != 0;
+  default:
+    return false;
+  }
+}
+
+bool IsPpcWasmDirectHelperFpuInstruction(UGeckoInstruction inst)
+{
+  if (inst.Rc || inst.OPCD != 63)
+    return false;
+
+  switch (inst.SUBOP5)
+  {
+  case 18:  // fdivx
+  case 20:  // fsubx
+  case 21:  // faddx
+  case 23:  // fselx
+  case 25:  // fmulx
+  case 26:  // frsqrtex
+  case 28:  // fmsubx
+  case 29:  // fmaddx
+  case 30:  // fnmsubx
+  case 31:  // fnmaddx
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool IsPpcWasmSpecializedFpuInstruction(UGeckoInstruction inst)
+{
+  if (inst.OPCD == 31)
+  {
+    switch (inst.SUBOP10)
+    {
+    case 535:  // lfsx
+    case 567:  // lfsux
+    case 599:  // lfdx
+    case 631:  // lfdux
+    case 663:  // stfsx
+    case 695:  // stfsux
+    case 727:  // stfdx
+    case 759:  // stfdux
+    case 983:  // stfiwx
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  if (inst.OPCD == 63)
+  {
+    if (IsDoublePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc)
+      return true;
+
+    if (inst.SUBOP5 == 23 && !inst.Rc)  // fselx (SNES Touch)
+      return true;
+
+    if (inst.SUBOP10 == 15)  // fctiwzx
+      return true;
+
+    switch (inst.SUBOP10)
+    {
+    case 0:    // fcmpu
+    case 12:   // frspx
+    case 26:   // frsqrtex
+    case 32:   // fcmpo
+    case 40:   // fnegx
+    case 72:   // fmrx
+    case 136:  // fnabsx
+    case 264:  // fabsx
+      return !inst.Rc;
+    default:
+      return false;
+    }
+  }
+
+  switch (inst.OPCD)
+  {
+  case 56:  // psq_l
+  case 57:  // psq_lu
+  case 60:  // psq_st
+  case 61:  // psq_stu
+    return IsPairedQuantizedFloatMemoryCandidate(inst);
+  case 48:  // lfs
+  case 49:  // lfsu
+  case 50:  // lfd
+  case 51:  // lfdu
+  case 52:  // stfs
+  case 53:  // stfsu
+  case 54:  // stfd
+  case 55:  // stfdu
+    return true;
+  case 4:
+    return (IsPairedSingleMergeSubop(inst.SUBOP10) ||
+            IsPairedSingleArithmeticSubop(inst.SUBOP5) ||
+            IsPairedSingleUnarySubop(inst.SUBOP10)) &&
+           !inst.Rc;
+  case 59:
+    return IsSinglePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc;
+  default:
+    return false;
+  }
+}
+
+void EmitPsqFloatFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                   UGeckoInstruction inst, bool store)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+  EmitI32Const(body, 1u << 31);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  if (!store)
+  {
+    EmitI32Const(body, 16);
+    body.push_back(0x76);
+  }
+  EmitI32Const(body, 7);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitIsMem1AddressForSize(body, layout, inst.W ? sizeof(u32) : sizeof(u64));
+  body.push_back(0x71);
+}
+
+void EmitPsqTypeScaleFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                       UGeckoInstruction inst, bool store, u32 type, u32 scale,
+                                       u32 element_bytes, bool l1_cache)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+  EmitI32Const(body, 1u << 31);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  if (store)
+  {
+    EmitI32Const(body, 7);
+    body.push_back(0x71);
+  }
+  else
+  {
+    EmitI32Const(body, 16);
+    body.push_back(0x76);
+    EmitI32Const(body, 7);
+    body.push_back(0x71);
+  }
+  EmitI32Const(body, type);
+  body.push_back(0x46);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, store ? 8 : 24);
+  body.push_back(0x76);
+  EmitI32Const(body, 0x3f);
+  body.push_back(0x71);
+  EmitI32Const(body, scale);
+  body.push_back(0x46);
+  body.push_back(0x71);
+
+  if (l1_cache)
+    EmitIsL1CacheAddressForSize(body, layout, inst.W ? element_bytes : element_bytes * 2);
+  else
+    EmitIsMem1AddressForSize(body, layout, inst.W ? element_bytes : element_bytes * 2);
+  body.push_back(0x71);
+}
+
+void EmitPsqGatherPipeFloatStoreCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                          UGeckoInstruction inst)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+  EmitI32Const(body, 1u << 31);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 7);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0x0ffff000);
+  body.push_back(0x71);
+  EmitI32Const(body, GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS);
+  body.push_back(0x46);
+  body.push_back(0x71);
+}
+
+void EmitLoadPsqFloatLane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fd, u32 lane,
+                          u32 byte_offset)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU32BigEndianFromRamAddressOffset(body, layout, byte_offset);
+  body.push_back(0xbe);
+  body.push_back(0xbb);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, fd, lane));
+}
+
+void EmitStorePsqFloatLane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fs, u32 lane,
+                           u32 byte_offset)
+{
+  EmitStateLoadF64(body, PsOffset(layout, fs, lane));
+  body.push_back(0xb6);
+  body.push_back(0xbc);
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToRamAddressOffset(body, layout, byte_offset);
+}
+
+void EmitStorePsqFloatToGatherPipeLane(std::vector<u8>& body, const WasmStateLayout& layout,
+                                       u32 fs, u32 lane)
+{
+  EmitStateLoadF64(body, PsOffset(layout, fs, lane));
+  body.push_back(0xb6);
+  body.push_back(0xbc);
+  EmitLocalSet(body, 2);
+  EmitStoreU32BigEndianToGatherPipe(body, layout);
+}
+
+void EmitLoadPsqS16Scale0Lane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fd,
+                              u32 lane, u32 byte_offset)
+{
+  EmitStateStoreU32Prefix(body);
+  EmitLoadU16BigEndianFromRamAddressOffset(body, layout, byte_offset);
+  EmitSignExtendI16(body);
+  body.push_back(0xb7);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, fd, lane));
+}
+
+void EmitStorePsqU8Scale61Lane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fs,
+                               u32 lane, u32 byte_offset)
+{
+  EmitStateLoadF64(body, PsOffset(layout, fs, lane));
+  EmitF64ConstBits(body, UINT64_C(0x3fc0000000000000));
+  body.push_back(0xa2);
+  EmitF64ConstBits(body, 0);
+  body.push_back(0xa5);
+  EmitF64ConstBits(body, UINT64_C(0x406fe00000000000));
+  body.push_back(0xa4);
+  body.push_back(0xfc);
+  EmitU32Leb(body, 3);
+  EmitLocalSet(body, 2);
+  EmitStoreU8ToL1AddressOffset(body, layout, byte_offset);
+}
+
+void EmitLoadPsqS16Scale0(std::vector<u8>& body, const WasmStateLayout& layout,
+                          UGeckoInstruction inst)
+{
+  EmitLoadPsqS16Scale0Lane(body, layout, inst.RD, 0, 0);
+  if (inst.W)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitF64ConstBits(body, UINT64_C(0x3ff0000000000000));
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.RD, 1));
+  }
+  else
+  {
+    EmitLoadPsqS16Scale0Lane(body, layout, inst.RD, 1, sizeof(u16));
+  }
+}
+
+void EmitStorePsqU8Scale61(std::vector<u8>& body, const WasmStateLayout& layout,
+                           UGeckoInstruction inst)
+{
+  EmitStorePsqU8Scale61Lane(body, layout, inst.RS, 0, 0);
+  if (!inst.W)
+    EmitStorePsqU8Scale61Lane(body, layout, inst.RS, 1, sizeof(u8));
+}
+
+// SNES Touch: psq_l of the integer formats (u8, u16, s8, s16) at any scale, in main RAM. Need
+// for Speed: Underground 2 does over a million of these a minute from two loops and every one
+// went through the interpreter helper. Dequantizing is value * 2^-scale, where the 6-bit scale is
+// signed, so the factor is built exactly from its exponent field; a power-of-two scale is exact in
+// single precision too, so rounding the product to single matches the interpreter's float math.
+
+// FP on, big-endian, LSQE set, GQR load type 4..7, and the pair inside main RAM.
+void EmitPsqIntegerLoadFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                         UGeckoInstruction inst)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+  EmitI32Const(body, 1u << 31);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  body.push_back(0x71);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 16);
+  body.push_back(0x76);
+  EmitI32Const(body, 7);
+  body.push_back(0x71);
+  EmitI32Const(body, 4);
+  body.push_back(0x4f);  // i32.ge_u
+  body.push_back(0x71);
+
+  EmitIsMem1AddressForSize(body, layout, inst.W ? sizeof(u16) : 2 * sizeof(u16));
+  body.push_back(0x71);
+}
+
+// Pushes (GQR load type == type) as i32.
+void EmitPsqLoadTypeIs(std::vector<u8>& body, const WasmStateLayout& layout,
+                       UGeckoInstruction inst, u32 type)
+{
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 16);
+  body.push_back(0x76);
+  EmitI32Const(body, 7);
+  body.push_back(0x71);
+  EmitI32Const(body, type);
+  body.push_back(0x46);
+}
+
+// One lane: load the integer at byte_offset from the effective address (local 1), convert,
+// multiply by the factor in local 6, round to single, store to fd.
+void EmitLoadPsqIntegerLane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fd,
+                            u32 lane, u32 byte_offset, u32 type)
+{
+  EmitStateStoreU32Prefix(body);
+  switch (type)
+  {
+  case QUANTIZE_U8:
+  case QUANTIZE_S8:
+    EmitRamAddress(body, layout);
+    body.push_back(type == QUANTIZE_U8 ? 0x2d : 0x2c);  // i32.load8_u / i32.load8_s
+    body.push_back(0x00);
+    EmitU32Leb(body, byte_offset);
+    break;
+  default:
+    EmitLoadU16BigEndianFromRamAddressOffset(body, layout, byte_offset);
+    if (type == QUANTIZE_S16)
+      EmitSignExtendI16(body);
+    break;
+  }
+  body.push_back(0xb7);  // f64.convert_i32_s (unsigned values are small enough)
+  EmitLocalGet(body, 6);
+  body.push_back(0xa2);  // f64.mul
+  body.push_back(0xb6);
+  body.push_back(0xbb);
+  EmitStateStoreF64Suffix(body, PsOffset(layout, fd, lane));
+}
+
+void EmitLoadPsqIntegerType(std::vector<u8>& body, const WasmStateLayout& layout,
+                            UGeckoInstruction inst, u32 type)
+{
+  const u32 element_bytes = (type == QUANTIZE_U8 || type == QUANTIZE_S8) ? sizeof(u8) : sizeof(u16);
+  EmitLoadPsqIntegerLane(body, layout, inst.RD, 0, 0, type);
+  if (inst.W)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitF64ConstBits(body, UINT64_C(0x3ff0000000000000));
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.RD, 1));
+  }
+  else
+  {
+    EmitLoadPsqIntegerLane(body, layout, inst.RD, 1, element_bytes, type);
+  }
+}
+
+void EmitLoadPsqInteger(std::vector<u8>& body, const WasmStateLayout& layout,
+                        UGeckoInstruction inst)
+{
+  // local 6 = 2^-scale: exponent field 1023 - scale, scale sign-extended from 6 bits
+  EmitI32Const(body, 1023);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 24);
+  body.push_back(0x76);
+  EmitI32Const(body, 26);
+  body.push_back(0x74);
+  EmitI32Const(body, 26);
+  body.push_back(0x75);
+  body.push_back(0x6b);  // i32.sub
+  body.push_back(0xac);  // i64.extend_i32_s
+  body.push_back(0x42);  // i64.const 52
+  EmitU32Leb(body, 52);
+  body.push_back(0x86);  // i64.shl
+  body.push_back(0xbf);  // f64.reinterpret_i64
+  EmitLocalSet(body, 6);
+
+  const u32 types[] = {QUANTIZE_S16, QUANTIZE_S8, QUANTIZE_U16, QUANTIZE_U8};
+  for (u32 i = 0; i < 3; ++i)
+  {
+    EmitPsqLoadTypeIs(body, layout, inst, types[i]);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitLoadPsqIntegerType(body, layout, inst, types[i]);
+    body.push_back(0x05);
+  }
+  EmitLoadPsqIntegerType(body, layout, inst, types[3]);
+  for (u32 i = 0; i < 3; ++i)
+    body.push_back(0x0b);
+}
+
+void EmitPairedQuantizedFloatMemory(std::vector<u8>& body, const WasmStateLayout& layout,
+                                    const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool load = inst.OPCD == 56 || inst.OPCD == 57;
+  const bool update = inst.OPCD == 57 || inst.OPCD == 61;
+
+  EmitEffectiveAddress12(body, layout, inst, update);
+  EmitLocalSet(body, 1);
+
+  EmitPsqFloatFastPathCondition(body, layout, inst, !load);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  if (load)
+  {
+    EmitLoadPsqFloatLane(body, layout, inst.RD, 0, 0);
+    if (inst.W)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitF64ConstBits(body, UINT64_C(0x3ff0000000000000));
+      EmitStateStoreF64Suffix(body, PsOffset(layout, inst.RD, 1));
+    }
+    else
+    {
+      EmitLoadPsqFloatLane(body, layout, inst.RD, 1, sizeof(u32));
+    }
+  }
+  else
+  {
+    EmitStorePsqFloatLane(body, layout, inst.RS, 0, 0);
+    if (!inst.W)
+      EmitStorePsqFloatLane(body, layout, inst.RS, 1, sizeof(u32));
+  }
+
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  }
+
+  body.push_back(0x05);
+  if (!load)
+  {
+    EmitPsqGatherPipeFloatStoreCondition(body, layout, inst);
+    body.push_back(0x04);
+    body.push_back(0x40);
+
+    EmitStorePsqFloatToGatherPipeLane(body, layout, inst.RS, 0);
+    if (!inst.W)
+      EmitStorePsqFloatToGatherPipeLane(body, layout, inst.RS, 1);
+
+    if (update)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    }
+    EmitFastCheckGatherPipeIfFull(body, layout);
+
+    body.push_back(0x05);
+  }
+
+  if (load)
+  {
+    EmitPsqTypeScaleFastPathCondition(body, layout, inst, false, QUANTIZE_S16, 0, sizeof(u16),
+                                      false);
+  }
+  else
+  {
+    EmitPsqTypeScaleFastPathCondition(body, layout, inst, true, QUANTIZE_U8, 61, sizeof(u8),
+                                      true);
+  }
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  if (load)
+    EmitLoadPsqS16Scale0(body, layout, inst);
+  else
+    EmitStorePsqU8Scale61(body, layout, inst);
+
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  }
+
+  body.push_back(0x05);
+  if (load)
+  {
+    // SNES Touch: the other integer formats and scales, before the helper
+    EmitPsqIntegerLoadFastPathCondition(body, layout, inst);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitLoadPsqInteger(body, layout, inst);
+    if (update)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    }
+    body.push_back(0x05);
+  }
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+  if (load)
+    body.push_back(0x0b);
+  if (!load)
+    body.push_back(0x0b);
+  body.push_back(0x0b);
+}
+
+void EmitDcbz(std::vector<u8>& body, const WasmStateLayout& layout, const PPCAnalyst::CodeOp& op,
+              u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  EmitEffectiveAddressX(body, layout, inst);
+  EmitI32Const(body, ~31u);
+  body.push_back(0x71);
+  EmitLocalSet(body, 1);
+
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID0));
+  EmitI32Const(body, 1u << 14);
+  body.push_back(0x71);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  EmitStateLoadU8(body, layout.dcache_enabled_offset);
+  body.push_back(0x45);
+  body.push_back(0x71);
+  EmitIsMem1LineAddress(body, layout);
+  body.push_back(0x71);
+  EmitIsOutsideLowDcbzHackRange(body);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  for (u32 offset = 0; offset < 32; offset += sizeof(u32))
+    EmitStoreZeroU32ToRamAddress(body, layout, offset);
+
+  body.push_back(0x05);
+  EmitSystemCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+void LogWasmBlockReject(const char* reason, const GekkoOPInfo* opinfo, u32 inst_hex, u32 address,
+                        u32 instruction_count)
+{
+  if (s_wasm_block_reject_log_count++ >= 40)
+    return;
+
+  EM_ASM(
+      {
+        if (!Module.dolphinWebVerbosePpcJit)
+          return;
+        const reason = UTF8ToString($0);
+        const opname = $1 ? UTF8ToString($1) : "-";
+        const inst = ($2 >>> 0).toString(16).padStart(8, "0");
+        const address = ($3 >>> 0).toString(16).padStart(8, "0");
+        console.log(
+            `[ppc-wasm-jit] reject ${reason} op=${opname} inst=0x${inst} pc=0x${address} count=${$4}`);
+      },
+      reason, opinfo ? opinfo->opname : nullptr, inst_hex, address, instruction_count);
+}
+
+// ---- WASM-JIT category bisect toggles ----------------------------------------
+// Uncomment exactly ONE of these to force that category to interpreter fallback.
+// Then rebuild + run menu-progress-validate.mjs and compare distinctCanvasHashes.
+// The category whose disable raises hash count from ~4 to ~50+ is the broken one.
+//
+// #define DOLPHIN_WEB_DISABLE_FASTFP       // lfs/stfs/lfd/fmuls/fmadds/fmr/etc.
+// #define DOLPHIN_WEB_DISABLE_FASTMEM      // stw/stwu/lwz/lwzu/lwzx/stwx
+// #define DOLPHIN_WEB_DISABLE_FASTMEM8_16  // lb/stb/lh/sth and indexed variants
+// #define DOLPHIN_WEB_DISABLE_FASTINT      // mulli/subfic/addic/addic.
+// #define DOLPHIN_WEB_DISABLE_FASTSYS      // isync/sync
+// #define DOLPHIN_WEB_DISABLE_FASTBRANCH   // bcx/bx/bclrx/bcctrx  (uses EmitInterpretCall — keeps block alive)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER    // addi/addis/cmpli/cmpi/rlwinm/ori/or/add/sub/mul/etc.
+//
+// FASTOTHER sub-category bisect (uncomment ONE to isolate within fastother):
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_CMP    // cmpli/cmpi (OPCD 10/11) — CR comparisons
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_ADDI   // addi/addis (OPCD 14/15)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_ROT    // rlwimix/rlwinmx/rlwnmx (OPCD 20/21/23)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_BWISE  // ori/oris/xori/xoris/andi./andis. (OPCD 24-29)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_MULTI  // lmw/stmw (OPCD 46/47)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_OPCD19 // CR logical ops (OPCD 19 subops)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_OPCD31 // add/subf/neg/and/or/xor/sraw/mfspr/mtspr/etc. (OPCD 31)
+//
+// OPCD 31 sub-sub-category bisect (uncomment ONE after confirming OPCD31 is the culprit):
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31CMP  // cmp/cmpl (SUBOP10 0/32)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADD  // add/subf/neg/addc/adde/subfc/subfe/addze (266/40/104/10/138/8/136/202)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31MUL  // mullw/mulhw/mulhwu/divw/divwu (235/75/11/491/459)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SHIFT // slw/srw/sraw/srawi/cntlzw (24/536/792/824/26)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31LOG  // and/or/xor/nor/andc/nand/extsh/extsb (28/444/316/124/60/476/922/954)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SPR  // mfspr/mtspr/mfcr/mtcrf/mfmsr/mtmsr/dcbz (339/467/19/144/83/146/1014)
+//
+// OPCD31 ADD group individual instruction bisect (uncomment ONE):
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDX   // addx only (SUBOP10=266): RA + RB
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFX   // subfx only (SUBOP10=40): RB - RA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31NEGX    // negx only (SUBOP10=104): 0 - RA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDCX   // addcx only (SUBOP10=10): RA + RB, sets CA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDEX   // addex only (SUBOP10=138): RA + RB + CA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX  // subfcx only (SUBOP10=8): RB - RA, sets CA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFEX  // subfex only (SUBOP10=136): RB - RA - ~CA
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDZEX  // addzex only (SUBOP10=202): RA + CA
+//
+// Combined group tests (uncomment ONE):
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SIMPLE  // addx+subfx+negx only (no carry ops)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY    // addcx+addex+subfcx+subfex+addzex (all carry-chain)
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY_ADD  // addcx(10)+addex(138) only
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY_SUBF  // subfcx(8)+subfex(136)+addzex(202) only
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDCX_ALONE  // addcx(10) alone — most common carry op
+// Individual subfcx/subfex/addzex tests:
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_ALONE  // subfcx(8) alone
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFEX_ALONE  // subfex(136) alone
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDZEX_ALONE  // addzex(202) alone
+// Pairs:
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_SUBFEX  // subfcx(8)+subfex(136) pair
+// #define DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_ADDZEX  // subfcx(8)+addzex(202) pair
+// ---- end bisect toggles -------------------------------------------------------
+
+bool EmitWasmSupportedIntegerInstruction(std::vector<u8>& body, const WasmStateLayout& layout,
+                                         const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTFP
+  if ((op.opinfo->flags & FL_USE_FPU) != 0)
+    return false;
+#else
+  if ((op.opinfo->flags & FL_USE_FPU) != 0 && !IsPpcWasmSpecializedFpuInstruction(inst))
+  {
+    EmitFpCall(body, op, downcount);
+    return true;
+  }
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTBRANCH
+  if (inst.OPCD == 16 || inst.OPCD == 18 ||
+      (inst.OPCD == 19 && (inst.SUBOP10 == 16 || inst.SUBOP10 == 528 || inst.SUBOP10 == 50)))
+  {
+    // Emit interpret call to keep block alive but use interpreter for this branch.
+    // This isolates whether the WASM branch emitters themselves are wrong vs
+    // whether other instructions in the block are wrong (block rejection collateral).
+    EmitInterpretCall(body, op, downcount, op.canEndBlock);
+    return true;
+  }
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTINT
+  if (inst.OPCD == 7 || inst.OPCD == 8 || inst.OPCD == 12 || inst.OPCD == 13)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTSYS
+  if (inst.OPCD == 19 && inst.SUBOP10 == 150)
+    return false;
+  if (inst.OPCD == 31 && inst.SUBOP10 == 598)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTMEM
+  // stw(u)/lwz(u) immediate forms
+  if (inst.OPCD == 32 || inst.OPCD == 33 || inst.OPCD == 36 || inst.OPCD == 37)
+    return false;
+  // lwzx/lwzux/stwx/stwux indexed forms (OPCD 31)
+  if (inst.OPCD == 31 &&
+      (inst.SUBOP10 == 23 || inst.SUBOP10 == 55 || inst.SUBOP10 == 151 || inst.SUBOP10 == 183))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTMEM8_16
+  // lb/lbu/stb/stbu/lh/lhz/lha/sth immediate forms
+  if (inst.OPCD == 34 || inst.OPCD == 35 || inst.OPCD == 38 || inst.OPCD == 39 ||
+      inst.OPCD == 40 || inst.OPCD == 41 || inst.OPCD == 42 || inst.OPCD == 43 ||
+      inst.OPCD == 44 || inst.OPCD == 45)
+    return false;
+  // lbzx/lbzux/stbx/stbux/lhzx/lhzux/lhax/lhaux/sthx/sthux indexed forms (OPCD 31)
+  if (inst.OPCD == 31 &&
+      (inst.SUBOP10 == 87 || inst.SUBOP10 == 119 || inst.SUBOP10 == 215 || inst.SUBOP10 == 247 ||
+       inst.SUBOP10 == 279 || inst.SUBOP10 == 311 || inst.SUBOP10 == 343 || inst.SUBOP10 == 375 ||
+       inst.SUBOP10 == 407 || inst.SUBOP10 == 439))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER
+  // Integer arithmetic/logic/compare immediates not in other categories
+  if (inst.OPCD == 10 || inst.OPCD == 11 ||   // cmpli, cmpi
+      inst.OPCD == 14 || inst.OPCD == 15 ||   // addi, addis
+      inst.OPCD == 20 || inst.OPCD == 21 ||   // rlwimix, rlwinmx
+      inst.OPCD == 23 ||                       // rlwnmx
+      inst.OPCD == 24 || inst.OPCD == 25 ||   // ori, oris
+      inst.OPCD == 26 || inst.OPCD == 27 ||   // xori, xoris
+      inst.OPCD == 28 || inst.OPCD == 29 ||   // andi_rc, andis_rc
+      inst.OPCD == 46 || inst.OPCD == 47)     // lmw, stmw
+    return false;
+  // OPCD 19: CR logical ops and rfi
+  if (inst.OPCD == 19 && inst.SUBOP10 != 16 && inst.SUBOP10 != 528 && inst.SUBOP10 != 150 &&
+      inst.SUBOP10 != 50)
+    return false;
+  // OPCD 31: everything not in fastmem/fastmem8_16/fastsys
+  if (inst.OPCD == 31 &&
+      inst.SUBOP10 != 23 && inst.SUBOP10 != 55 && inst.SUBOP10 != 151 && inst.SUBOP10 != 183 &&
+      inst.SUBOP10 != 87 && inst.SUBOP10 != 119 && inst.SUBOP10 != 215 && inst.SUBOP10 != 247 &&
+      inst.SUBOP10 != 279 && inst.SUBOP10 != 311 && inst.SUBOP10 != 343 && inst.SUBOP10 != 375 &&
+      inst.SUBOP10 != 407 && inst.SUBOP10 != 439 && inst.SUBOP10 != 598)
+    return false;
+#endif
+
+// FASTOTHER sub-category bisect guards (only active when FASTOTHER is not defined)
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_CMP
+  if (inst.OPCD == 10 || inst.OPCD == 11)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_ADDI
+  if (inst.OPCD == 14 || inst.OPCD == 15)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_ROT
+  if (inst.OPCD == 20 || inst.OPCD == 21 || inst.OPCD == 23)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_BWISE
+  if (inst.OPCD == 24 || inst.OPCD == 25 || inst.OPCD == 26 || inst.OPCD == 27 ||
+      inst.OPCD == 28 || inst.OPCD == 29)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_MULTI
+  if (inst.OPCD == 46 || inst.OPCD == 47)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_OPCD19
+  if (inst.OPCD == 19 && inst.SUBOP10 != 16 && inst.SUBOP10 != 528 && inst.SUBOP10 != 150 &&
+      inst.SUBOP10 != 50)
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_OPCD31
+  // OPCD 31: everything not in fastmem/fastmem8_16/fastsys (add/subf/neg/and/or/xor/sraw/mfspr/mtspr/etc.)
+  if (inst.OPCD == 31 &&
+      inst.SUBOP10 != 23 && inst.SUBOP10 != 55 && inst.SUBOP10 != 151 && inst.SUBOP10 != 183 &&
+      inst.SUBOP10 != 87 && inst.SUBOP10 != 119 && inst.SUBOP10 != 215 && inst.SUBOP10 != 247 &&
+      inst.SUBOP10 != 279 && inst.SUBOP10 != 311 && inst.SUBOP10 != 343 && inst.SUBOP10 != 375 &&
+      inst.SUBOP10 != 407 && inst.SUBOP10 != 439 && inst.SUBOP10 != 598)
+    return false;
+#endif
+
+// OPCD 31 sub-sub-category guards
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31CMP
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 0 || inst.SUBOP10 == 32))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADD
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 266 || inst.SUBOP10 == 40 || inst.SUBOP10 == 104 ||
+      inst.SUBOP10 == 10 || inst.SUBOP10 == 138 || inst.SUBOP10 == 8 || inst.SUBOP10 == 136 ||
+      inst.SUBOP10 == 202))
+    return false;
+#endif
+
+// OPCD31 ADD group individual instruction guards
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 266)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 40)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31NEGX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 104)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDCX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 10)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDEX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 138)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 8)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFEX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 136)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDZEX
+  if (inst.OPCD == 31 && inst.SUBOP10 == 202)
+    return false;
+#endif
+
+// Combined group guards
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SIMPLE
+  // addx+subfx+negx (no carry)
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 266 || inst.SUBOP10 == 40 || inst.SUBOP10 == 104))
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY
+  // carry-chain: addcx+addex+subfcx+subfex+addzex
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 10 || inst.SUBOP10 == 138 || inst.SUBOP10 == 8 ||
+      inst.SUBOP10 == 136 || inst.SUBOP10 == 202))
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY_ADD
+  // addcx+addex (add carry chain)
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 10 || inst.SUBOP10 == 138))
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31CARRY_SUBF
+  // subfcx+subfex+addzex (subf carry chain)
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 8 || inst.SUBOP10 == 136 || inst.SUBOP10 == 202))
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDCX_ALONE
+  // addcx(10) alone — most common carry op
+  if (inst.OPCD == 31 && inst.SUBOP10 == 10)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_ALONE
+  if (inst.OPCD == 31 && inst.SUBOP10 == 8)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFEX_ALONE
+  if (inst.OPCD == 31 && inst.SUBOP10 == 136)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31ADDZEX_ALONE
+  if (inst.OPCD == 31 && inst.SUBOP10 == 202)
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_SUBFEX
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 8 || inst.SUBOP10 == 136))
+    return false;
+#endif
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SUBFCX_ADDZEX
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 8 || inst.SUBOP10 == 202))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31MUL
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 235 || inst.SUBOP10 == 75 || inst.SUBOP10 == 11 ||
+      inst.SUBOP10 == 491 || inst.SUBOP10 == 459))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SHIFT
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 24 || inst.SUBOP10 == 536 || inst.SUBOP10 == 792 ||
+      inst.SUBOP10 == 824 || inst.SUBOP10 == 26))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31LOG
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 28 || inst.SUBOP10 == 444 || inst.SUBOP10 == 316 ||
+      inst.SUBOP10 == 124 || inst.SUBOP10 == 60 || inst.SUBOP10 == 476 || inst.SUBOP10 == 922 ||
+      inst.SUBOP10 == 954))
+    return false;
+#endif
+
+#ifdef DOLPHIN_WEB_DISABLE_FASTOTHER_31SPR
+  if (inst.OPCD == 31 && (inst.SUBOP10 == 339 || inst.SUBOP10 == 467 || inst.SUBOP10 == 19 ||
+      inst.SUBOP10 == 144 || inst.SUBOP10 == 83 || inst.SUBOP10 == 146 || inst.SUBOP10 == 371 ||
+      inst.SUBOP10 == 1014))
+    return false;
+#endif
+
+  switch (inst.OPCD)
+  {
+  case 4:
+    if (IsPairedSingleMergeSubop(inst.SUBOP10) && !inst.Rc)
+    {
+      EmitPairedSingleMerge(body, layout, op, downcount);
+      return true;
+    }
+    if ((inst.SUBOP5 == 12 || inst.SUBOP5 == 13 || inst.SUBOP5 == 14 ||
+         inst.SUBOP5 == 15) &&
+        !inst.Rc)
+    {
+      EmitPairedSingleScalarMulAdd(body, layout, op, downcount);
+      return true;
+    }
+    if ((inst.SUBOP5 == 20 || inst.SUBOP5 == 21) && !inst.Rc)
+    {
+      EmitPairedSingleAddSub(body, layout, op, downcount);
+      return true;
+    }
+    if ((inst.SUBOP5 == 25 || inst.SUBOP5 == 28 || inst.SUBOP5 == 29 || inst.SUBOP5 == 30 ||
+         inst.SUBOP5 == 31) &&
+        !inst.Rc)
+    {
+      EmitPairedSingleMulAddSub(body, layout, op, downcount);
+      return true;
+    }
+    // SNES Touch additions
+    if ((inst.SUBOP5 == 10 || inst.SUBOP5 == 11) && !inst.Rc)
+    {
+      EmitPairedSingleSum(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP5 == 23 && !inst.Rc)
+    {
+      EmitFloatSelect(body, layout, op, downcount, 2);
+      return true;
+    }
+    if (inst.SUBOP5 == 18 && !inst.Rc)
+    {
+      EmitPairedSingleDiv(body, layout, op, downcount);
+      return true;
+    }
+    if ((inst.SUBOP10 == 40 || inst.SUBOP10 == 136 || inst.SUBOP10 == 264) && !inst.Rc)
+    {
+      EmitPairedSingleSign(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 72 && !inst.Rc)
+    {
+      EmitPairedSingleMove(body, layout, op, downcount);
+      return true;
+    }
+    return false;
+
+  case 48:  // lfs
+  case 49:  // lfsu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitFloatLoadStore(body, layout, op, downcount, true, inst.OPCD == 49);
+    return true;
+
+  case 50:  // lfd
+  case 51:  // lfdu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitLfdLoad(body, layout, op, downcount, inst.OPCD == 51);
+    return true;
+
+  case 52:  // stfs
+  case 53:  // stfsu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitFloatLoadStore(body, layout, op, downcount, false, inst.OPCD == 53);
+    return true;
+
+  case 54:  // stfd
+  case 55:  // stfdu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStfdStore(body, layout, op, downcount, inst.OPCD == 55);
+    return true;
+
+  case 56:  // psq_l
+  case 57:  // psq_lu
+  case 60:  // psq_st
+  case 61:  // psq_stu
+    if (IsPairedQuantizedFloatMemoryCandidate(inst))
+    {
+      EmitPairedQuantizedFloatMemory(body, layout, op, downcount);
+      return true;
+    }
+    return false;
+
+  case 59:
+    if (IsSinglePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc)
+    {
+      EmitSinglePrecisionArithmetic(body, layout, op, downcount);
+      return true;
+    }
+    return false;
+
+  case 10:  // cmpli
+    EmitCompareImmediate(body, layout, inst, false);
+    return true;
+
+  case 11:  // cmpi
+    EmitCompareImmediate(body, layout, inst, true);
+    return true;
+
+  case 12:  // addic
+    EmitAddic(body, layout, inst, false);
+    return true;
+
+  case 13:  // addic.
+    EmitAddic(body, layout, inst, true);
+    return true;
+
+  case 16:  // bcx
+    EmitConditionalBranch(body, layout, op);
+    return true;
+
+  case 18:  // bx
+    EmitUnconditionalBranch(body, layout, op, downcount);
+    return true;
+
+  case 19:  // bclrx/bcctrx
+    if (inst.SUBOP10 == 16)
+    {
+      EmitBranchToRegister(body, layout, op, SPR_LR, true);
+      return true;
+    }
+    if (inst.SUBOP10 == 528)
+    {
+      EmitBranchToRegister(body, layout, op, SPR_CTR, false);
+      return true;
+    }
+    if (inst.SUBOP10 == 50)
+    {
+      EmitRfi(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 150)
+      return true;
+    // SNES Touch: SUBOP10 0 is mcrf, not a CR logic op. Routed to EmitCrLogical it fell into the
+    // default case, which left both CR bits on the WebAssembly stack and wrote 0 to the wrong bit
+    // ("expected 1 elements on the stack for fallthru, found 3"). It now takes the fallback path.
+    switch (inst.SUBOP10)
+    {
+    case 33:
+    case 129:
+    case 193:
+    case 225:
+    case 257:
+    case 289:
+    case 417:
+    case 449:
+      EmitCrLogical(body, layout, inst);
+      return true;
+    }
+    return false;
+
+  case 7:  // mulli
+  {
+    const bool skip_rd = ShouldSkipGprStore(op, inst.RD);
+    if (!skip_rd) EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+    EmitI32Const(body, static_cast<u32>(static_cast<s32>(inst.SIMM_16)));
+    body.push_back(0x6c);
+    if (skip_rd) { body.push_back(0x1a); ++s_wasm_regalloc_dead_store_skip_count; }
+    else EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+  }
+
+  case 8:  // subfic
+  {
+    // See the note on addex (SUBOP10 138) further below: store the new XER.CA
+    // BEFORE writing GprOffset(RD), because RD may alias RA and the CA
+    // recomputation re-reads RA from memory.
+    //
+    // §28by regalloc-active variant: cache RA in local 7 once, reuse 3x
+    // (saves 2 state-struct memory loads per subfic). Safe because RA isn't
+    // mutated between the loads — the existing code orders the RD store
+    // AFTER all RA reads.
+    const bool regalloc_active = !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_REGALLOC);
+    const u32 immediate = static_cast<u32>(static_cast<s32>(inst.SIMM_16));
+    if (regalloc_active)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitLocalSet(body, 7);  // local 7 = RA value (single load, 3 uses)
+      ++s_wasm_regalloc_dead_store_skip_count;  // counts subfic-CSE events
+    }
+    EmitI32Const(body, immediate);
+    if (regalloc_active) EmitLocalGet(body, 7);
+    else EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+    body.push_back(0x6b);
+    EmitLocalSet(body, 3);
+
+    EmitLocalGet(body, 0);
+    if (regalloc_active) EmitLocalGet(body, 7);
+    else EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+    body.push_back(0x45);
+    EmitI32Const(body, 0);
+    if (regalloc_active) EmitLocalGet(body, 7);
+    else EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+    body.push_back(0x6b);
+    EmitI32Const(body, immediate);
+    body.push_back(0x6a);
+    EmitI32Const(body, immediate);
+    body.push_back(0x49);
+    body.push_back(0x72);
+    EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+    return true;
+  }
+
+  case 14:  // addi
+  {
+    const bool skip_rd = ShouldSkipGprStore(op, inst.RD);
+    if (!skip_rd) EmitStateStoreU32Prefix(body);
+    EmitGprOrZero(body, layout, inst.RA);
+    EmitI32Const(body, static_cast<u32>(static_cast<s32>(inst.SIMM_16)));
+    body.push_back(0x6a);
+    if (skip_rd) { body.push_back(0x1a); ++s_wasm_regalloc_dead_store_skip_count; }
+    else EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+  }
+
+  case 15:  // addis
+  {
+    const u32 immediate = static_cast<u32>(static_cast<s32>(inst.SIMM_16) * 65536);
+    const bool skip_rd = ShouldSkipGprStore(op, inst.RD);
+    if (!skip_rd) EmitStateStoreU32Prefix(body);
+    EmitGprOrZero(body, layout, inst.RA);
+    EmitI32Const(body, immediate);
+    body.push_back(0x6a);
+    if (skip_rd) { body.push_back(0x1a); ++s_wasm_regalloc_dead_store_skip_count; }
+    else EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+  }
+
+  case 21:  // rlwinmx
+  {
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.SH);
+    body.push_back(0x77);
+    EmitI32Const(body, MakeRotationMask(inst.MB, inst.ME));
+    body.push_back(0x71);
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    if (inst.Rc)
+      EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+  }
+
+  case 20:  // rlwimix
+  {
+    const u32 mask = MakeRotationMask(inst.MB, inst.ME);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+    EmitI32Const(body, ~mask);
+    body.push_back(0x71);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.SH);
+    body.push_back(0x77);
+    EmitI32Const(body, mask);
+    body.push_back(0x71);
+    body.push_back(0x72);
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    if (inst.Rc)
+      EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+  }
+
+  case 23:  // rlwnmx
+  {
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+    EmitI32Const(body, 0x1f);
+    body.push_back(0x71);
+    body.push_back(0x77);
+    EmitI32Const(body, MakeRotationMask(inst.MB, inst.ME));
+    body.push_back(0x71);
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    if (inst.Rc)
+      EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+  }
+
+  case 24:  // ori
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM);
+    body.push_back(0x72);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 25:  // oris
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM << 16);
+    body.push_back(0x72);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 26:  // xori
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM);
+    body.push_back(0x73);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 27:  // xoris
+    EmitStateStoreU32Prefix(body);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM << 16);
+    body.push_back(0x73);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 28:  // andi_rc
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM);
+    body.push_back(0x71);
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+
+  case 29:  // andis_rc
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitI32Const(body, inst.UIMM << 16);
+    body.push_back(0x71);
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+
+  case 32:  // lwz
+  {
+    const bool fmh = EmitFmhTryRangeCheck(body, layout, op);  // §28cz
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    if (fmh)
+      EmitFmhReadU32(body, layout);
+    else
+      EmitReadU32MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+  }
+
+  case 33:  // lwzu
+  {
+    const bool fmh = EmitFmhTryRangeCheck(body, layout, op);  // §28cz
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    if (fmh)
+      EmitFmhReadU32(body, layout);
+    else
+      EmitReadU32MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+  }
+
+  case 34:  // lbz
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadU8MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+
+  case 35:  // lbzu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadU8MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 36:  // stw
+  {
+    const bool fmh = EmitFmhTryRangeCheck(body, layout, op);  // §28cz
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    if (fmh)
+      EmitFmhWriteU32(body, layout);
+    else
+      EmitWriteU32MaybeDirect(body, layout);
+    return true;
+  }
+
+  case 37:  // stwu
+  {
+    // §28cz Range check uses pre-update gpr[RA]; emit it BEFORE the RA write.
+    const bool fmh = EmitFmhTryRangeCheck(body, layout, op);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    if (fmh)
+      EmitFmhWriteU32(body, layout);
+    else
+      EmitWriteU32MaybeDirect(body, layout);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+  }
+
+  case 38:  // stb
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    EmitWriteU8MaybeDirect(body, layout);
+    return true;
+
+  case 39:  // stbu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    EmitWriteU8MaybeDirect(body, layout);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 40:  // lhz
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadU16MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+
+  case 41:  // lhzu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadU16MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 42:  // lha
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadS16MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    return true;
+
+  case 43:  // lhau
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateStoreU32Prefix(body);
+    EmitReadS16MaybeDirect(body, layout);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 44:  // sth
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    EmitWriteU16MaybeDirect(body, layout);
+    return true;
+
+  case 45:  // sthu
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitLocalSet(body, 2);
+    EmitWriteU16MaybeDirect(body, layout);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    return true;
+
+  case 46:  // lmw
+  case 47:  // stmw
+    EmitSetEffectiveAddressLocal(body, layout, inst);
+    EmitMultipleWordMemory(body, layout, op, downcount, inst.OPCD == 46);
+    return true;
+
+  case 31:  // orx/mr without Rc
+    if (inst.SUBOP10 == 19)
+    {
+      EmitMfcr(body, layout, inst);
+      return true;
+    }
+    if (inst.SUBOP10 == 83)
+    {
+      EmitMfmsr(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 144)
+    {
+      EmitMtcrf(body, layout, inst);
+      return true;
+    }
+    if (inst.SUBOP10 == 146)
+    {
+      EmitMtmsr(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 371)
+    {
+      EmitSystemCall(body, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 1014)
+    {
+      EmitDcbz(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 339)
+    {
+      const u32 spr_index = DecodeMfsprIndex(inst);
+      if (spr_index != SPR_XER && !IsDirectSimpleMfspr(spr_index))
+      {
+        EmitSystemCall(body, op, downcount);
+        return true;
+      }
+      EmitStateStoreU32Prefix(body);
+      if (spr_index == SPR_XER)
+        EmitLoadXer(body, layout);
+      else
+        EmitStateLoadU32(body, SprOffset(layout, spr_index));
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      return true;
+    }
+    if (inst.SUBOP10 == 467)
+    {
+      const u32 spr_index = DecodeMtsprIndex(inst);
+      if (spr_index != SPR_XER && !IsDirectSimpleMtspr(spr_index))
+      {
+        EmitSystemCall(body, op, downcount);
+        return true;
+      }
+      EmitStateLoadU32(body, GprOffset(layout, inst.RD));
+      EmitLocalSet(body, 3);
+      if (spr_index == SPR_XER)
+      {
+        EmitStoreXerFromLocal(body, layout, 3);
+      }
+      else
+      {
+        EmitStateStoreU32Prefix(body);
+        EmitLocalGet(body, 3);
+        EmitStateStoreU32Suffix(body, SprOffset(layout, spr_index));
+      }
+      if (op.canEndBlock)
+        EmitStoreNpcConst(body, layout, op.address + 4);
+      return true;
+    }
+    if (inst.SUBOP10 == 54 || inst.SUBOP10 == 86 || inst.SUBOP10 == 470)
+    {
+      EmitSystemCall(body, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 246 || inst.SUBOP10 == 278)
+      return true;
+    if (inst.SUBOP10 == 279)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU16MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      return true;
+    }
+    if (inst.SUBOP10 == 311)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU16MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 343)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadS16MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      return true;
+    }
+    if (inst.SUBOP10 == 375)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadS16MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 407)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU16MaybeDirect(body, layout);
+      return true;
+    }
+    if (inst.SUBOP10 == 439)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU16MaybeDirect(body, layout);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 23)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU32MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      return true;
+    }
+    if (inst.SUBOP10 == 55)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU32MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 151)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU32MaybeDirect(body, layout);
+      return true;
+    }
+    if (inst.SUBOP10 == 183)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU32MaybeDirect(body, layout);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 535 || inst.SUBOP10 == 567)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitFloatLoadStore(body, layout, op, downcount, true, inst.SUBOP10 == 567);
+      return true;
+    }
+    if (inst.SUBOP10 == 599 || inst.SUBOP10 == 631)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitLfdLoad(body, layout, op, downcount, inst.SUBOP10 == 631);
+      return true;
+    }
+    if (inst.SUBOP10 == 663 || inst.SUBOP10 == 695)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitFloatLoadStore(body, layout, op, downcount, false, inst.SUBOP10 == 695);
+      return true;
+    }
+    if (inst.SUBOP10 == 727 || inst.SUBOP10 == 759)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStfdStore(body, layout, op, downcount, inst.SUBOP10 == 759);
+      return true;
+    }
+    if (inst.SUBOP10 == 983)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStfiwx(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 87)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU8MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      return true;
+    }
+    if (inst.SUBOP10 == 119)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateStoreU32Prefix(body);
+      EmitReadU8MaybeDirect(body, layout);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 215)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU8MaybeDirect(body, layout);
+      return true;
+    }
+    if (inst.SUBOP10 == 247)
+    {
+      EmitSetEffectiveAddressXLocal(body, layout, inst);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalSet(body, 2);
+      EmitWriteU8MaybeDirect(body, layout);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 1);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      return true;
+    }
+    if (inst.SUBOP10 == 0)
+    {
+      EmitCompareRegister(body, layout, inst, true);
+      return true;
+    }
+    if (inst.SUBOP10 == 32)
+    {
+      EmitCompareRegister(body, layout, inst, false);
+      return true;
+    }
+    if (inst.SUBOP10 == 10 && !inst.OE)
+    {
+      // See the note on addex (SUBOP10 138) below: store new XER.CA BEFORE
+      // storing the result to GprOffset(RD), because RD may alias RA or RB
+      // and the CA recomputation re-reads them from memory.
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6a);
+      EmitLocalSet(body, 3);
+
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      body.push_back(0x4b);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 138 && !inst.OE)
+    {
+      // Compute the result (RA + RB + CA) into local[3].
+      EmitStateLoadU8(body, layout.xer_ca_offset);
+      EmitLocalSet(body, 2);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6a);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6a);
+      EmitLocalSet(body, 3);
+
+      // Compute new XER.CA using ORIGINAL RA/RB from memory and store it FIRST.
+      // We must not store the result to GprOffset(RD) before this read pair —
+      // Melee emits `adde rD, rA, rB` with rD == rA (or rB) often enough that
+      // the rD store would otherwise clobber the value we re-read here, giving
+      // a carry computed from (result, RB) instead of (RA, RB). The corrupted
+      // CA then propagates through subsequent adde/subfe and breaks 3D
+      // rendering at ~frame 700 (post-JIT-engagement title screen).
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      body.push_back(0x4b);
+      EmitLocalGet(body, 2);
+      EmitLocalGet(body, 3);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6b);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x46);
+      body.push_back(0x71);
+      body.push_back(0x72);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+      // NOW write the result. Safe even if RD aliases RA or RB because the CA
+      // computation has already consumed the original values.
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 202 && !inst.OE)
+    {
+      EmitStateLoadU8(body, layout.xer_ca_offset);
+      EmitLocalSet(body, 2);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitLocalGet(body, 2);
+      body.push_back(0x6a);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 2);
+      EmitLocalGet(body, 3);
+      body.push_back(0x45);
+      body.push_back(0x71);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 8 && !inst.OE)
+    {
+      // See the note on addex (138) below.
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x6b);
+      EmitLocalSet(body, 3);
+
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x45);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x49);
+      body.push_back(0x45);
+      body.push_back(0x72);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 136 && !inst.OE)
+    {
+      // See the note on addex (138) below: store new XER.CA BEFORE storing
+      // result to GprOffset(RD), because RD may alias RA or RB and the CA
+      // recomputation re-reads them from memory.
+      EmitStateLoadU8(body, layout.xer_ca_offset);
+      EmitLocalSet(body, 2);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6a);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6a);
+      EmitLocalSet(body, 3);
+
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x4b);
+      EmitLocalGet(body, 2);
+      EmitLocalGet(body, 3);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6b);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x46);
+      body.push_back(0x71);
+      body.push_back(0x72);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 266 && !inst.OE)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6a);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 104 && !inst.OE)
+    {
+      EmitI32Const(body, 0);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x6b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 235 && !inst.OE)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6c);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 491 && !inst.OE)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitLocalSet(body, 3);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitLocalSet(body, 2);
+
+      EmitLocalGet(body, 2);
+      body.push_back(0x45);
+      EmitLocalGet(body, 3);
+      EmitI32Const(body, 0x80000000);
+      body.push_back(0x46);
+      EmitLocalGet(body, 2);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x46);
+      body.push_back(0x71);
+      body.push_back(0x72);
+      body.push_back(0x04);
+      body.push_back(0x7f);
+      EmitLocalGet(body, 3);
+      EmitI32Const(body, 0);
+      body.push_back(0x48);
+      body.push_back(0x04);
+      body.push_back(0x7f);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x05);
+      EmitI32Const(body, 0);
+      body.push_back(0x0b);
+      body.push_back(0x05);
+      EmitLocalGet(body, 3);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6d);
+      body.push_back(0x0b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 11 || inst.SUBOP10 == 75)
+    {
+      const bool is_signed = inst.SUBOP10 == 75;
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(is_signed ? 0xac : 0xad);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(is_signed ? 0xac : 0xad);
+      body.push_back(0x7e);
+      EmitI32Const(body, 32);
+      body.push_back(0xad);
+      body.push_back(is_signed ? 0x87 : 0x88);
+      body.push_back(0xa7);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 24)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x20);
+      body.push_back(0x71);
+      body.push_back(0x04);
+      body.push_back(0x7f);
+      EmitI32Const(body, 0);
+      body.push_back(0x05);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x1f);
+      body.push_back(0x71);
+      body.push_back(0x74);
+      body.push_back(0x0b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 40 && !inst.OE)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      body.push_back(0x6b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 459 && !inst.OE)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x45);
+      body.push_back(0x04);
+      body.push_back(0x7f);
+      EmitI32Const(body, 0);
+      body.push_back(0x05);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RA));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      body.push_back(0x6e);
+      body.push_back(0x0b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RD));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 792)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x20);
+      body.push_back(0x71);
+      body.push_back(0x04);
+      body.push_back(0x40);
+
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitI32Const(body, 0);
+      body.push_back(0x48);
+      EmitLocalSet(body, 2);
+      EmitI32Const(body, 0);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6b);
+      EmitLocalSet(body, 3);
+
+      body.push_back(0x05);
+
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x1f);
+      body.push_back(0x71);
+      EmitLocalSet(body, 2);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitLocalGet(body, 2);
+      body.push_back(0x75);
+      EmitLocalSet(body, 3);
+
+      EmitLocalGet(body, 2);
+      EmitI32Const(body, 0);
+      body.push_back(0x47);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitI32Const(body, 32);
+      EmitLocalGet(body, 2);
+      body.push_back(0x6b);
+      body.push_back(0x74);
+      EmitLocalGet(body, 3);
+      body.push_back(0x71);
+      EmitI32Const(body, 0);
+      body.push_back(0x47);
+      body.push_back(0x71);
+      EmitLocalSet(body, 2);
+      body.push_back(0x0b);
+
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 2);
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 824)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitI32Const(body, inst.SH);
+      body.push_back(0x75);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+
+      EmitStateStoreU32Prefix(body);
+      if (inst.SH == 0)
+      {
+        EmitI32Const(body, 0);
+      }
+      else
+      {
+        EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+        EmitI32Const(body, 32 - inst.SH);
+        body.push_back(0x74);
+        EmitLocalGet(body, 3);
+        body.push_back(0x71);
+        EmitI32Const(body, 0);
+        body.push_back(0x47);
+      }
+      EmitStateStoreU8Suffix(body, layout.xer_ca_offset);
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 26)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      body.push_back(0x67);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 536)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x20);
+      body.push_back(0x71);
+      body.push_back(0x04);
+      body.push_back(0x7f);
+      EmitI32Const(body, 0);
+      body.push_back(0x05);
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+      EmitI32Const(body, 0x1f);
+      body.push_back(0x71);
+      body.push_back(0x76);
+      body.push_back(0x0b);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 922 || inst.SUBOP10 == 954)
+    {
+      EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+      EmitI32Const(body, inst.SUBOP10 == 922 ? 16 : 24);
+      body.push_back(0x74);
+      EmitI32Const(body, inst.SUBOP10 == 922 ? 16 : 24);
+      body.push_back(0x75);
+      EmitLocalSet(body, 3);
+      EmitStateStoreU32Prefix(body);
+      EmitLocalGet(body, 3);
+      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+      if (inst.Rc)
+        EmitUpdateCr0FromLocal(body, layout, 3);
+      return true;
+    }
+    if (inst.SUBOP10 == 598)
+      return true;
+    switch (inst.SUBOP10)
+    {
+    case 28:
+    case 60:
+    case 124:
+    case 316:
+    case 444:
+    case 476:
+      break;
+    default:
+      return false;
+    }
+
+    EmitStateLoadU32(body, GprOffset(layout, inst.RS));
+    EmitStateLoadU32(body, GprOffset(layout, inst.RB));
+    switch (inst.SUBOP10)
+    {
+    case 28:  // andx
+      body.push_back(0x71);
+      break;
+    case 124:  // norx
+      body.push_back(0x72);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      break;
+    case 60:  // andcx
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      body.push_back(0x71);
+      break;
+    case 316:  // xorx
+      body.push_back(0x73);
+      break;
+    case 444:  // orx
+      body.push_back(0x72);
+      break;
+    case 476:  // nandx
+      body.push_back(0x71);
+      EmitI32Const(body, 0xffffffff);
+      body.push_back(0x73);
+      break;
+    default:
+      return false;
+    }
+    EmitLocalSet(body, 3);
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 3);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+    if (inst.Rc)
+      EmitUpdateCr0FromLocal(body, layout, 3);
+    return true;
+
+  case 63:
+    if (IsDoublePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc)
+    {
+      EmitDoublePrecisionArithmetic(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP5 == 23 && !inst.Rc)  // fselx (SNES Touch)
+    {
+      EmitFloatSelect(body, layout, op, downcount, 1);
+      return true;
+    }
+    if ((inst.SUBOP10 == 0 || inst.SUBOP10 == 32) && !inst.Rc)
+    {
+      EmitFloatCompare(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 15)
+    {
+      EmitFctiwzFast(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 12 && !inst.Rc)
+    {
+      EmitFrsp(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 26 && !inst.Rc)
+    {
+      EmitFrsqrte(body, layout, op, downcount);
+      return true;
+    }
+    if ((inst.SUBOP10 == 40 || inst.SUBOP10 == 136 || inst.SUBOP10 == 264) && !inst.Rc)
+    {
+      EmitUnaryFpBitExact(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP10 == 72 && !inst.Rc)
+    {
+      EmitFpuAvailableOrFallback(body, op, layout, downcount);
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadI64(body, PsOffset(layout, inst.FB, 0));
+      EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 0));
+      body.push_back(0x05);
+      EmitFpCall(body, op, downcount);
+      body.push_back(0x0b);
+      return true;
+    }
+    return false;
+
+  default:
+    return false;
+  }
+}
+
+bool IsPpcWasmDirectInstructionCandidate(const PPCAnalyst::CodeOp& op)
+{
+  if (op.skip)
+    return true;
+
+  const UGeckoInstruction inst = op.inst;
+
+  // Day-2 narrow-bisection knobs for the OPCD-31 carry-emitting ops. Either
+  // the umbrella WASMCARRY bit or the matching per-op bit denies admission to
+  // the direct-tier JIT, falling that instruction back to the interpreter.
+  // Two-stage so the host can confirm "carry family is the bug" first
+  // (cheap, one probe), then narrow to the exact opcode (per-op probes).
+  if (inst.OPCD == 31)
+  {
+    const u32 disable_mask = s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+    const bool umbrella_off = (disable_mask & DOLPHIN_WEB_DISABLE_WASMCARRY) != 0;
+    switch (inst.SUBOP10)
+    {
+    case 10:  // addcx
+      if (umbrella_off || (disable_mask & DOLPHIN_WEB_DISABLE_WASMADDC) != 0) return false;
+      break;
+    case 8:   // subfcx
+      if (umbrella_off || (disable_mask & DOLPHIN_WEB_DISABLE_WASMSUBFC) != 0) return false;
+      break;
+    case 138: // addex
+      if (umbrella_off || (disable_mask & DOLPHIN_WEB_DISABLE_WASMADDE) != 0) return false;
+      break;
+    case 136: // subfex
+      if (umbrella_off || (disable_mask & DOLPHIN_WEB_DISABLE_WASMSUBFE) != 0) return false;
+      break;
+    case 202: // addzex
+      if (umbrella_off || (disable_mask & DOLPHIN_WEB_DISABLE_WASMADDZE) != 0) return false;
+      break;
+    default:
+      break;
+    }
+  }
+
+  // Direct-tier JIT admits FPU only when this file has a specialized emitter or a known hot helper
+  // fallback. Letting every FPU helper through regresses Melee's title-screen blocks.
+  if ((op.opinfo->flags & FL_USE_FPU) != 0)
+    return IsPpcWasmSpecializedFpuInstruction(inst) || IsPpcWasmDirectHelperFpuInstruction(inst);
+
+  switch (inst.OPCD)
+  {
+  case 7:   // mulli
+  case 8:   // subfic
+  case 10:  // cmpli
+  case 11:  // cmpi
+  case 12:  // addic
+  case 13:  // addic.
+  case 14:  // addi
+  case 15:  // addis
+  case 16:  // bcx
+  case 18:  // bx
+  case 20:  // rlwimix
+  case 21:  // rlwinmx
+  case 23:  // rlwnmx
+  case 24:  // ori
+  case 25:  // oris
+  case 26:  // xori
+  case 27:  // xoris
+  case 28:  // andi_rc
+  case 29:  // andis_rc
+  case 32:  // lwz
+  case 33:  // lwzu
+  case 34:  // lbz
+  case 35:  // lbzu
+  case 36:  // stw
+  case 37:  // stwu
+  case 38:  // stb
+  case 39:  // stbu
+  case 40:  // lhz
+  case 41:  // lhzu
+  case 42:  // lha
+  case 43:  // lhau
+  case 44:  // sth
+  case 45:  // sthu
+  case 46:  // lmw
+  case 47:  // stmw
+    return true;
+
+  case 19:
+    if (inst.SUBOP10 == 16 || inst.SUBOP10 == 528 || inst.SUBOP10 == 150)
+      return true;
+    switch (inst.SUBOP10)
+    {
+    case 0:
+    case 33:
+    case 129:
+    case 193:
+    case 225:
+    case 257:
+    case 289:
+    case 417:
+    case 449:
+      return true;
+    default:
+      return false;
+    }
+
+  case 31:
+    switch (inst.SUBOP10)
+    {
+    case 0:    // cmp
+    case 11:   // mulhwux
+    case 23:   // lwzx
+    case 24:   // slwx
+    case 26:   // cntlzwx
+    case 28:   // andx
+    case 32:   // cmpl
+    case 55:   // lwzux
+    case 60:   // andcx
+    case 75:   // mulhwx
+    case 83:   // mfmsr
+    case 87:   // lbzx
+    case 119:  // lbzux
+    case 124:  // norx
+    case 146:  // mtmsr
+    case 151:  // stwx
+    case 183:  // stwux
+    case 215:  // stbx
+    case 246:  // dcbtst
+    case 247:  // stbux
+    case 278:  // dcbt
+    case 279:  // lhzx
+    case 311:  // lhzux
+    case 316:  // xorx
+    case 343:  // lhax
+    case 375:  // lhaux
+    case 407:  // sthx
+    case 439:  // sthux
+    case 444:  // orx
+    case 476:  // nandx
+    case 536:  // srwx
+    case 598:  // sync
+    case 792:  // srawx
+    case 824:  // srawix
+    case 922:  // extshx
+    case 954:  // extsbx
+      return true;
+    case 8:    // subfcx
+    case 10:   // addcx
+    case 40:   // subfx
+    case 104:  // negx
+    case 136:  // subfex
+    case 138:  // addex
+    case 202:  // addzex
+    case 235:  // mullwx
+    case 266:  // addx
+    case 459:  // divwux
+    case 491:  // divwx
+      return !inst.OE;
+    case 19:   // mfcr
+    case 144:  // mtcrf
+      return true;
+    case 339:  // mfspr
+    {
+      const u32 spr_index = DecodeMfsprIndex(inst);
+      return spr_index == SPR_XER || IsDirectSimpleMfspr(spr_index);
+    }
+    case 467:  // mtspr
+    {
+      const u32 spr_index = DecodeMtsprIndex(inst);
+      return spr_index == SPR_XER || IsDirectSimpleMtspr(spr_index);
+    }
+    default:
+      return false;
+    }
+
+  default:
+    return false;
+  }
+}
+
+// §28cy ZERO-RUNTIME-COST static measurement. Analyzes the SAME ops span that gets
+// compiled and tallies, into the file-scope s_fmh_* counters, how many guest memory
+// accesses COULD be covered by a per-block bounds-check hoist. Compile-time only:
+// emits NOTHING, changes NO codegen. See counter declarations (~CachedInterpreter.cpp:251).
+//
+// Classification (mirrors the emitter's real D-form vs X-form selection — see the
+// per-op handlers ~5834-5951 (D-form, EmitSetEffectiveAddressLocal → EmitEffectiveAddress,
+// EA = rA + sign_extend(SIMM16)) vs the OPCD-31 indexed handlers ~6037-6098 (X-form,
+// EmitSetEffectiveAddressXLocal → EmitEffectiveAddressX, EA = rA + rB)):
+//   - D-form int load/store: OPCD 32-45 with FL_LOADSTORE. (OPCD 46/47 lmw/stmw EXCLUDED.)
+//   - X-form (excluded, runtime-index base): OPCD 31 with FL_LOADSTORE.
+// A D-form op with rA==0 is an absolute address (EmitGprOrZero treats rA==0 as 0) and is
+// NOT statically boundable, so it terminates/skips any group.
+void AnalyzeFastmemHoistability(const std::span<const PPCAnalyst::CodeOp> ops)
+{
+  // Current open run of D-form accesses sharing the same base register.
+  bool have_group = false;
+  int group_base = 0;
+  u32 group_count = 0;
+
+  const auto flush_group = [&]() {
+    if (have_group && group_count >= 2 && group_base != 0)
+    {
+      s_fmh_hoistable_groups = SaturatingAddU64(s_fmh_hoistable_groups, 1);
+      s_fmh_covered_accesses = SaturatingAddU64(s_fmh_covered_accesses, group_count);
+      return true;  // this block had a hoistable group
+    }
+    return false;
+  };
+
+  bool block_had_hoist = false;
+  for (const PPCAnalyst::CodeOp& op : ops)
+  {
+    if (op.opinfo == nullptr)
+      continue;
+    const UGeckoInstruction inst = op.inst;
+    const u32 opcd = inst.OPCD;
+    const bool is_loadstore = (op.opinfo->flags & FL_LOADSTORE) != 0;
+
+    // X-form indexed int load/store: OPCD 31 + FL_LOADSTORE. Excluded (EA uses rB).
+    if (opcd == 31 && is_loadstore)
+    {
+      s_fmh_xform_accesses = SaturatingAddU64(s_fmh_xform_accesses, 1);
+      block_had_hoist |= flush_group();  // an excluded access breaks any open run
+      have_group = false;
+      continue;
+    }
+
+    // D-form int load/store: OPCD 32-45 + FL_LOADSTORE. (46/47 lmw/stmw excluded.)
+    const bool is_dform = (opcd >= 32 && opcd <= 45) && is_loadstore;
+    if (is_dform)
+    {
+      s_fmh_total_dform_accesses = SaturatingAddU64(s_fmh_total_dform_accesses, 1);
+      const int b = inst.RA;
+      // rA==0 is an absolute address — not statically boundable. Breaks the run.
+      if (b == 0)
+      {
+        block_had_hoist |= flush_group();
+        have_group = false;
+        continue;
+      }
+      // Extend the current run if it shares this base; otherwise start a new run.
+      if (have_group && b == group_base)
+      {
+        ++group_count;
+      }
+      else
+      {
+        block_had_hoist |= flush_group();
+        have_group = true;
+        group_base = b;
+        group_count = 1;
+      }
+      // A u-form access (lwzu/stwu/…) writes its own rA, so it terminates its own
+      // base run AFTER itself. The generic regsOut check below handles this since
+      // the base b is in this op's regsOut.
+      if (op.regsOut[b])
+      {
+        block_had_hoist |= flush_group();
+        have_group = false;
+      }
+      continue;
+    }
+
+    // Any other op (ALU, u-form on another reg, branch, etc.) terminates the open
+    // run the moment it writes the run's base register.
+    if (have_group && op.regsOut[group_base])
+    {
+      block_had_hoist |= flush_group();
+      have_group = false;
+    }
+  }
+  block_had_hoist |= flush_group();
+
+  if (block_had_hoist)
+    s_fmh_blocks_with_hoist = SaturatingAddU64(s_fmh_blocks_with_hoist, 1);
+}
+
+// §28cz Build the per-block hoist PLAN consumed by the emitter. Uses the SAME
+// grouping rules as AnalyzeFastmemHoistability (D-form OPCD 32-45 + FL_LOADSTORE;
+// X-form OPCD-31 excluded and breaks runs; lmw/stmw 46/47 excluded; rA==0 breaks;
+// consecutive same-base b; terminate when any op writes b incl. u-form's own rA;
+// hoistable iff >=2 covered accesses and b!=0). For each hoistable group it
+// records, per member CodeOp, that the op is covered; marks the FIRST member as
+// emit_check (the range-check site); and stashes the group's base b plus
+// omin/omax = min/max sign_extend(SIMM16) across the WHOLE group so the single
+// range check bounds every member. Only populates the map when the enable bit is
+// set. NOTE: omin/omax span all D-form members; the emitter applies the fast
+// path only to the 32-bit members (lwz/lwzu/stw/stwu) — a superset bound is still
+// sound. maxsize is fixed at 4 (32-bit scope) for the high-end check.
+void AnalyzeFastmemHoistPlan(const std::span<const PPCAnalyst::CodeOp> ops)
+{
+  s_fmh_plan.ops.clear();
+  s_fmh_plan.active = DolphinWebFeatureEnabled(DOLPHIN_WEB_ENABLE_FASTMEM_HOIST);
+  if (!s_fmh_plan.active)
+    return;
+
+  // Open run of D-form accesses sharing base group_base.
+  bool have_group = false;
+  int group_base = 0;
+  std::vector<const PPCAnalyst::CodeOp*> group_members;
+  s32 group_omin = 0;
+  s32 group_omax = 0;
+
+  const auto flush_group = [&]() {
+    if (have_group && group_members.size() >= 2 && group_base != 0)
+    {
+      bool first_covered = true;
+      for (const PPCAnalyst::CodeOp* mp : group_members)
+      {
+        WasmFastmemHoistPlan::OpInfo info;
+        info.covered = true;
+        // emit_check on the FIRST 32-bit member only (lwz/lwzu/stw/stwu) — the
+        // range check is only consumed by the fast path, which is 32-bit-scoped.
+        const u32 mopcd = mp->inst.OPCD;
+        const bool m_is_32 = (mopcd == 32 || mopcd == 33 || mopcd == 36 || mopcd == 37);
+        if (first_covered && m_is_32)
+        {
+          info.emit_check = true;
+          first_covered = false;
+        }
+        if (!m_is_32)
+        {
+          // §28cz Covered by a hoistable group but outside the 32-bit fast-path
+          // scope (8/16-bit member): it stays on the existing checked emitter.
+          s_fmh_fire_slow = SaturatingAddU64(s_fmh_fire_slow, 1);
+        }
+        info.base = group_base;
+        info.omin = group_omin;
+        info.omax = group_omax;
+        s_fmh_plan.ops[mp] = info;
+      }
+    }
+    group_members.clear();
+  };
+
+  for (const PPCAnalyst::CodeOp& op : ops)
+  {
+    if (op.opinfo == nullptr)
+      continue;
+    const UGeckoInstruction inst = op.inst;
+    const u32 opcd = inst.OPCD;
+    const bool is_loadstore = (op.opinfo->flags & FL_LOADSTORE) != 0;
+
+    if (opcd == 31 && is_loadstore)  // X-form excluded; breaks any open run
+    {
+      flush_group();
+      have_group = false;
+      continue;
+    }
+
+    const bool is_dform = (opcd >= 32 && opcd <= 45) && is_loadstore;
+    if (is_dform)
+    {
+      const int b = inst.RA;
+      const s32 off = static_cast<s32>(inst.SIMM_16);
+      if (b == 0)  // absolute address — not statically boundable
+      {
+        flush_group();
+        have_group = false;
+        continue;
+      }
+      if (have_group && b == group_base)
+      {
+        group_members.push_back(&op);
+        group_omin = std::min(group_omin, off);
+        group_omax = std::max(group_omax, off);
+      }
+      else
+      {
+        flush_group();
+        have_group = true;
+        group_base = b;
+        group_members.push_back(&op);
+        group_omin = off;
+        group_omax = off;
+      }
+      // u-form writes its own rA → terminates its base run AFTER itself.
+      if (op.regsOut[b])
+      {
+        flush_group();
+        have_group = false;
+      }
+      continue;
+    }
+
+    // Any other op terminates the run the moment it writes the run's base reg.
+    if (have_group && op.regsOut[group_base])
+    {
+      flush_group();
+      have_group = false;
+    }
+  }
+  flush_group();
+}
+
+std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::CodeOp> ops,
+                                                const WasmStateLayout& layout, u32 next_pc,
+                                                bool write_npc,
+                                                bool allow_interpret_fallback = false,
+                                                bool record_emit_failure = false,
+                                                bool last_op_ends_block = true,
+                                                u32 loop_pc = 0)
+{
+  AnalyzeFastmemHoistability(ops);
+  AnalyzeFastmemHoistPlan(ops);  // §28cz build the hoist plan (no-op unless enable bit set)
+  std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+
+  std::vector<u8> types;
+  types.push_back(0x04);
+  types.insert(types.end(), {0x60, 0x01, 0x7f, 0x01, 0x7f});
+  types.insert(types.end(), {0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f});
+  types.insert(types.end(), {0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x00});
+  types.insert(types.end(), {0x60, 0x05, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f});
+  EmitSection(bytes, 1, types);
+
+  std::vector<u8> imports;
+  imports.push_back(0x14);
+  EmitEnvFunctionImport(imports, "read_u32", 1);
+  EmitEnvFunctionImport(imports, "write_u32", 2);
+  EmitEnvFunctionImport(imports, "read_u8", 1);
+  EmitEnvFunctionImport(imports, "write_u8", 2);
+  EmitEnvFunctionImport(imports, "read_u16", 1);
+  EmitEnvFunctionImport(imports, "write_u16", 2);
+  EmitEnvFunctionImport(imports, "lfs", 3);
+  EmitEnvFunctionImport(imports, "stfs", 3);
+  EmitEnvFunctionImport(imports, "lfd", 3);
+  EmitEnvFunctionImport(imports, "fmr", 3);
+  EmitEnvFunctionImport(imports, "system", 3);
+  EmitEnvFunctionImport(imports, "fp", 3);
+  EmitEnvFunctionImport(imports, "fctiwz", 3);
+  EmitEnvFunctionImport(imports, "interpret", 3);
+  EmitEnvFunctionImport(imports, "fastcheck_gpfifo", 2);
+  EmitEnvFunctionImport(imports, "fast_os_interrupt_call", 3);
+  EmitEnvFunctionImport(imports, "fast_melee_input_status_call", 1);
+  EmitEnvFunctionImport(imports, "fast_melee_status_call", 3);
+  EmitEnvFunctionImport(imports, "fast_melee_service_poll_call", 3);
+  EmitName(imports, "env");
+  EmitName(imports, "memory");
+  imports.push_back(0x02);
+  imports.push_back(0x03);
+  // Imported shared memory's declared min/max MUST equal the SAB's min/max
+  // (1.5 GiB = 24576 pages — must match INITIAL_MEMORY in CMakeLists.txt).
+  // Was 16384 — that triggered LinkError("memory max 24576 > WASM binary
+  // max 16384") at JIT warmup, which is exactly when blocks first compile
+  // (~frame 700). Crash blocked wasmjit=1 in software backend; bumping the
+  // ceiling also unblocks block compilation for OGL+forcejit=1.
+#ifndef DOLPHIN_WASM_MEMORY_PAGES
+#error "DOLPHIN_WASM_MEMORY_PAGES must be supplied by the pinned CMake configuration"
+#endif
+  EmitU32Leb(imports, DOLPHIN_WASM_MEMORY_PAGES);
+  EmitU32Leb(imports, DOLPHIN_WASM_MEMORY_PAGES);
+  EmitSection(bytes, 2, imports);
+
+  EmitSection(bytes, 3, {0x01, 0x00});
+
+  std::vector<u8> exports;
+  exports.push_back(0x01);
+  EmitName(exports, "f");
+  exports.push_back(0x00);
+  EmitU32Leb(exports, WASM_IMPORT_FAST_MELEE_SERVICE_POLL_CALL_INDEX + 1);
+  EmitSection(bytes, 7, exports);
+
+  // §28by — `0x01, 0x7f` group adds a 4th i32 local at index 7 (regalloc
+  // scratch). §28cx C1 — appended `0x20, 0x7f` group adds 32 i32 locals at
+  // indices 8..39 (WASM_GPR_LOCAL_BASE + GPR index), one per PowerPC GPR.
+  // Leading local-group count bumped 4 → 5. WASM locals are zero-initialised;
+  // the prologue below overwrites the referenced ones with their live values.
+  // §28cz — when the fastmem-hoist plan is active for this block, append a 6th
+  // group `0x01, 0x7f` (one i32 at index WASM_FMH_FLAG_LOCAL=40, the per-group
+  // range-check flag) and bump the leading group count 5 → 6. When the plan is
+  // inactive the locals section is byte-identical to today (no extra local).
+  std::vector<u8> body = s_fmh_plan.active
+      ? std::vector<u8>{0x06, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f, 0x01, 0x7f}
+      : std::vector<u8>{0x05, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f};
+
+  // §28cx C1: set up the GPR register cache for this block, then eagerly load
+  // every GPR the block reads or writes into its local. Eager (not lazy) load
+  // guarantees a GPR is resident on every control-flow path before any
+  // conditional WASM block, so reads/stores inside an `if` are always valid.
+  s_gpr_rc.active = !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_REGALLOC);
+  s_gpr_rc.gpr_base = layout.gpr_offset;
+  for (u32 i = 0; i < 32; ++i)
+  {
+    s_gpr_rc.present[i] = false;
+    s_gpr_rc.dirty[i] = false;
+  }
+  if (s_gpr_rc.active)
+  {
+    BitSet32 used_gprs;
+    for (const PPCAnalyst::CodeOp& op : ops)
+      used_gprs |= op.regsIn | op.regsOut;
+    for (int bit : used_gprs)
+    {
+      if (bit < 0 || bit >= 32)
+        continue;
+      s_gpr_rc.present[bit] = true;
+      EmitLocalGet(body, 0);
+      body.push_back(0x28);  // i32.load
+      body.push_back(0x02);  // align=2
+      EmitU32Leb(body, layout.gpr_offset + static_cast<u32>(bit) * static_cast<u32>(sizeof(u32)));
+      EmitLocalSet(body, WASM_GPR_LOCAL_BASE + static_cast<u32>(bit));
+    }
+  }
+
+  const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
+  const bool loops = last_op != ops.rend() && last_op_ends_block && !s_fmh_plan.active &&
+                     s_wasm_downcount_offset != 0 && IsWasmLoopBackBranch(*last_op, loop_pc);
+  if (loops)
+  {
+    // Every GPR the block writes may be newer in its local than in memory on a later iteration,
+    // so every exit writes them back, whatever the order the block writes them in.
+    for (const PPCAnalyst::CodeOp& op : ops)
+    {
+      for (int bit : op.regsOut)
+      {
+        if (bit >= 0 && bit < 32 && s_gpr_rc.present[bit])
+          s_gpr_rc.dirty[bit] = true;
+      }
+    }
+    body.push_back(0x03);  // loop
+    body.push_back(0x40);
+  }
+  u32 downcount = 0;
+  for (const PPCAnalyst::CodeOp& op : ops)
+  {
+    downcount += op.opinfo->num_cycles;
+    if (op.skip)
+      continue;
+
+    if (loops && &op == &*last_op)
+    {
+      EmitWasmLoopBackBranch(body, layout, op, downcount, loop_pc);
+      continue;
+    }
+
+    if (IsWasmSideExitBranch(op) && (&op != &*last_op || !last_op_ends_block))
+    {
+      EmitConditionalSideExit(body, layout, op, downcount);
+      continue;
+    }
+
+    if (!EmitWasmSupportedIntegerInstruction(body, layout, op, downcount))
+    {
+      if (!allow_interpret_fallback)
+      {
+        if (record_emit_failure)
+        {
+          const u32 key = (op.inst.OPCD << 10) | op.inst.SUBOP10;
+          ++s_wasm_block_emit_fail_count;
+          ++s_wasm_emit_fail_key_counts[key];
+          if (s_wasm_emit_fail_sample_pcs[key] == 0)
+            s_wasm_emit_fail_sample_pcs[key] = op.address;
+        }
+        s_gpr_rc.active = false;  // §28cx C1: don't leak cache state on abort
+        s_fmh_plan.active = false;  // §28cz: don't leak hoist plan on abort
+        s_fmh_plan.ops.clear();
+        return {};
+      }
+      EmitInterpretCall(body, op, downcount, op.canEndBlock);
+    }
+  }
+
+  if (loops)
+    body.push_back(0x0b);
+
+  // §28cx C1: commit all dirty GPR locals to guest memory before the block's
+  // single unconditional exit. The halt early-returns inside the call emitters
+  // already flushed before their call, so every exit path is covered.
+  EmitRegCacheFlushDirty(body);
+
+  if (write_npc)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitI32Const(body, next_pc);
+    EmitStateStoreU32Suffix(body, layout.npc_offset);
+  }
+  EmitI32Const(body, 0);
+  body.push_back(0x0b);
+
+  std::vector<u8> code;
+  code.push_back(0x01);
+  EmitU32Leb(code, static_cast<u32>(body.size()));
+  code.insert(code.end(), body.begin(), body.end());
+  EmitSection(bytes, 10, code);
+
+  s_gpr_rc.active = false;  // §28cx C1: cache state is per-block; clear on exit
+  s_fmh_plan.active = false;  // §28cz: hoist plan is per-block; clear on exit
+  s_fmh_plan.ops.clear();
+  return bytes;
+}
+
+int CompileWasmCachedInterpreterBlockForTest(const std::vector<u8>& bytes)
+{
+  const auto read_u32_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU32));
+  const auto write_u32_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU32));
+  const auto read_u8_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU8));
+  const auto write_u8_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU8));
+  const auto read_u16_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU16));
+  const auto write_u16_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU16));
+  const auto lfs_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterLfs));
+  const auto stfs_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterStfs));
+  const auto lfd_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterLfd));
+  const auto fmr_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFmr));
+  const auto system_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterSystem));
+  const auto fp_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFpOp));
+  const auto fctiwz_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFctiwz));
+  const auto interpret_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterInterpret));
+  const auto fastcheck_gpfifo_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastCheckGatherPipe));
+  const auto fast_os_interrupt_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastOsInterruptCall));
+  const auto fast_melee_input_status_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeInputStatusCall));
+  const auto fast_melee_status_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeStatusCall));
+  const auto fast_melee_service_poll_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeServicePollCall));
+  const auto cache_key = DolphinWeb_MakeWasmBlockCacheKey(bytes);
+  return DolphinWeb_CachedInterpreterCompileWasmBlock(
+      bytes.data(), static_cast<int>(bytes.size()), cache_key.data(), read_u32_index,
+      write_u32_index, read_u8_index, write_u8_index, read_u16_index, write_u16_index, lfs_index,
+      stfs_index, lfd_index, fmr_index, system_index, fp_index, fctiwz_index, interpret_index,
+      fastcheck_gpfifo_index, fast_os_interrupt_call_index, fast_melee_input_status_call_index,
+      fast_melee_status_call_index, fast_melee_service_poll_call_index);
+}
+
+WasmStateLayout MakeWasmBlockTestLayout(PowerPC::PowerPCState& state, u8* ram, u32 ram_size)
+{
+  const auto state_base = reinterpret_cast<std::uintptr_t>(&state);
+  return {
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.npc) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(state.gpr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(state.ps) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(state.cr.fields) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(state.spr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.msr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.fpscr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.feature_flags) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.pagetable_update_pending) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.xer_ca) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.xer_so_ov) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.xer_stringctrl) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.m_enable_dcache) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.gather_pipe_ptr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&state.gather_pipe_base_ptr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(ram)),
+      ram_size,
+      0,
+      0,
+  };
+}
+
+PPCAnalyst::CodeOp MakeWasmBlockTestOp(UGeckoInstruction inst, u32 address)
+{
+  PPCAnalyst::CodeOp op{};
+  op.inst = inst;
+  op.address = address;
+  op.opinfo = PPCTables::GetOpInfo(op.inst, op.address);
+  return op;
+}
+
+UGeckoInstruction EncodeDFormForWasmBlockTest(u32 opcd, u32 rd_or_rs, u32 ra, u16 immediate)
+{
+  return UGeckoInstruction{(opcd << 26) | (rd_or_rs << 21) | (ra << 16) | immediate};
+}
+
+UGeckoInstruction EncodeAFormForWasmBlockTest(u32 opcd, u32 fd, u32 fa, u32 fb, u32 fc, u32 xo)
+{
+  return UGeckoInstruction{(opcd << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (fc << 6) |
+                           (xo << 1)};
+}
+
+UGeckoInstruction EncodeFloatCompareForWasmBlockTest(u32 crfd, u32 fa, u32 fb, u32 xo)
+{
+  return UGeckoInstruction{(63u << 26) | (crfd << 23) | (fa << 16) | (fb << 11) | (xo << 1)};
+}
+
+bool ReadRamU32BEForWasmBlockTest(const std::array<u8, 256>& ram, u32 offset, u32 expected)
+{
+  return (u32{ram[offset]} << 24 | u32{ram[offset + 1]} << 16 | u32{ram[offset + 2]} << 8 |
+          u32{ram[offset + 3]}) == expected;
+}
+
+bool NearlyEqualForWasmBlockTest(double lhs, double rhs)
+{
+  return std::abs(lhs - rhs) <= 0.000001;
+}
+}  // namespace
+#endif
+
+// Per-helper disable bitmask setter. Wired from the JS host via
+// `?disable=...` URL flag → worker bindApi → Module._SetCachedInterpreterDisableMask.
+// Returns the previous mask so the caller can diff/restore. Safe to call from
+// the main JS thread while the CPU thread is compiling blocks (mask is atomic).
+extern "C" std::uint32_t DolphinWeb_SetCachedInterpreterDisableMask(std::uint32_t mask)
+{
+  return s_dolphin_web_disable_mask.exchange(mask, std::memory_order_relaxed);
+}
+
+extern "C" std::uint32_t DolphinWeb_GetCachedInterpreterDisableMask()
+{
+  return s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+}
+
+CachedInterpreter::CachedInterpreter(Core::System& system) : JitBase(system), m_block_cache(*this)
+{
+}
+
+CachedInterpreter::~CachedInterpreter() = default;
+
+void CachedInterpreter::Init()
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  s_static_link_stats.Init();
+#endif
+#line 7757
+  RefreshConfig();
+
+  AllocCodeSpace(CODE_SIZE);
+  ResetFreeMemoryRanges();
+
+  jo.enableBlocklink = false;
+
+  m_block_cache.Init();
+
+  code_block.m_stats = &js.st;
+  code_block.m_gpa = &js.gpa;
+  code_block.m_fpa = &js.fpa;
+}
+
+void CachedInterpreter::Shutdown()
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  m_block_cache.AdvanceStaticLinkEpoch();
+#endif
+#line 7773
+#ifdef __EMSCRIPTEN__
+  s_deferred_wasm_queues.erase(this);
+  if (s_wasm_policy_owner == this)
+    s_wasm_policy_owner = nullptr;
+#endif
+  m_block_cache.Shutdown();
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  s_static_link_stats.Publish();
+#endif
+#line 7779
+}
+
+void CachedInterpreter::ExecuteOneBlock([[maybe_unused]] bool allow_redispatch)
+{
+  const u8* normal_entry = m_block_cache.Dispatch();
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  s_static_link_stats.InitialDispatch(normal_entry == nullptr);
+#endif
+#line 7784
+  if (!normal_entry)
+  {
+    Jit(m_ppc_state.pc);
+    return;
+  }
+
+  auto& ppc_state = m_ppc_state;
+#ifdef __EMSCRIPTEN__
+  // §28bt: gated in-place block re-dispatch. When a block ends with timing
+  // budget left and the CPU still Running, fetch + run the next block here
+  // instead of unwinding to Run() and re-entering ExecuteOneBlock — removes
+  // one non-inlined call/return + loop test per PPC block (~14M/s in warm
+  // battle). Every per-block writeback (pc=npc, downcount-=N, perfmon, halt)
+  // already happened in RunWasmBlock / the end-block callbacks before we read
+  // downcount here, so chaining is state-equivalent to the Run() do-while.
+  // Disabled in single-step and while the per-block profiler is sampling so
+  // RecordPpcBlockProfile stays one-block-per-call. Runtime-killable via the
+  // DOLPHIN_WEB_DISABLE_BLOCK_REDISPATCH mask bit.
+  const CPU::State* const redispatch_state_ptr = m_system.GetCPU().GetStatePtr();
+  const bool redispatch_enabled =
+      allow_redispatch && !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_BLOCK_REDISPATCH) &&
+      !s_ppc_block_profile_enabled;
+#endif
+#ifdef __EMSCRIPTEN__
+  bool profile_block = false;
+  u32 profile_pc = 0;
+  std::chrono::steady_clock::time_point profile_start{};
+  if (s_ppc_block_profile_enabled)
+  {
+    const u32 sequence = ++s_ppc_profile_total_blocks;
+    profile_block = (sequence & PPC_PROFILE_SAMPLE_MASK) == 0;
+    if (profile_block)
+    {
+      profile_pc = ppc_state.pc;
+      profile_start = std::chrono::steady_clock::now();
+    }
+  }
+#endif
+#ifdef __EMSCRIPTEN__
+  DOLPHIN_WEB_HOT_COUNT(++s_wasm_redispatch_entry_count);
+#endif
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const bool static_links_enabled = StaticExitLinksEnabled();
+  StaticExitLinks::Scope static_link_scope(
+      &m_block_cache, &ppc_state, static_links_enabled);
+#endif
+#line 7825
+  for (;;)
+  {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    static_link_scope.BeginBlock(m_block_cache.StaticLinkEpoch(),
+                                static_cast<u32>(ppc_state.feature_flags));
+#endif
+#line 7827
+  while (true)
+  {
+    const auto callback = *reinterpret_cast<const AnyCallback*>(normal_entry);
+    const u8* payload = normal_entry + sizeof(callback);
+    // Direct dispatch to the most commonly used callbacks for better performance
+    if (callback == AnyCallbackCast(Interpret<false>)) [[likely]]
+    {
+      Interpret<false>(ppc_state, *reinterpret_cast<const InterpretOperands*>(payload));
+      normal_entry = payload + sizeof(InterpretOperands);
+    }
+#if DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH
+    else if (callback == AnyCallbackCast(RunWasmBlock))
+    {
+      if (const auto distance =
+              RunWasmBlock(ppc_state, *reinterpret_cast<const WasmBlockOperands*>(payload)))
+        normal_entry += distance;
+      else
+        break;
+    }
+#endif
+#if DOLPHIN_WEB_HOT_DISPATCH_ORDER
+    // DOLPHIN_WEB_HOT_DISPATCH_ORDER_BEGIN
+    else if (callback == AnyCallbackCast(FastInteger))
+    {
+      if (FastInteger(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload)))
+        normal_entry = payload + sizeof(FastInstructionOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastBranch))
+    {
+      FastBranch(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastFloat))
+    {
+      if (FastFloat(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload)))
+        normal_entry = payload + sizeof(FastInstructionOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastBranchBdnz))
+    {
+      FastBranchBdnz(ppc_state, *reinterpret_cast<const FastBranchBdnzOperands*>(payload));
+      normal_entry = payload + sizeof(FastBranchBdnzOperands);
+    }
+    else if (callback == AnyCallbackCast(Interpret<true>))
+    {
+      Interpret<true>(ppc_state, *reinterpret_cast<const InterpretOperands*>(payload));
+      normal_entry = payload + sizeof(InterpretOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMfmsr))
+    {
+      FastMfmsr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMtmsr))
+    {
+      FastMtmsr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMfspr))
+    {
+      FastMfspr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMtspr))
+    {
+      FastMtspr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastSystemNoop))
+    {
+      FastSystemNoop(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    // DOLPHIN_WEB_HOT_DISPATCH_ORDER_END
+#else
+    // DOLPHIN_WEB_LEGACY_DISPATCH_ORDER_BEGIN
+    else if (callback == AnyCallbackCast(Interpret<true>))
+    {
+      Interpret<true>(ppc_state, *reinterpret_cast<const InterpretOperands*>(payload));
+      normal_entry = payload + sizeof(InterpretOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMfmsr))
+    {
+      FastMfmsr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMtmsr))
+    {
+      FastMtmsr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMfspr))
+    {
+      FastMfspr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMtspr))
+    {
+      FastMtspr(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastSystemNoop))
+    {
+      FastSystemNoop(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastInteger))
+    {
+      if (FastInteger(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload)))
+        normal_entry = payload + sizeof(FastInstructionOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastBranch))
+    {
+      FastBranch(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastBranchBdnz))
+    {
+      FastBranchBdnz(ppc_state, *reinterpret_cast<const FastBranchBdnzOperands*>(payload));
+      normal_entry = payload + sizeof(FastBranchBdnzOperands);
+    }
+    else if (callback == AnyCallbackCast(FastFloat))
+    {
+      if (FastFloat(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload)))
+        normal_entry = payload + sizeof(FastInstructionOperands);
+      else
+        break;
+    }
+    // DOLPHIN_WEB_LEGACY_DISPATCH_ORDER_END
+#endif
+    else if (callback == AnyCallbackCast(FastMeleeIdlePollLoop))
+    {
+      if (FastMeleeIdlePollLoop(ppc_state,
+                                *reinterpret_cast<const MeleeIdlePollLoopOperands*>(payload)))
+        normal_entry = payload + sizeof(MeleeIdlePollLoopOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastMeleeTitleLoop))
+    {
+      if (FastMeleeTitleLoop(ppc_state,
+                             *reinterpret_cast<const MeleeTitleLoopOperands*>(payload)))
+        normal_entry = payload + sizeof(MeleeTitleLoopOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastOsInterruptFunction))
+    {
+      if (FastOsInterruptFunction(ppc_state,
+                                  *reinterpret_cast<const OsInterruptFunctionOperands*>(payload)))
+        normal_entry = payload + sizeof(OsInterruptFunctionOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastOsInterruptCallBranch))
+    {
+      if (FastOsInterruptCallBranch(
+              ppc_state, *reinterpret_cast<const OsInterruptFunctionOperands*>(payload)))
+        normal_entry = payload + sizeof(OsInterruptFunctionOperands);
+      else
+        break;
+    }
+    else if (callback == AnyCallbackCast(FastMeleeInputStatusCallBranch))
+    {
+      FastMeleeInputStatusCallBranch(
+          ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMeleeStatusFunctionCallBranch))
+    {
+      FastMeleeStatusFunctionCallBranch(
+          ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMeleeSiPollNoEventCallBranch))
+    {
+      FastMeleeSiPollNoEventCallBranch(
+          ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastMeleeInputPollNoChangeCallBranch))
+    {
+      FastMeleeInputPollNoChangeCallBranch(
+          ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastDcbx))
+    {
+      FastDcbx(ppc_state, *reinterpret_cast<const FastInstructionOperands*>(payload));
+      normal_entry = payload + sizeof(FastInstructionOperands);
+    }
+    else if (callback == AnyCallbackCast(FastDcbxLoop))
+    {
+      FastDcbxLoop(ppc_state, *reinterpret_cast<const DcbxLoopOperands*>(payload));
+      normal_entry = payload + sizeof(DcbxLoopOperands);
+    }
+    else
+    {
+      if (const auto distance = callback(ppc_state, payload))
+        normal_entry += distance;
+      else
+        break;
+    }
+  }
+#ifdef __EMSCRIPTEN__
+    if (redispatch_enabled && m_ppc_state.downcount > 0 &&
+        *redispatch_state_ptr == CPU::State::Running)
+    {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+      const auto static_link_result = static_link_scope.Resolve(
+          &m_block_cache, &ppc_state, m_block_cache.StaticLinkEpoch(),
+          static_cast<u32>(ppc_state.feature_flags), ppc_state.pc);
+      const u8* const next =
+          static_link_result.entry ? static_link_result.entry : m_block_cache.Dispatch();
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+      s_static_link_stats.Record(static_link_result.decision);
+      if (!static_link_result.entry)
+        s_static_link_stats.FallbackDispatch(next == nullptr);
+#endif
+#else
+#line 8054
+      const u8* const next = m_block_cache.Dispatch();
+#endif
+#line 8055
+      if (!next)
+      {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+        static_link_scope.Close();
+#endif
+#line 8057
+        Jit(m_ppc_state.pc);
+        return;
+      }
+      DOLPHIN_WEB_HOT_COUNT(++s_wasm_redispatch_iter_count);
+      normal_entry = next;
+      continue;
+    }
+#endif
+    break;
+  }
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  static_link_scope.Close();
+#endif
+#line 8067
+#ifdef __EMSCRIPTEN__
+  if (profile_block)
+  {
+    RecordPpcBlockProfile(profile_pc,
+                          ElapsedMicros(profile_start, std::chrono::steady_clock::now()));
+  }
+#endif
+}
+
+void CachedInterpreter::Run()
+{
+  auto& core_timing = m_system.GetCoreTiming();
+
+  const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
+  while (*state_ptr == CPU::State::Running)
+  {
+#ifdef __EMSCRIPTEN__
+    ApplyRequestedWasmPolicy(*this);
+#endif
+    // §28cn metrics-gated per-slice wall-time profiling. The timestamp below
+    // spans Advance + ExecuteOneBlock; >16000us means the CPU pthread crossed
+    // one 60Hz frame budget, including intentional waits.
+    // §28ce: peak burst stats — snapshot last slice's totals into the
+    // burst-max atomics, then reset the per-slice counters before entering
+    // the new slice. Done unconditionally (independent of throttle gate)
+    // so burst stats are visible whether throttle is on or off.
+    {
+      const u32 last_slice_compiles = s_wasm_compiles_this_slice;
+      const u32 last_slice_us = s_wasm_compile_us_this_slice;
+      if (last_slice_compiles)
+      {
+        u32 prev = s_wasm_compile_burst_max_per_slice.load(std::memory_order_relaxed);
+        while (last_slice_compiles > prev &&
+               !s_wasm_compile_burst_max_per_slice.compare_exchange_weak(
+                   prev, last_slice_compiles, std::memory_order_relaxed)) {}
+      }
+      if (last_slice_us)
+      {
+        u32 prev = s_wasm_compile_us_burst_max_per_slice.load(std::memory_order_relaxed);
+        while (last_slice_us > prev &&
+               !s_wasm_compile_us_burst_max_per_slice.compare_exchange_weak(
+                   prev, last_slice_us, std::memory_order_relaxed)) {}
+      }
+      s_wasm_compiles_this_slice = 0;
+      s_wasm_compile_us_this_slice = 0;
+    }
+    // The compile budget has been replenished and no cached callback is active.
+    RetryDeferredWasmBlocks(*this);
+    // Start new timing slice
+    // Metrics-off runs avoid all per-slice clocks. BeginSlice also resets
+    // the exclusive wait/work attribution for this one CoreTiming slice.
+    const bool _profile_slice = DolphinWeb::WasmTimingProfile::BeginSlice();
+    const auto _slice_start =
+        _profile_slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // NOTE: Exceptions may change PC
+    const auto _advance_start =
+        _profile_slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    core_timing.Advance();
+    const auto _advance_end =
+        _profile_slice ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    do
+    {
+      ExecuteOneBlock();
+    } while (m_ppc_state.downcount > 0 && *state_ptr == CPU::State::Running);
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+    s_static_link_stats.Slice();
+#endif
+#line 8132
+    // §28cn slice timing close-out. compile_us already accumulated by
+    // DolphinWeb_RecordModuleUs into s_wasm_compile_us_this_slice (just
+    // before the §28ce reset above zeros it for next slice — but we read
+    // it AFTER the slice has run, just before the reset zeros it on the
+    // next iteration). Actually we need the read BEFORE the next iteration
+    // resets it — so capture it on this iteration's tail.
+    if (_profile_slice)
+    {
+      const auto _slice_end = std::chrono::steady_clock::now();
+      const u32 _slice_us = DolphinWeb::WasmTimingProfile::ElapsedMicros(_slice_start, _slice_end);
+      const u32 _advance_us =
+          DolphinWeb::WasmTimingProfile::ElapsedMicros(_advance_start, _advance_end);
+      const u32 _exec_us = DolphinWeb::WasmTimingProfile::ElapsedMicros(_advance_end, _slice_end);
+      DolphinWeb::WasmTimingProfile::FinishSlice(_slice_us, _advance_us, _exec_us);
+      // §28co per-stage maxes — CAS-update.
+      {
+        u32 prev = s_runloop_advance_max_us.load(std::memory_order_relaxed);
+        while (_advance_us > prev &&
+               !s_runloop_advance_max_us.compare_exchange_weak(prev, _advance_us,
+                                                               std::memory_order_relaxed)) {}
+      }
+      {
+        u32 prev = s_runloop_exec_max_us.load(std::memory_order_relaxed);
+        while (_exec_us > prev &&
+               !s_runloop_exec_max_us.compare_exchange_weak(prev, _exec_us,
+                                                            std::memory_order_relaxed)) {}
+      }
+      const u32 _compile_us = s_wasm_compile_us_this_slice;
+      const u32 _run_only_us = _slice_us > _compile_us ? (_slice_us - _compile_us) : 0;
+      s_runloop_total_us.fetch_add(_slice_us, std::memory_order_relaxed);
+      s_runloop_slice_count.fetch_add(1, std::memory_order_relaxed);
+      {
+        u32 prev = s_runloop_max_per_slice_us.load(std::memory_order_relaxed);
+        while (_slice_us > prev &&
+               !s_runloop_max_per_slice_us.compare_exchange_weak(prev, _slice_us,
+                                                                 std::memory_order_relaxed)) {}
+      }
+      {
+        u32 prev = s_runloop_max_run_only_us.load(std::memory_order_relaxed);
+        while (_run_only_us > prev &&
+               !s_runloop_max_run_only_us.compare_exchange_weak(prev, _run_only_us,
+                                                                std::memory_order_relaxed)) {}
+      }
+    }
+  }
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  s_static_link_stats.Publish();
+#endif
+#line 8177
+}
+
+void CachedInterpreter::SingleStep()
+{
+  // Enter new timing slice
+  m_system.GetCoreTiming().Advance();
+#ifdef __EMSCRIPTEN__
+  ApplyRequestedWasmPolicy(*this);
+#endif
+  ExecuteOneBlock(false);  // §28bt: never chain blocks under the debugger step
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  s_static_link_stats.Publish();
+#endif
+#line 8187
+}
+
+s32 CachedInterpreter::StartProfiledBlock(PowerPC::PowerPCState& ppc_state,
+                                          const StartProfiledBlockOperands& operands)
+{
+  JitBlock::ProfileData::BeginProfiling(operands.profile_data);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+template <bool profiled>
+s32 CachedInterpreter::EndBlock(PowerPC::PowerPCState& ppc_state,
+                                const EndBlockOperands<profiled>& operands)
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto* const completed_static_links = &operands.links;
+#endif
+#line 8200
+  ppc_state.pc = ppc_state.npc;
+  ppc_state.downcount -= operands.downcount;
+  UpdatePerformanceMonitorIfNeeded(operands.downcount, operands.num_load_stores,
+                                   operands.num_fp_inst, ppc_state);
+  if constexpr (profiled)
+    JitBlock::ProfileData::EndProfiling(operands.profile_data, operands.downcount);
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  StaticExitLinks::Publish(&ppc_state, completed_static_links);
+#endif
+#line 8206
+  return 0;
+}
+
+template <bool write_pc>
+s32 CachedInterpreter::Interpret(PowerPC::PowerPCState& ppc_state,
+                                 const InterpretOperands& operands)
+{
+  if constexpr (write_pc)
+  {
+    ppc_state.pc = operands.current_pc;
+    ppc_state.npc = operands.current_pc + 4;
+  }
+  operands.func(operands.interpreter, operands.inst);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+template <bool write_pc>
+s32 CachedInterpreter::InterpretAndCheckExceptions(
+    PowerPC::PowerPCState& ppc_state, const InterpretAndCheckExceptionsOperands& operands)
+{
+  if constexpr (write_pc)
+  {
+    ppc_state.pc = operands.current_pc;
+    ppc_state.npc = operands.current_pc + 4;
+  }
+  operands.func(operands.interpreter, operands.inst);
+
+  if ((ppc_state.Exceptions & (EXCEPTION_DSI | EXCEPTION_PROGRAM)) != 0)
+  {
+    ppc_state.pc = operands.current_pc;
+    ppc_state.downcount -= operands.downcount;
+    operands.power_pc.CheckExceptions();
+    return 0;
+  }
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::HLEFunction(PowerPC::PowerPCState& ppc_state,
+                                   const HLEFunctionOperands& operands)
+{
+  const auto& [system, current_pc, hook_index] = operands;
+  ppc_state.pc = current_pc;
+  HLE::Execute(Core::CPUThreadGuard{system}, current_pc, hook_index);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::WriteBrokenBlockNPC(PowerPC::PowerPCState& ppc_state,
+                                           const WriteBrokenBlockNPCOperands& operands)
+{
+  const auto& [current_pc] = operands;
+  ppc_state.npc = current_pc;
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::CheckFPU(PowerPC::PowerPCState& ppc_state, const CheckHaltOperands& operands)
+{
+  const auto& [power_pc, current_pc, downcount] = operands;
+  if (!ppc_state.msr.FP)
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.downcount -= downcount;
+    ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
+    power_pc.CheckExceptions();
+    return 0;
+  }
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::CheckBreakpoint(PowerPC::PowerPCState& ppc_state,
+                                       const CheckHaltOperands& operands)
+{
+  const auto& [power_pc, current_pc, downcount] = operands;
+  ppc_state.pc = current_pc;
+  if (power_pc.CheckAndHandleBreakPoints())
+  {
+    // Accessing PowerPCState through power_pc instead of ppc_state produces better assembly.
+    power_pc.GetPPCState().downcount -= downcount;
+    return 0;
+  }
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::CheckIdle(PowerPC::PowerPCState& ppc_state,
+                                 const CheckIdleOperands& operands)
+{
+  const auto& [core_timing, idle_pc] = operands;
+  if (ppc_state.npc == idle_pc)
+    core_timing.Idle();
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+static bool IsFastSimpleSpr(u32 index)
+{
+  return index == SPR_XER || index == SPR_LR || index == SPR_CTR;
+}
+
+static bool IsFastPureIntegerInstruction(UGeckoInstruction inst)
+{
+  switch (inst.OPCD)
+  {
+  case 7:   // mulli
+  case 8:   // subfic
+  case 10:  // cmpli
+  case 11:  // cmpi
+  case 12:  // addic
+  case 13:  // addic.
+  case 14:  // addi
+  case 15:  // addis
+  case 21:  // rlwinmx
+  case 24:  // ori
+  case 25:  // oris
+  case 26:  // xori
+  case 27:  // xoris
+  case 28:  // andi_rc
+  case 29:  // andis_rc
+  case 32:  // lwz
+  case 33:  // lwzu
+  case 34:  // lbz
+  case 35:  // lbzu
+  case 36:  // stw
+  case 37:  // stwu
+  case 38:  // stb
+  case 39:  // stbu
+  case 40:  // lhz
+  case 41:  // lhzu
+  case 42:  // lha
+  case 43:  // lhau
+  case 44:  // sth
+  case 45:  // sthu
+  case 46:  // lmw
+  case 47:  // stmw
+    return true;
+  case 31:
+    switch (inst.SUBOP10)
+    {
+    case 0:    // cmp
+    case 87:   // lbzx
+    case 119:  // lbzux
+    case 215:  // stbx
+    case 247:  // stbux
+    case 279:  // lhzx
+    case 311:  // lhzux
+    case 343:  // lhax
+    case 375:  // lhaux
+    case 407:  // sthx
+    case 439:  // sthux
+    case 23:   // lwzx
+    case 28:   // andx
+    case 32:   // cmpl
+    case 55:   // lwzux
+    case 151:  // stwx
+    case 183:  // stwux
+    case 266:  // addx
+    case 316:  // xorx
+    case 444:  // orx
+      return !inst.OE;
+    default:
+      return false;
+    }
+  default:
+    return false;
+  }
+}
+
+static bool IsFastBranchInstruction(UGeckoInstruction inst)
+{
+  if (inst.OPCD == 16 || inst.OPCD == 18)
+    return true;
+  return inst.OPCD == 19 && (inst.SUBOP10 == 16 || inst.SUBOP10 == 528);
+}
+
+static bool IsFastFloatInstruction(UGeckoInstruction inst)
+{
+  switch (inst.OPCD)
+  {
+  case 48:  // lfs
+  case 50:  // lfd
+  case 52:  // stfs
+    return true;
+  case 31:
+    if (inst.Rc)
+      return false;
+    return inst.SUBOP10 == 535 || inst.SUBOP10 == 663 || inst.SUBOP10 == 983;  // lfsx, stfsx, stfiwx
+  default:
+    break;
+  }
+
+  if (inst.OPCD == 59)
+  {
+    if (inst.Rc)
+      return false;
+    return inst.SUBOP5 == 20 || inst.SUBOP5 == 21 || inst.SUBOP5 == 25 ||
+           inst.SUBOP5 == 29 || inst.SUBOP5 == 30;  // fsubs, fadds, fmuls, fmadds, fnmsubs
+  }
+
+  if (inst.OPCD == 63)
+  {
+    if (inst.Rc)
+      return false;
+    return inst.SUBOP10 == 15 || inst.SUBOP10 == 40 || inst.SUBOP10 == 72 ||
+           inst.SUBOP10 == 136 || inst.SUBOP10 == 264;  // fctiwzx, fnegx, fmrx, fnabsx, fabsx
+  }
+
+  return false;
+}
+
+bool CachedInterpreter::TryWriteMeleeIdlePollLoop(u32 index, PowerPC::PowerPCManager& power_pc)
+{
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_MELEELOOP))
+    return false;
+  if (IsDebuggingEnabled() || IsBranchWatchEnabled() || jo.memcheck ||
+      m_code_buffer[index].address != MELEE_IDLE_POLL_LOOP_PC ||
+      m_code_buffer[index].inst.hex != 0x4be74829)
+  {
+    return false;
+  }
+
+  ++s_fast_melee_idle_poll_loop_compile_attempts;
+
+  const std::array<std::pair<u32, u32>, 4> expected = {{
+      {0x801a4da8, 0x4be74829},  // bl 0x800195d0
+      {0x801a4dac, 0x4be74ae9},  // bl 0x80019894
+      {0x801a4db0, 0x547b063f},  // clrlwi. r27, r3, 0x18
+      {0x801a4db4, 0x4182fff4},  // beq 0x801a4da8
+  }};
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  auto& mmu = m_system.GetMMU();
+  for (const auto& [expected_address, expected_hex] : expected)
+  {
+    const auto result = mmu.TryReadInstruction(expected_address);
+    if (!result.valid || result.hex != expected_hex)
+    {
+      s_fast_melee_idle_poll_loop_mismatch_address = expected_address;
+      s_fast_melee_idle_poll_loop_mismatch_expected = expected_hex;
+      s_fast_melee_idle_poll_loop_mismatch_actual = result.valid ? result.hex : 0xffffffff;
+      ++s_fast_melee_idle_poll_loop_compile_rejects;
+      return false;
+    }
+
+    const UGeckoInstruction inst{result.hex};
+    const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(inst, expected_address);
+    cycles += opinfo->num_cycles;
+    if ((opinfo->flags & FL_LOADSTORE) != 0)
+      ++loadstores;
+  }
+
+  if (cycles == 0)
+  {
+    ++s_fast_melee_idle_poll_loop_compile_rejects;
+    return false;
+  }
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  auto static_links = StaticExitLinks::Fallthrough(MELEE_IDLE_POLL_LOOP_PC);
+  StaticExitLinks::Add(static_links, MELEE_IDLE_POLL_LOOP_END_PC);
+  auto* const emitted = reinterpret_cast<MeleeIdlePollLoopOperands*>(
+      GetWritableCodePtr() + sizeof(AnyCallback));
+  Write(FastMeleeIdlePollLoop,
+        {power_pc, MELEE_IDLE_POLL_LOOP_PC, MELEE_IDLE_POLL_LOOP_END_PC, cycles, loadstores,
+         static_links});
+  if (!HasWriteFailed())
+    RegisterStaticExitLinks(&emitted->links);
+#else
+#line 8475
+  Write(FastMeleeIdlePollLoop,
+        {power_pc, MELEE_IDLE_POLL_LOOP_PC, MELEE_IDLE_POLL_LOOP_END_PC, cycles, loadstores});
+#endif
+#line 8477
+  return true;
+}
+
+bool CachedInterpreter::TryWriteMeleeTitleLoop(u32 index, PowerPC::PowerPCManager& power_pc)
+{
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_MELEELOOP))
+    return false;
+
+  constexpr u32 loop_start = 0x8035ca24;
+  constexpr u32 loop_end = 0x8035cb38;
+  constexpr u32 instruction_count = ((loop_end - loop_start) / sizeof(u32)) + 1;
+
+  if (IsDebuggingEnabled() || IsBranchWatchEnabled() || IsProfilingEnabled() || jo.memcheck ||
+      m_code_buffer[index].address != loop_start || m_code_buffer[index].inst.hex != 0xfda06090)
+  {
+    return false;
+  }
+
+  ++s_fast_melee_title_loop_compile_attempts;
+
+  const auto read_instruction = [&](u32 offset) -> std::optional<UGeckoInstruction> {
+    const auto result = m_system.GetMMU().TryReadInstruction(loop_start + offset * sizeof(u32));
+    if (!result.valid)
+      return std::nullopt;
+    return UGeckoInstruction{result.hex};
+  };
+  const auto matches = [&](u32 offset, u32 expected) {
+    const auto inst = read_instruction(offset);
+    if (inst && inst->hex == expected)
+      return true;
+    s_fast_melee_title_loop_mismatch_offset = offset;
+    s_fast_melee_title_loop_mismatch_expected = expected;
+    s_fast_melee_title_loop_mismatch_actual = inst ? inst->hex : 0xffffffff;
+    return false;
+  };
+
+  if (!matches(0, 0xfda06090) ||     // fmr f13, f12
+      !matches(2, 0xc1bc0000) ||     // lfs f13, 0(r28)
+      !matches(8, 0xed136bfa) ||     // fmadds f8, f19, f15, f13
+      !matches(27, 0x6fbd8000) ||    // xoris r29, r29, 0x8000
+      !matches(31, 0x93a10054) ||    // stw r29, 0x0054(sp)
+      !matches(34, 0x7d31652e) ||    // stfsx f9, r17, r12
+      !matches(39, 0x7e315c2e) ||    // lfsx f17, r17, r11
+      !matches(47, 0xedce01b2) ||    // fmuls f14, f14, f6
+      !matches(61, 0xfdc0701e) ||    // fctiwz f14, f14
+      !matches(69, 0x4200feec))      // bdnz+ -> 0x8035ca24
+  {
+    ++s_fast_melee_title_loop_compile_rejects;
+    return false;
+  }
+
+  u32 cycles = 0;
+  u32 loadstores = 0;
+  u32 fp_inst = 0;
+  for (u32 offset = 0; offset < instruction_count; ++offset)
+  {
+    const auto inst = read_instruction(offset);
+    if (!inst)
+    {
+      ++s_fast_melee_title_loop_compile_rejects;
+      return false;
+    }
+
+    const GekkoOPInfo* opinfo = PPCTables::GetOpInfo(*inst, loop_start + offset * sizeof(u32));
+    cycles += opinfo->num_cycles;
+    if ((opinfo->flags & FL_LOADSTORE) != 0)
+      ++loadstores;
+    if ((opinfo->flags & FL_USE_FPU) != 0)
+      ++fp_inst;
+  }
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  auto static_links = StaticExitLinks::Fallthrough(loop_start);
+  StaticExitLinks::Add(static_links, loop_end + sizeof(u32));
+  auto* const emitted = reinterpret_cast<MeleeTitleLoopOperands*>(
+      GetWritableCodePtr() + sizeof(AnyCallback));
+  Write(FastMeleeTitleLoop, {power_pc, loop_start, loop_end + sizeof(u32), cycles, loadstores,
+                             fp_inst, static_links});
+  if (!HasWriteFailed())
+    RegisterStaticExitLinks(&emitted->links);
+#else
+#line 8548
+  Write(FastMeleeTitleLoop, {power_pc, loop_start, loop_end + sizeof(u32), cycles, loadstores,
+                             fp_inst});
+#endif
+#line 8550
+  return true;
+}
+
+bool CachedInterpreter::TryWriteOsInterruptFunction(u32 index, PowerPC::PowerPCManager& power_pc)
+{
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_OSINTERRUPT))
+    return false;
+  if (IsDebuggingEnabled() || IsBranchWatchEnabled() || jo.memcheck)
+    return false;
+
+  const u32 start = m_code_buffer[index].address;
+  if (start != OS_INTERRUPT_DISABLE_PC && start != OS_INTERRUPT_ENABLE_PC &&
+      start != OS_INTERRUPT_RESTORE_PC)
+    return false;
+
+  ++s_fast_os_interrupt_compile_attempts;
+
+  const auto read_instruction = [&](u32 address) -> std::optional<UGeckoInstruction> {
+    const auto result = m_system.GetMMU().TryReadInstruction(address);
+    if (!result.valid)
+      return std::nullopt;
+    return UGeckoInstruction{result.hex};
+  };
+  const auto matches = [&](u32 address, u32 expected) {
+    const auto inst = read_instruction(address);
+    if (inst && inst->hex == expected)
+      return true;
+    s_fast_os_interrupt_mismatch_address = address;
+    s_fast_os_interrupt_mismatch_expected = expected;
+    s_fast_os_interrupt_mismatch_actual = inst ? inst->hex : 0xffffffff;
+    return false;
+  };
+  const auto cycles_for = [&](std::initializer_list<u32> addresses) {
+    u32 cycles = 0;
+    for (const u32 address : addresses)
+    {
+      const auto inst = read_instruction(address);
+      if (!inst)
+        return 0u;
+      cycles += PPCTables::GetOpInfo(*inst, address)->num_cycles;
+    }
+    return cycles;
+  };
+
+  if (start == OS_INTERRUPT_DISABLE_PC)
+  {
+    if (!matches(0x80347364, 0x7c6000a6) ||  // mfmsr r3
+        !matches(0x80347368, 0x5464045e) ||  // rlwinm r4, r3, 0, 17, 15
+        !matches(0x8034736c, 0x7c800124) ||  // mtmsr r4
+        !matches(0x80347370, 0x54638ffe) ||  // rlwinm r3, r3, 17, 31, 31
+        !matches(0x80347374, 0x4e800020))    // blr
+    {
+      ++s_fast_os_interrupt_compile_rejects;
+      return false;
+    }
+
+    const u32 cycles =
+        cycles_for({0x80347364, 0x80347368, 0x8034736c, 0x80347370, 0x80347374});
+    if (cycles == 0)
+    {
+      ++s_fast_os_interrupt_compile_rejects;
+      return false;
+    }
+    MarkOsInterruptModeVerified(OS_INTERRUPT_DISABLE);
+    Write(FastOsInterruptFunction, {power_pc, start, OS_INTERRUPT_DISABLE, cycles, cycles});
+    return true;
+  }
+
+  if (start == OS_INTERRUPT_ENABLE_PC)
+  {
+    if (!matches(0x80347378, 0x7c6000a6) ||  // mfmsr r3
+        !matches(0x8034737c, 0x60648000) ||  // ori r4, r3, 0x8000
+        !matches(0x80347380, 0x7c800124) ||  // mtmsr r4
+        !matches(0x80347384, 0x54638ffe) ||  // rlwinm r3, r3, 17, 31, 31
+        !matches(0x80347388, 0x4e800020))    // blr
+    {
+      ++s_fast_os_interrupt_compile_rejects;
+      return false;
+    }
+
+    const u32 cycles =
+        cycles_for({0x80347378, 0x8034737c, 0x80347380, 0x80347384, 0x80347388});
+    if (cycles == 0)
+    {
+      ++s_fast_os_interrupt_compile_rejects;
+      return false;
+    }
+    MarkOsInterruptModeVerified(OS_INTERRUPT_ENABLE);
+    Write(FastOsInterruptFunction, {power_pc, start, OS_INTERRUPT_ENABLE, cycles, cycles});
+    return true;
+  }
+
+  if (!matches(0x8034738c, 0x2c030000) ||  // cmpwi r3, 0
+      !matches(0x80347390, 0x7c8000a6) ||  // mfmsr r4
+      !matches(0x80347394, 0x4182000c) ||  // beq -> clear EE
+      !matches(0x80347398, 0x60858000) ||  // ori r5, r4, 0x8000
+      !matches(0x8034739c, 0x48000008) ||  // b -> mtmsr
+      !matches(0x803473a0, 0x5485045e) ||  // rlwinm r5, r4, 0, 17, 15
+      !matches(0x803473a4, 0x7ca00124) ||  // mtmsr r5
+      !matches(0x803473a8, 0x54848ffe) ||  // rlwinm r4, r4, 17, 31, 31
+      !matches(0x803473ac, 0x4e800020))    // blr
+  {
+    ++s_fast_os_interrupt_compile_rejects;
+    return false;
+  }
+
+  const u32 enable_cycles = cycles_for({0x8034738c, 0x80347390, 0x80347394, 0x80347398,
+                                        0x8034739c, 0x803473a4, 0x803473a8, 0x803473ac});
+  const u32 disable_cycles = cycles_for({0x8034738c, 0x80347390, 0x80347394, 0x803473a0,
+                                         0x803473a4, 0x803473a8, 0x803473ac});
+  if (enable_cycles == 0 || disable_cycles == 0)
+  {
+    ++s_fast_os_interrupt_compile_rejects;
+    return false;
+  }
+
+  MarkOsInterruptModeVerified(OS_INTERRUPT_RESTORE);
+  Write(FastOsInterruptFunction,
+        {power_pc, start, OS_INTERRUPT_RESTORE, enable_cycles, disable_cycles});
+  return true;
+}
+
+bool CachedInterpreter::TryWriteDcbxLoop(u32 index, PowerPC::PowerPCManager& power_pc)
+{
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_DCBXLOOP))
+    return false;
+  if (IsDebuggingEnabled() || IsBranchWatchEnabled() || jo.memcheck ||
+      index + 2 >= code_block.m_num_instructions)
+  {
+    return false;
+  }
+
+  const PPCAnalyst::CodeOp& dcbx = m_code_buffer[index];
+  const PPCAnalyst::CodeOp& addi = m_code_buffer[index + 1];
+  const PPCAnalyst::CodeOp& third = m_code_buffer[index + 2];
+  if (addi.skip || third.skip)
+    return false;
+
+  const u32 subop = dcbx.inst.SUBOP10;
+  if (dcbx.inst.OPCD != 31 || (subop != 54 && subop != 86 && subop != 470) ||
+      dcbx.inst.RA != 0 || dcbx.inst.RB == 0)
+  {
+    return false;
+  }
+
+  if (!IsDcbxLoopAddressStep(addi.inst, dcbx.inst.RB))
+    return false;
+
+  u32 cycle_count_per_loop = dcbx.opinfo->num_cycles + addi.opinfo->num_cycles;
+  u32 count_gpr = 0;
+  u32 loop_mode = DCBX_LOOP_CTR;
+
+  if (IsCtrDcbxLoopBranch(third.inst, third.address, dcbx.address))
+  {
+    cycle_count_per_loop += third.opinfo->num_cycles;
+  }
+  else
+  {
+    if (index + 3 >= code_block.m_num_instructions)
+      return false;
+
+    const PPCAnalyst::CodeOp& branch = m_code_buffer[index + 3];
+    if (branch.skip)
+      return false;
+
+    const std::optional<u32> counted_loop_gpr =
+        GetCountedDcbxLoopRegister(third.inst, dcbx.inst.RB);
+    if (!counted_loop_gpr ||
+        !IsCountedDcbxLoopBranch(branch.inst, branch.address, dcbx.address))
+    {
+      return false;
+    }
+
+    cycle_count_per_loop += third.opinfo->num_cycles + branch.opinfo->num_cycles;
+    count_gpr = *counted_loop_gpr;
+    loop_mode = DCBX_LOOP_COUNT_GPR;
+  }
+
+  if (cycle_count_per_loop == 0)
+    return false;
+
+  Write(FastDcbxLoop, {power_pc, dcbx.address, dcbx.inst, cycle_count_per_loop, count_gpr,
+                       loop_mode});
+  return true;
+}
+
+bool CachedInterpreter::TryWriteFastInstruction(const PPCAnalyst::CodeOp& op,
+                                                PowerPC::PowerPCManager& power_pc)
+{
+  const u32 disable_mask = s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+
+  if (!IsBranchWatchEnabled() && IsFastBranchInstruction(op.inst))
+  {
+    if (const auto os_interrupt_target = GetDirectBranchOsInterruptTarget(op.inst, op.address))
+    {
+      if ((disable_mask & DOLPHIN_WEB_DISABLE_OSINTERRUPT) == 0)
+      {
+        Write(FastOsInterruptCallBranch,
+              {power_pc, op.address, os_interrupt_target->mode,
+               os_interrupt_target->cycles_primary, os_interrupt_target->cycles_secondary});
+        return true;
+      }
+      // Fall through to FastBranch if osinterrupt is disabled and that path isn't disabled too.
+    }
+    if ((disable_mask & DOLPHIN_WEB_DISABLE_MELEECALL) == 0)
+    {
+      if (IsDirectBranchLinkTo(op.inst, op.address, MELEE_INPUT_STATUS_PC))
+      {
+        Write(FastMeleeInputStatusCallBranch, {power_pc, op.address, op.inst});
+        return true;
+      }
+      if (IsDirectBranchLinkTo(op.inst, op.address, MELEE_STATUS_FN_PC))
+      {
+        Write(FastMeleeStatusFunctionCallBranch, {power_pc, op.address, op.inst});
+        return true;
+      }
+      if (IsDirectBranchLinkTo(op.inst, op.address, MELEE_SERVICE_POLL_PC))
+      {
+        Write(FastMeleeServicePollCallBranch, {power_pc, op.address, op.inst});
+        return true;
+      }
+      if (IsDirectBranchLinkTo(op.inst, op.address, MELEE_SI_POLL_PC))
+      {
+        Write(FastMeleeSiPollNoEventCallBranch, {power_pc, op.address, op.inst});
+        return true;
+      }
+      if (IsDirectBranchLinkTo(op.inst, op.address, MELEE_INPUT_POLL_PC))
+      {
+        Write(FastMeleeInputPollNoChangeCallBranch, {power_pc, op.address, op.inst});
+        return true;
+      }
+    }
+
+    if ((disable_mask & DOLPHIN_WEB_DISABLE_FASTBRANCH) != 0)
+      return false;
+
+    // bdnz / bdnz+ : decrement CTR, branch if CTR != 0. The most common counter-loop branch
+    // in Melee tight loops. BO==16 (no hint), BO==17 (predict-taken hint). LK==0 keeps LR
+    // untouched. BI is irrelevant when BO bit 4 is set, but we constrain BI==0 to match the
+    // canonical assembler form and avoid surprise. The branch target is statically known
+    // (PPCAnalyst already populates op.branchTo), so we precompute it here and skip the BO
+    // bit decode, CR lookup, target arithmetic, and OPCD switch dispatch on every call.
+    if (op.inst.OPCD == 16 && op.inst.LK == 0 && op.inst.BI == 0 &&
+        (op.inst.BO == 16 || op.inst.BO == 17))
+    {
+      Write(FastBranchBdnz, {power_pc, op.address, op.branchTo});
+      return true;
+    }
+
+    Write(FastBranch, {power_pc, op.address, op.inst});
+    return true;
+  }
+
+  if (IsFastFloatInstruction(op.inst))
+  {
+    if ((disable_mask & DOLPHIN_WEB_DISABLE_FASTFP) != 0)
+      return false;
+    Write(FastFloat, {power_pc, op.address, op.inst});
+    return true;
+  }
+
+  if (IsFastPureIntegerInstruction(op.inst))
+  {
+    if ((disable_mask & DOLPHIN_WEB_DISABLE_FASTINT) != 0)
+      return false;
+    Write(FastInteger, {power_pc, op.address, op.inst});
+    return true;
+  }
+
+  if (op.inst.OPCD == 19 && op.inst.SUBOP10 == 150)  // isync
+  {
+    if ((disable_mask & DOLPHIN_WEB_DISABLE_FASTSYSTEM) != 0)
+      return false;
+    Write(FastSystemNoop, {power_pc, op.address, op.inst});
+    return true;
+  }
+
+  if (op.inst.OPCD != 31)
+    return false;
+
+  if ((disable_mask & DOLPHIN_WEB_DISABLE_FASTSYSTEM) != 0)
+    return false;
+
+  switch (op.inst.SUBOP10)
+  {
+  case 83:  // mfmsr
+    Write(FastMfmsr, {power_pc, op.address, op.inst});
+    return true;
+  case 146:  // mtmsr
+    Write(FastMtmsr, {power_pc, op.address, op.inst});
+    return true;
+  case 339:  // mfspr
+    if (IsFastSimpleSpr(DecodeMfsprIndex(op.inst)))
+    {
+      Write(FastMfspr, {power_pc, op.address, op.inst});
+      return true;
+    }
+    return false;
+  case 467:  // mtspr
+    if (IsFastSimpleSpr(DecodeMtsprIndex(op.inst)))
+    {
+      Write(FastMtspr, {power_pc, op.address, op.inst});
+      return true;
+    }
+    return false;
+  case 598:  // sync
+    Write(FastSystemNoop, {power_pc, op.address, op.inst});
+    return true;
+  case 54:   // dcbst
+  case 86:   // dcbf
+  case 470:  // dcbi
+    Write(FastDcbx, {power_pc, op.address, op.inst});
+    return true;
+  default:
+    return false;
+  }
+}
+
+static u32 ReadFastSpr(const PowerPC::PowerPCState& ppc_state, u32 index)
+{
+  if (index == SPR_XER)
+    return ppc_state.GetXER().Hex;
+  return ppc_state.spr[index];
+}
+
+static void WriteFastSpr(PowerPC::PowerPCState& ppc_state, u32 index, u32 value)
+{
+  if (index == SPR_XER)
+  {
+    ppc_state.SetXER(UReg_XER{value});
+    return;
+  }
+  ppc_state.spr[index] = value;
+}
+
+static void GeneratePrivilegedFastInstructionException(PowerPC::PowerPCState& ppc_state,
+                                                       u32 current_pc)
+{
+  ppc_state.pc = current_pc;
+  GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+}
+
+s32 CachedInterpreter::FastMfmsr(PowerPC::PowerPCState& ppc_state,
+                                 const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  if (ppc_state.msr.PR)
+    GeneratePrivilegedFastInstructionException(ppc_state, current_pc);
+  else
+    ppc_state.gpr[inst.RD] = ppc_state.msr.Hex;
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMtmsr(PowerPC::PowerPCState& ppc_state,
+                                 const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  ppc_state.pc = current_pc;
+  ppc_state.npc = current_pc + 4;
+  if (ppc_state.msr.PR)
+  {
+    GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+  }
+  else
+  {
+    ppc_state.msr.Hex = ppc_state.gpr[inst.RS];
+    power_pc.MSRUpdated();
+    CheckFPExceptions(ppc_state);
+    power_pc.CheckExceptions();
+  }
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMfspr(PowerPC::PowerPCState& ppc_state,
+                                 const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  const u32 index = DecodeMfsprIndex(inst);
+  ppc_state.gpr[inst.RD] = ReadFastSpr(ppc_state, index);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMtspr(PowerPC::PowerPCState& ppc_state,
+                                 const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  const u32 index = DecodeMtsprIndex(inst);
+  WriteFastSpr(ppc_state, index, ppc_state.gpr[inst.RD]);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastSystemNoop(PowerPC::PowerPCState& ppc_state,
+                                      const FastInstructionOperands& operands)
+{
+  (void)ppc_state;
+  const UGeckoInstruction inst = operands.inst;
+  if (inst.OPCD == 19)
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_system_isync_ops);
+  else
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_system_sync_ops);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+template <typename T>
+static void SetFastCompareField(PowerPC::PowerPCState& ppc_state, u32 cr_field_index, T lhs, T rhs)
+{
+  u32 cr_field = PowerPC::CR_EQ;
+  if (lhs < rhs)
+    cr_field = PowerPC::CR_LT;
+  else if (lhs > rhs)
+    cr_field = PowerPC::CR_GT;
+  if (ppc_state.GetXER_SO())
+    cr_field |= PowerPC::CR_SO;
+  ppc_state.cr.SetField(cr_field_index, cr_field);
+}
+
+template <typename T>
+static void SetFastCompare(PowerPC::PowerPCState& ppc_state, UGeckoInstruction inst, T lhs, T rhs)
+{
+  SetFastCompareField(ppc_state, inst.CRFD, lhs, rhs);
+}
+
+static void FastUpdateCR0(PowerPC::PowerPCState& ppc_state, u32 value)
+{
+  const s64 sign_extended = s64{s32(value)};
+  u64 cr_val = u64(sign_extended);
+
+  if (value == 0)
+    cr_val |= 1ULL << 63;
+
+  cr_val = (cr_val & ~(1ULL << PowerPC::CR_EMU_SO_BIT)) |
+           (u64{ppc_state.GetXER_SO()} << PowerPC::CR_EMU_SO_BIT);
+
+  ppc_state.cr.fields[0] = cr_val;
+}
+
+static bool TryFastRamWordLoadStore(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                    UGeckoInstruction inst)
+{
+  const bool indexed = inst.OPCD == 31;
+  const bool load = inst.OPCD == 32 || inst.OPCD == 33 ||
+                    (indexed && (inst.SUBOP10 == 23 || inst.SUBOP10 == 55));
+  const bool store = inst.OPCD == 36 || inst.OPCD == 37 ||
+                     (indexed && (inst.SUBOP10 == 151 || inst.SUBOP10 == 183));
+  if (!load && !store)
+    return false;
+
+  const bool update =
+      inst.OPCD == 33 || inst.OPCD == 37 ||
+      (indexed && (inst.SUBOP10 == 55 || inst.SUBOP10 == 183));
+  const u32 address =
+      indexed ? ((update || inst.RA) ? ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB] :
+                                       ppc_state.gpr[inst.RB]) :
+                ((update || inst.RA) ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_16) :
+                                       u32(inst.SIMM_16));
+
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 offset = address & 0x3fffffff;
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  const bool in_ram = !ppc_state.msr.LE && ram != nullptr && offset < ram_size &&
+                      ram_size - offset >= sizeof(u32);
+
+  if (load)
+  {
+    const u32 value = in_ram ? ReadRamU32BE(ram, offset) : system.GetMMU().Read<u32>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+    {
+      ppc_state.gpr[inst.RD] = value;
+      if (update)
+        ppc_state.gpr[inst.RA] = address;
+    }
+
+    if (inst.OPCD == 32)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_lwz_ops);
+    else if (inst.OPCD == 33)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_lwzu_ops);
+    else if (inst.SUBOP10 == 23)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_lwzx_ops);
+    else
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_lwzux_ops);
+  }
+  else
+  {
+    if (in_ram)
+      WriteRamU32BE(ram, offset, ppc_state.gpr[inst.RS]);
+    else
+      system.GetMMU().Write<u32>(ppc_state.gpr[inst.RS], address);
+
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0 && update)
+      ppc_state.gpr[inst.RA] = address;
+
+    if (inst.OPCD == 36)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_stw_ops);
+    else if (inst.OPCD == 37)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_stwu_ops);
+    else if (inst.SUBOP10 == 151)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_stwx_ops);
+    else
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_stwux_ops);
+  }
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_word_mem_ops);
+  return true;
+}
+
+static bool TryFastRamByteHalfLoadStore(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                        UGeckoInstruction inst)
+{
+  const bool indexed = inst.OPCD == 31;
+  const bool load_byte = inst.OPCD == 34 || inst.OPCD == 35 ||
+                         (indexed && (inst.SUBOP10 == 87 || inst.SUBOP10 == 119));
+  const bool store_byte = inst.OPCD == 38 || inst.OPCD == 39 ||
+                          (indexed && (inst.SUBOP10 == 215 || inst.SUBOP10 == 247));
+  const bool load_half = inst.OPCD == 40 || inst.OPCD == 41 || inst.OPCD == 42 ||
+                         inst.OPCD == 43 ||
+                         (indexed && (inst.SUBOP10 == 279 || inst.SUBOP10 == 311 ||
+                                      inst.SUBOP10 == 343 || inst.SUBOP10 == 375));
+  const bool store_half = inst.OPCD == 44 || inst.OPCD == 45 ||
+                          (indexed && (inst.SUBOP10 == 407 || inst.SUBOP10 == 439));
+  if (!load_byte && !store_byte && !load_half && !store_half)
+    return false;
+
+  const bool update =
+      inst.OPCD == 35 || inst.OPCD == 39 || inst.OPCD == 41 || inst.OPCD == 43 ||
+      inst.OPCD == 45 ||
+      (indexed && (inst.SUBOP10 == 119 || inst.SUBOP10 == 247 || inst.SUBOP10 == 311 ||
+                   inst.SUBOP10 == 375 || inst.SUBOP10 == 439));
+  const u32 address =
+      indexed ? ((update || inst.RA) ? ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB] :
+                                       ppc_state.gpr[inst.RB]) :
+                ((update || inst.RA) ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_16) :
+                                       u32(inst.SIMM_16));
+
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 offset = address & 0x3fffffff;
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  const u32 bytes = (load_half || store_half) ? sizeof(u16) : sizeof(u8);
+  const bool in_ram = !ppc_state.msr.LE && ram != nullptr && offset < ram_size &&
+                      ram_size - offset >= bytes;
+
+  if (load_byte)
+  {
+    const u32 value = in_ram ? ram[offset] : system.GetMMU().Read<u8>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+    {
+      ppc_state.gpr[inst.RD] = value;
+      if (update)
+        ppc_state.gpr[inst.RA] = address;
+    }
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_byte_mem_load_ops);
+  }
+  else if (store_byte)
+  {
+    if (in_ram)
+      ram[offset] = static_cast<u8>(ppc_state.gpr[inst.RS]);
+    else
+      system.GetMMU().Write<u8>(static_cast<u8>(ppc_state.gpr[inst.RS]), address);
+
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0 && update)
+      ppc_state.gpr[inst.RA] = address;
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_byte_mem_store_ops);
+  }
+  else if (load_half)
+  {
+    const u16 raw = in_ram ? ReadRamU16BE(ram, offset) : system.GetMMU().Read<u16>(address);
+    const bool algebraic = inst.OPCD == 42 || inst.OPCD == 43 ||
+                           (indexed && (inst.SUBOP10 == 343 || inst.SUBOP10 == 375));
+    const u32 value = algebraic ? static_cast<u32>(static_cast<s32>(static_cast<s16>(raw))) :
+                                  static_cast<u32>(raw);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+    {
+      ppc_state.gpr[inst.RD] = value;
+      if (update)
+        ppc_state.gpr[inst.RA] = address;
+    }
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_half_mem_load_ops);
+  }
+  else
+  {
+    if (in_ram)
+      WriteRamU16BE(ram, offset, static_cast<u16>(ppc_state.gpr[inst.RS]));
+    else
+      system.GetMMU().Write<u16>(static_cast<u16>(ppc_state.gpr[inst.RS]), address);
+
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0 && update)
+      ppc_state.gpr[inst.RA] = address;
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_half_mem_store_ops);
+  }
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_byte_half_mem_ops);
+  return true;
+}
+
+static bool TryFastRamMultiwordLoadStore(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                         UGeckoInstruction inst)
+{
+  const bool load = inst.OPCD == 46;
+  const bool store = inst.OPCD == 47;
+  if (!load && !store)
+    return false;
+
+  const u32 start_address =
+      inst.RA ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_16) : u32(inst.SIMM_16);
+  const u32 register_count = 32 - inst.RD;
+  const u32 bytes = register_count * sizeof(u32);
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 offset = start_address & 0x3fffffff;
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  const bool in_ram = !ppc_state.msr.LE && ram != nullptr && offset < ram_size &&
+                      ram_size - offset >= bytes;
+
+  if (load)
+  {
+    for (u32 i = 0; i < register_count; ++i)
+    {
+      const u32 address = start_address + i * sizeof(u32);
+      const u32 value = in_ram ? ReadRamU32BE(ram, offset + i * sizeof(u32)) :
+                                 system.GetMMU().Read<u32>(address);
+      if ((ppc_state.Exceptions & EXCEPTION_DSI) != 0)
+        break;
+      ppc_state.gpr[inst.RD + i] = value;
+    }
+  }
+  else
+  {
+    for (u32 i = 0; i < register_count; ++i)
+    {
+      const u32 address = start_address + i * sizeof(u32);
+      const u32 value = ppc_state.gpr[inst.RS + i];
+      if (in_ram)
+        WriteRamU32BE(ram, offset + i * sizeof(u32), value);
+      else
+        system.GetMMU().Write<u32>(value, address);
+      if ((ppc_state.Exceptions & EXCEPTION_DSI) != 0)
+        break;
+    }
+  }
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_multiword_mem_ops);
+  return true;
+}
+
+DOLPHIN_WEB_FAST_BRANCH_INLINE s32 CachedInterpreter::FastBranch(
+    PowerPC::PowerPCState& ppc_state, const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)power_pc;
+  ppc_state.pc = current_pc;
+  ppc_state.npc = current_pc + 4;
+
+  switch (inst.OPCD)
+  {
+  case 16:  // bcx
+  {
+    if ((inst.BO & BO_DONT_DECREMENT_FLAG) == 0)
+      CTR(ppc_state)--;
+
+    const bool true_false = ((inst.BO >> 3) & 1) != 0;
+    const bool only_counter_check = ((inst.BO >> 4) & 1) != 0;
+    const bool only_condition_check = ((inst.BO >> 2) & 1) != 0;
+    const u32 ctr_check = ((CTR(ppc_state) != 0) ^ (inst.BO >> 1)) & 1;
+    const bool counter = only_condition_check || ctr_check != 0;
+    const bool condition =
+        only_counter_check || (ppc_state.cr.GetBit(inst.BI) == u32(true_false));
+
+    if (counter && condition)
+    {
+      if (inst.LK)
+        LR(ppc_state) = current_pc + 4;
+
+      u32 destination_addr = u32(SignExt16(s16(inst.BD << 2)));
+      if (!inst.AA)
+        destination_addr += current_pc;
+      ppc_state.npc = destination_addr;
+    }
+
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bcx_ops);
+    break;
+  }
+  case 18:  // bx
+  {
+    if (inst.LK)
+      LR(ppc_state) = current_pc + 4;
+
+    u32 destination_addr = u32(SignExt26(inst.LI << 2));
+    if (!inst.AA)
+      destination_addr += current_pc;
+    ppc_state.npc = destination_addr;
+
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bx_ops);
+    break;
+  }
+  case 19:
+    if (inst.SUBOP10 == 16)  // bclrx
+    {
+      if ((inst.BO_2 & BO_DONT_DECREMENT_FLAG) == 0)
+        CTR(ppc_state)--;
+
+      const u32 counter = ((inst.BO_2 >> 2) | ((CTR(ppc_state) != 0) ^ (inst.BO_2 >> 1))) & 1;
+      const u32 condition =
+          ((inst.BO_2 >> 4) | (ppc_state.cr.GetBit(inst.BI_2) == ((inst.BO_2 >> 3) & 1))) & 1;
+
+      if ((counter & condition) != 0)
+      {
+        ppc_state.npc = LR(ppc_state) & ~3u;
+        if (inst.LK_3)
+          LR(ppc_state) = current_pc + 4;
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bclrx_ops);
+    }
+    else if (inst.SUBOP10 == 528)  // bcctrx
+    {
+      const u32 condition =
+          ((inst.BO_2 >> 4) | (ppc_state.cr.GetBit(inst.BI_2) == ((inst.BO_2 >> 3) & 1))) & 1;
+
+      if (condition != 0)
+      {
+        ppc_state.npc = CTR(ppc_state) & ~3u;
+        if (inst.LK_3)
+          LR(ppc_state) = current_pc + 4;
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bcctrx_ops);
+    }
+    break;
+  default:
+    break;
+  }
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_ops);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastBranchBdnz(PowerPC::PowerPCState& ppc_state,
+                                      const FastBranchBdnzOperands& operands)
+{
+  const auto& [power_pc, current_pc, target_pc] = operands;
+  (void)power_pc;
+  ppc_state.pc = current_pc;
+  if (--CTR(ppc_state) != 0)
+    ppc_state.npc = target_pc;
+  else
+    ppc_state.npc = current_pc + 4;
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bcx_ops);
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_bdnz_ops);
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_branch_ops);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastInteger(PowerPC::PowerPCState& ppc_state,
+                                   const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  switch (inst.OPCD)
+  {
+  case 7:  // mulli
+    ppc_state.gpr[inst.RD] =
+        static_cast<u32>(static_cast<s32>(ppc_state.gpr[inst.RA]) * inst.SIMM_16);
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_integer_mulli_ops);
+    break;
+  case 8:  // subfic
+  {
+    const u32 lhs = ppc_state.gpr[inst.RA];
+    const u32 immediate = static_cast<u32>(static_cast<s32>(inst.SIMM_16));
+    ppc_state.gpr[inst.RD] = immediate - lhs;
+    ppc_state.SetCarry(immediate >= lhs);
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_integer_subfic_ops);
+    break;
+  }
+  case 10:  // cmpli
+    SetFastCompare(ppc_state, inst, ppc_state.gpr[inst.RA], inst.UIMM);
+    break;
+  case 11:  // cmpi
+    SetFastCompare(ppc_state, inst, s32(ppc_state.gpr[inst.RA]), inst.SIMM_16);
+    break;
+  case 12:  // addic
+  case 13:  // addic.
+  {
+    const u32 lhs = ppc_state.gpr[inst.RA];
+    const u32 immediate = static_cast<u32>(static_cast<s32>(inst.SIMM_16));
+    const u32 result = lhs + immediate;
+    ppc_state.gpr[inst.RD] = result;
+    ppc_state.SetCarry(Interpreter::Helper_Carry(lhs, immediate));
+    if (inst.OPCD == 13)
+    {
+      FastUpdateCR0(ppc_state, result);
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_integer_addic_rc_ops);
+    }
+    else
+    {
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_integer_addic_ops);
+    }
+    break;
+  }
+  case 14:  // addi
+    ppc_state.gpr[inst.RD] =
+        inst.RA ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_16) : u32(inst.SIMM_16);
+    break;
+  case 15:  // addis
+  {
+    const u32 immediate = u32(inst.SIMM_16) << 16;
+    ppc_state.gpr[inst.RD] = inst.RA ? ppc_state.gpr[inst.RA] + immediate : immediate;
+    break;
+  }
+  case 21:  // rlwinmx
+    ppc_state.gpr[inst.RA] = std::rotl(ppc_state.gpr[inst.RS], inst.SH) &
+                             MakeRotationMask(inst.MB, inst.ME);
+    if (inst.Rc)
+      FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+    break;
+  case 24:  // ori
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] | inst.UIMM;
+    break;
+  case 25:  // oris
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] | (u32{inst.UIMM} << 16);
+    break;
+  case 26:  // xori
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] ^ inst.UIMM;
+    break;
+  case 27:  // xoris
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] ^ (u32{inst.UIMM} << 16);
+    break;
+  case 28:  // andi_rc
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] & inst.UIMM;
+    FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+    break;
+  case 29:  // andis_rc
+    ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] & (u32{inst.UIMM} << 16);
+    FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+    break;
+  case 32:  // lwz
+  case 33:  // lwzu
+  case 36:  // stw
+  case 37:  // stwu
+    TryFastRamWordLoadStore(Core::System::GetInstance(), ppc_state, inst);
+    break;
+  case 34:  // lbz
+  case 35:  // lbzu
+  case 38:  // stb
+  case 39:  // stbu
+  case 40:  // lhz
+  case 41:  // lhzu
+  case 42:  // lha
+  case 43:  // lhau
+  case 44:  // sth
+  case 45:  // sthu
+    TryFastRamByteHalfLoadStore(Core::System::GetInstance(), ppc_state, inst);
+    break;
+  case 46:  // lmw
+  case 47:  // stmw
+    TryFastRamMultiwordLoadStore(Core::System::GetInstance(), ppc_state, inst);
+    break;
+  case 31:
+    switch (inst.SUBOP10)
+    {
+    case 0:  // cmp
+      SetFastCompare(ppc_state, inst, s32(ppc_state.gpr[inst.RA]), s32(ppc_state.gpr[inst.RB]));
+      break;
+    case 23:   // lwzx
+    case 55:   // lwzux
+    case 151:  // stwx
+    case 183:  // stwux
+      TryFastRamWordLoadStore(Core::System::GetInstance(), ppc_state, inst);
+      break;
+    case 87:   // lbzx
+    case 119:  // lbzux
+    case 215:  // stbx
+    case 247:  // stbux
+    case 279:  // lhzx
+    case 311:  // lhzux
+    case 343:  // lhax
+    case 375:  // lhaux
+    case 407:  // sthx
+    case 439:  // sthux
+      TryFastRamByteHalfLoadStore(Core::System::GetInstance(), ppc_state, inst);
+      break;
+    case 28:  // andx
+      ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] & ppc_state.gpr[inst.RB];
+      if (inst.Rc)
+        FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+      break;
+    case 32:  // cmpl
+      SetFastCompare(ppc_state, inst, ppc_state.gpr[inst.RA], ppc_state.gpr[inst.RB]);
+      break;
+    case 266:  // addx
+      ppc_state.gpr[inst.RD] = ppc_state.gpr[inst.RA] + ppc_state.gpr[inst.RB];
+      if (inst.Rc)
+        FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RD]);
+      break;
+    case 316:  // xorx
+      ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] ^ ppc_state.gpr[inst.RB];
+      if (inst.Rc)
+        FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+      break;
+    case 444:  // orx
+      ppc_state.gpr[inst.RA] = ppc_state.gpr[inst.RS] | ppc_state.gpr[inst.RB];
+      if (inst.Rc)
+        FastUpdateCR0(ppc_state, ppc_state.gpr[inst.RA]);
+      break;
+    default:
+      break;
+    }
+    break;
+  default:
+    break;
+  }
+
+  if ((ppc_state.Exceptions & EXCEPTION_DSI) != 0)
+  {
+    ppc_state.pc = current_pc;
+    power_pc.CheckExceptions();
+    return 0;
+  }
+
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+static bool FastCheckFpuAvailable(PowerPC::PowerPCState& ppc_state,
+                                  PowerPC::PowerPCManager& power_pc, u32 current_pc)
+{
+  if (ppc_state.msr.FP)
+    return true;
+
+  ppc_state.pc = current_pc;
+  ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
+  power_pc.CheckExceptions();
+  return false;
+}
+
+static bool IsFiniteFastFloatOperand(u64 value)
+{
+  return (value & Common::DOUBLE_EXP) != Common::DOUBLE_EXP;
+}
+
+static void SetFastFI(PowerPC::PowerPCState& ppc_state, u32 fi)
+{
+  if (fi != 0)
+    SetFPException(ppc_state, FPSCR_XX);
+  ppc_state.fpscr.FI = fi;
+}
+
+static bool TryFastRamFloatLoadStore(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                     UGeckoInstruction inst)
+{
+  const bool indexed = inst.OPCD == 31;
+  const bool load_single = inst.OPCD == 48 || (indexed && inst.SUBOP10 == 535);
+  const bool load_double = inst.OPCD == 50;
+  const bool store_single = inst.OPCD == 52 || (indexed && inst.SUBOP10 == 663);
+  const bool store_integer_word = indexed && inst.SUBOP10 == 983;
+  const bool load = load_single || load_double;
+  const bool store = store_single || store_integer_word;
+  if (!load && !store)
+    return false;
+
+  const u32 address = indexed ?
+                          ((inst.RA ? ppc_state.gpr[inst.RA] : 0) + ppc_state.gpr[inst.RB]) :
+                          (inst.RA ? ppc_state.gpr[inst.RA] + u32(inst.SIMM_16) :
+                                     u32(inst.SIMM_16));
+
+  if ((address & 0b11) != 0)
+  {
+    GenerateAlignmentException(ppc_state, address);
+    return true;
+  }
+
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 offset = address & 0x3fffffff;
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  const u32 bytes = load_double ? sizeof(u64) : sizeof(u32);
+  const bool in_ram =
+      !ppc_state.msr.LE && ram != nullptr && offset < ram_size && ram_size - offset >= bytes;
+
+  if (load_single)
+  {
+    const u32 value = in_ram ? ReadRamU32BE(ram, offset) : system.GetMMU().Read<u32>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+      ppc_state.ps[inst.FD].Fill(ConvertToDouble(value));
+
+    if (indexed)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_lfsx_ops);
+    else
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_lfs_ops);
+  }
+  else if (load_double)
+  {
+    const u64 value = in_ram ? ReadRamU64BE(ram, offset) : system.GetMMU().Read<u64>(address);
+    if ((ppc_state.Exceptions & EXCEPTION_DSI) == 0)
+      ppc_state.ps[inst.FD].SetPS0(value);
+    DOLPHIN_WEB_HOT_COUNT(++s_fast_float_lfd_ops);
+  }
+  else
+  {
+    const u32 value =
+        store_integer_word ? ppc_state.ps[inst.FS].PS0AsU32() :
+                             ConvertToSingle(ppc_state.ps[inst.FS].PS0AsU64());
+    if (in_ram)
+      WriteRamU32BE(ram, offset, value);
+    else
+      system.GetMMU().Write<u32>(value, address);
+
+    if (store_integer_word)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_stfiwx_ops);
+    else if (indexed)
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_stfsx_ops);
+    else
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_stfs_ops);
+  }
+
+  return true;
+}
+
+s32 CachedInterpreter::FastFloat(PowerPC::PowerPCState& ppc_state,
+                                 const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  if (!FastCheckFpuAvailable(ppc_state, power_pc, current_pc))
+    return 0;
+
+  DOLPHIN_WEB_HOT_COUNT(++s_fast_float_ops);
+
+  switch (inst.OPCD)
+  {
+  case 48:  // lfs
+  case 50:  // lfd
+  case 52:  // stfs
+    TryFastRamFloatLoadStore(Core::System::GetInstance(), ppc_state, inst);
+    break;
+  case 31:  // lfsx, stfsx, stfiwx
+    TryFastRamFloatLoadStore(Core::System::GetInstance(), ppc_state, inst);
+    break;
+  case 59:
+    if (inst.SUBOP5 == 20 || inst.SUBOP5 == 21)  // fsubsx, faddsx
+    {
+      const auto& a = ppc_state.ps[inst.FA];
+      const auto& b = ppc_state.ps[inst.FB];
+      const u64 a_bits = a.PS0AsU64();
+      const u64 b_bits = b.PS0AsU64();
+      const bool add = inst.SUBOP5 == 21;
+      if (ppc_state.fpscr.VE == 0 && IsFiniteFastFloatOperand(a_bits) &&
+          IsFiniteFastFloatOperand(b_bits))
+      {
+        const double result_value = add ? std::bit_cast<double>(a_bits) +
+                                             std::bit_cast<double>(b_bits) :
+                                         std::bit_cast<double>(a_bits) -
+                                             std::bit_cast<double>(b_bits);
+        const float result = ForceSingle(ppc_state.fpscr, result_value);
+        ppc_state.ps[inst.FD].Fill(result);
+        ppc_state.UpdateFPRFSingle(result);
+        if (add)
+          DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fadds_ops);
+        else
+          DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fsubs_ops);
+      }
+      else
+      {
+        const FPResult result_value = add ? NI_add(ppc_state, a.PS0AsDouble(), b.PS0AsDouble()) :
+                                           NI_sub(ppc_state, a.PS0AsDouble(), b.PS0AsDouble());
+
+        if (ppc_state.fpscr.VE == 0 || result_value.HasNoInvalidExceptions())
+        {
+          const float result = ForceSingle(ppc_state.fpscr, result_value.value);
+          ppc_state.ps[inst.FD].Fill(result);
+          ppc_state.UpdateFPRFSingle(result);
+        }
+      }
+
+      if (add)
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fadds_ops);
+      else
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fsubs_ops);
+    }
+    else if (inst.SUBOP5 == 25)  // fmulsx
+    {
+      const auto& a = ppc_state.ps[inst.FA];
+      const auto& c = ppc_state.ps[inst.FC];
+      const u64 a_bits = a.PS0AsU64();
+      const u64 c_bits = c.PS0AsU64();
+      if (ppc_state.fpscr.VE == 0 && IsFiniteFastFloatOperand(a_bits) &&
+          IsFiniteFastFloatOperand(c_bits))
+      {
+        const double product =
+            std::bit_cast<double>(a_bits) * Force25Bit(std::bit_cast<double>(c_bits));
+        const float result = ForceSingle(ppc_state.fpscr, product);
+        ppc_state.ps[inst.FD].Fill(result);
+        ppc_state.fpscr.FI = 0;
+        ppc_state.fpscr.FR = 0;
+        ppc_state.UpdateFPRFSingle(result);
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fmuls_ops);
+      }
+      else
+      {
+        const double c_value = Force25Bit(c.PS0AsDouble());
+        const FPResult product = NI_mul(ppc_state, a.PS0AsDouble(), c_value);
+
+        if (ppc_state.fpscr.VE == 0 || product.HasNoInvalidExceptions())
+        {
+          const float result = ForceSingle(ppc_state.fpscr, product.value);
+          ppc_state.ps[inst.FD].Fill(result);
+          ppc_state.fpscr.FI = 0;
+          ppc_state.fpscr.FR = 0;
+          ppc_state.UpdateFPRFSingle(result);
+        }
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fmuls_ops);
+    }
+    else if (inst.SUBOP5 == 29)  // fmaddsx
+    {
+      const auto& a = ppc_state.ps[inst.FA];
+      const auto& b = ppc_state.ps[inst.FB];
+      const auto& c = ppc_state.ps[inst.FC];
+      const u64 a_bits = a.PS0AsU64();
+      const u64 b_bits = b.PS0AsU64();
+      const u64 c_bits = c.PS0AsU64();
+      if (ppc_state.fpscr.VE == 0 && IsFiniteFastFloatOperand(a_bits) &&
+          IsFiniteFastFloatOperand(b_bits) && IsFiniteFastFloatOperand(c_bits))
+      {
+        const double product = std::bit_cast<double>(a_bits) *
+                                   Force25Bit(std::bit_cast<double>(c_bits)) +
+                               std::bit_cast<double>(b_bits);
+        const float result = ForceSingle(ppc_state.fpscr, product);
+        ppc_state.ps[inst.FD].Fill(result);
+        ppc_state.fpscr.FI = product != result;
+        ppc_state.fpscr.FR = 0;
+        ppc_state.UpdateFPRFSingle(result);
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fmadds_ops);
+      }
+      else
+      {
+        const FPResult product =
+            NI_madd<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble());
+
+        if (ppc_state.fpscr.VE == 0 || product.HasNoInvalidExceptions())
+        {
+          const float result = ForceSingle(ppc_state.fpscr, product.value);
+          ppc_state.ps[inst.FD].Fill(result);
+          ppc_state.fpscr.FI = product.value != result;
+          ppc_state.fpscr.FR = 0;
+          ppc_state.UpdateFPRFSingle(result);
+        }
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fmadds_ops);
+    }
+    else if (inst.SUBOP5 == 30)  // fnmsubsx
+    {
+      const auto& a = ppc_state.ps[inst.FA];
+      const auto& b = ppc_state.ps[inst.FB];
+      const auto& c = ppc_state.ps[inst.FC];
+      const u64 a_bits = a.PS0AsU64();
+      const u64 b_bits = b.PS0AsU64();
+      const u64 c_bits = c.PS0AsU64();
+      if (ppc_state.fpscr.VE == 0 && IsFiniteFastFloatOperand(a_bits) &&
+          IsFiniteFastFloatOperand(b_bits) && IsFiniteFastFloatOperand(c_bits))
+      {
+        const double product = std::bit_cast<double>(a_bits) *
+                                   Force25Bit(std::bit_cast<double>(c_bits)) -
+                               std::bit_cast<double>(b_bits);
+        const float tmp = ForceSingle(ppc_state.fpscr, product);
+        const float result = std::isnan(tmp) ? tmp : -tmp;
+        ppc_state.ps[inst.FD].Fill(result);
+        ppc_state.UpdateFPRFSingle(result);
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fnmsubs_ops);
+      }
+      else
+      {
+        const FPResult product =
+            NI_msub<true>(ppc_state, a.PS0AsDouble(), c.PS0AsDouble(), b.PS0AsDouble());
+
+        if (ppc_state.fpscr.VE == 0 || product.HasNoInvalidExceptions())
+        {
+          const float tmp = ForceSingle(ppc_state.fpscr, product.value);
+          const float result = std::isnan(tmp) ? tmp : -tmp;
+          ppc_state.ps[inst.FD].Fill(result);
+          ppc_state.UpdateFPRFSingle(result);
+        }
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fnmsubs_ops);
+    }
+    break;
+  case 63:
+    if (inst.SUBOP10 == 15)  // fctiwzx
+    {
+      const double b = ppc_state.ps[inst.FB].PS0AsDouble();
+      const double rounded = std::trunc(b);
+      if (std::isfinite(b) && rounded >= -2147483648.0 && rounded < 2147483648.0)
+      {
+        const s32 signed_value = static_cast<s32>(rounded);
+        const u32 value = static_cast<u32>(signed_value);
+        const double di = static_cast<double>(signed_value);
+        if (di == b)
+        {
+          ppc_state.fpscr.ClearFIFR();
+        }
+        else
+        {
+          SetFastFI(ppc_state, 1);
+          ppc_state.fpscr.FR = std::fabs(di) > std::fabs(b);
+        }
+
+        u64 result = 0xfff8000000000000ull | value;
+        if (value == 0 && std::signbit(b))
+          result |= 0x100000000ull;
+        ppc_state.ps[inst.FD].SetPS0(result);
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_simple_fctiwz_ops);
+      }
+      else
+      {
+        Interpreter::fctiwzx(Core::System::GetInstance().GetInterpreter(), inst);
+      }
+
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fctiwz_ops);
+    }
+    else if (inst.SUBOP10 == 72)  // fmrx
+    {
+      ppc_state.ps[inst.FD].SetPS0(ppc_state.ps[inst.FB].PS0AsU64());
+      DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fmr_ops);
+    }
+    else if (inst.SUBOP10 == 40 || inst.SUBOP10 == 136 || inst.SUBOP10 == 264)
+    {
+      u64 value = ppc_state.ps[inst.FB].PS0AsU64();
+      if (inst.SUBOP10 == 40)  // fnegx
+      {
+        value ^= UINT64_C(1) << 63;
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fneg_ops);
+      }
+      else if (inst.SUBOP10 == 136)  // fnabsx
+      {
+        value |= UINT64_C(1) << 63;
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fnabs_ops);
+      }
+      else  // fabsx
+      {
+        value &= ~(UINT64_C(1) << 63);
+        DOLPHIN_WEB_HOT_COUNT(++s_fast_float_fabs_ops);
+      }
+      ppc_state.ps[inst.FD].SetPS0(value);
+    }
+    break;
+  default:
+    break;
+  }
+
+  if ((ppc_state.Exceptions & (EXCEPTION_DSI | EXCEPTION_PROGRAM | EXCEPTION_ALIGNMENT)) != 0)
+  {
+    ppc_state.pc = current_pc;
+    power_pc.CheckExceptions();
+    return 0;
+  }
+
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+static bool TryFastAlignedRamOffset(const PowerPC::PowerPCState& ppc_state, const u8* ram,
+                                    u32 ram_size, u32 address, u32 bytes, u32* offset)
+{
+  if (ppc_state.msr.LE || ram == nullptr || (address & 0b11) != 0)
+    return false;
+
+  const u32 candidate = address & 0x3fffffff;
+  if (candidate >= ram_size || ram_size - candidate < bytes)
+    return false;
+
+  *offset = candidate;
+  return true;
+}
+
+static double LoadFastSingleFromRam(const u8* ram, u32 offset)
+{
+  return std::bit_cast<double>(ConvertToDouble(ReadRamU32BE(ram, offset)));
+}
+
+static void StoreFastSingleToRam(u8* ram, u32 offset, double value)
+{
+  WriteRamU32BE(ram, offset, ConvertToSingle(std::bit_cast<u64>(value)));
+}
+
+static double FastSingleAdd(PowerPC::PowerPCState& ppc_state, double lhs, double rhs)
+{
+  const float result = ForceSingle(ppc_state.fpscr, lhs + rhs);
+  ppc_state.UpdateFPRFSingle(result);
+  return result;
+}
+
+static double FastSingleSub(PowerPC::PowerPCState& ppc_state, double lhs, double rhs)
+{
+  const float result = ForceSingle(ppc_state.fpscr, lhs - rhs);
+  ppc_state.UpdateFPRFSingle(result);
+  return result;
+}
+
+static double FastSingleMul(PowerPC::PowerPCState& ppc_state, double lhs, double rhs)
+{
+  const double product = lhs * Force25Bit(rhs);
+  const float result = ForceSingle(ppc_state.fpscr, product);
+  ppc_state.fpscr.FI = 0;
+  ppc_state.fpscr.FR = 0;
+  ppc_state.UpdateFPRFSingle(result);
+  return result;
+}
+
+static double FastSingleMAdd(PowerPC::PowerPCState& ppc_state, double lhs, double rhs,
+                             double addend)
+{
+  const double product = lhs * Force25Bit(rhs) + addend;
+  const float result = ForceSingle(ppc_state.fpscr, product);
+  ppc_state.fpscr.FI = product != result;
+  ppc_state.fpscr.FR = 0;
+  ppc_state.UpdateFPRFSingle(result);
+  return result;
+}
+
+static double FastSingleNMSub(PowerPC::PowerPCState& ppc_state, double lhs, double rhs,
+                              double subtrahend)
+{
+  const double product = lhs * Force25Bit(rhs) - subtrahend;
+  const float tmp = ForceSingle(ppc_state.fpscr, product);
+  const float result = std::isnan(tmp) ? tmp : -tmp;
+  ppc_state.UpdateFPRFSingle(result);
+  return result;
+}
+
+static u64 FastFctiwzResult(PowerPC::PowerPCState& ppc_state, double value)
+{
+  const double rounded = std::trunc(value);
+  u32 result = 0;
+  if (std::isfinite(value) && rounded >= -2147483648.0 && rounded < 2147483648.0)
+  {
+    const s32 signed_value = static_cast<s32>(rounded);
+    result = static_cast<u32>(signed_value);
+    const double converted = static_cast<double>(signed_value);
+    if (converted == value)
+    {
+      ppc_state.fpscr.ClearFIFR();
+    }
+    else
+    {
+      SetFastFI(ppc_state, 1);
+      ppc_state.fpscr.FR = std::fabs(converted) > std::fabs(value);
+    }
+  }
+  else
+  {
+    result = std::signbit(value) ? 0x80000000u : 0x7fffffffu;
+    SetFPException(ppc_state, FPSCR_VXCVI);
+  }
+
+  u64 encoded = 0xfff8000000000000ull | result;
+  if (result == 0 && std::signbit(value))
+    encoded |= 0x100000000ull;
+  return encoded;
+}
+
+s32 CachedInterpreter::FastMeleeIdlePollLoop(PowerPC::PowerPCState& ppc_state,
+                                             const MeleeIdlePollLoopOperands& operands)
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto* const completed_static_links = &operands.links;
+#endif
+#line 9975
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto& [power_pc, current_pc, next_pc, instruction_cycles_per_iteration,
+               instruction_loadstores_per_iteration, static_links] = operands;
+#else
+#line 9975
+  const auto& [power_pc, current_pc, next_pc, instruction_cycles_per_iteration,
+               instruction_loadstores_per_iteration] = operands;
+#endif
+#line 9977
+  (void)power_pc;
+  constexpr s32 fallback_size = sizeof(AnyCallback) + sizeof(operands);
+
+  const u32 pending_exceptions =
+      ppc_state.Exceptions &
+      (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER);
+  if (current_pc != MELEE_IDLE_POLL_LOOP_PC || next_pc != MELEE_IDLE_POLL_LOOP_END_PC ||
+      instruction_cycles_per_iteration == 0 || ppc_state.msr.LE || ppc_state.msr.PR ||
+      pending_exceptions != 0 || !IsOsInterruptModeVerified(OS_INTERRUPT_DISABLE) ||
+      !IsOsInterruptModeVerified(OS_INTERRUPT_RESTORE) || !VerifyMeleeServicePollFunction() ||
+      !VerifyMeleeInputPollNoChangeFunction())
+  {
+    ++s_fast_melee_idle_poll_loop_rejects;
+    return fallback_size;
+  }
+
+  if (s_fast_melee_idle_poll_loop_exits == 0 &&
+      s_fast_melee_idle_poll_loop_blocks > MELEE_IDLE_POLL_LOOP_NO_EXIT_THROTTLE_BLOCKS)
+  {
+    ++s_fast_melee_idle_poll_loop_throttles;
+    return fallback_size;
+  }
+
+  const u32 restore_cycles =
+      (ppc_state.msr.Hex & MSR_EE_MASK) != 0 ? OS_INTERRUPT_RESTORE_ENABLE_CYCLES :
+                                               OS_INTERRUPT_RESTORE_DISABLE_CYCLES;
+  const u32 cycles_per_iteration = instruction_cycles_per_iteration +
+                                   s_fast_melee_service_poll_cycles +
+                                   s_fast_melee_input_poll_cycles + restore_cycles;
+  const u32 loadstores_per_iteration = instruction_loadstores_per_iteration +
+                                       s_fast_melee_service_poll_loadstores +
+                                       s_fast_melee_input_poll_loadstores;
+  if (cycles_per_iteration == 0)
+  {
+    ++s_fast_melee_idle_poll_loop_rejects;
+    return fallback_size;
+  }
+
+  const u32 max_by_downcount =
+      ppc_state.downcount > 0 ?
+          std::max<u32>(1, static_cast<u32>(ppc_state.downcount) / cycles_per_iteration) :
+          1;
+  const u32 max_iterations = std::min(max_by_downcount, MELEE_IDLE_POLL_LOOP_MAX_BATCH);
+
+  u32 iterations = 0;
+  u32 final_status = 0;
+  bool exit_loop = false;
+  bool guard_failed = false;
+  for (; iterations < max_iterations; ++iterations)
+  {
+    u32 si_state = 0;
+    u32 si_pending = 0;
+    const std::optional<u32> raw_status = TryReadFastMeleeStatusResult(ppc_state);
+    const u32 mapped_status = raw_status ? MapFastMeleeStatusDispatchResult(*raw_status) : 0;
+    const bool status_dispatch_returns_early =
+        raw_status && (mapped_status == 0xffffffff || mapped_status == 5);
+    if (!status_dispatch_returns_early ||
+        !TryReadFastMeleeSiPollWords(&si_state, &si_pending) || si_state != 0 ||
+        si_pending != 0)
+    {
+      guard_failed = true;
+      break;
+    }
+
+    u32 old_high = 0;
+    u32 old_low = 0;
+    u32 new_high = 0;
+    u32 new_low = 0;
+    u32 status = 0;
+    if (!TryReadFastMeleeInputPollNoChangeWords(&old_high, &old_low, &new_high, &new_low) ||
+        old_high != new_high || old_low != new_low ||
+        !TryReadFastMeleeInputStatusByte(ppc_state, &status))
+    {
+      guard_failed = true;
+      break;
+    }
+
+    final_status = status & 0xff;
+    if (final_status != 0)
+    {
+      ++iterations;
+      exit_loop = true;
+      break;
+    }
+  }
+
+  if (iterations == 0)
+  {
+    ++s_fast_melee_idle_poll_loop_fallbacks;
+    return fallback_size;
+  }
+
+  const u32 cycles = cycles_per_iteration * iterations;
+  const u32 loadstores = loadstores_per_iteration * iterations;
+  ppc_state.gpr[0] = current_pc + sizeof(u32);
+  ppc_state.gpr[3] = final_status;
+  ppc_state.gpr[27] = final_status;
+  LR(ppc_state) = current_pc + 2 * sizeof(u32);
+  FastUpdateCR0(ppc_state, final_status);
+  ppc_state.npc = exit_loop ? next_pc : current_pc;
+  ppc_state.pc = ppc_state.npc;
+  ppc_state.downcount -= static_cast<int>(cycles);
+  UpdatePerformanceMonitorIfNeeded(cycles, loadstores, 0, ppc_state);
+
+  ++s_fast_melee_idle_poll_loop_blocks;
+  s_fast_melee_idle_poll_loop_iterations =
+      SaturatingAddU32(s_fast_melee_idle_poll_loop_iterations, iterations);
+  s_fast_melee_service_poll_inline_ops =
+      SaturatingAddU32(s_fast_melee_service_poll_inline_ops, iterations);
+  s_fast_melee_input_poll_inline_ops =
+      SaturatingAddU32(s_fast_melee_input_poll_inline_ops, iterations);
+  if (exit_loop)
+    ++s_fast_melee_idle_poll_loop_exits;
+  if (guard_failed)
+    ++s_fast_melee_idle_poll_loop_fallbacks;
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  StaticExitLinks::Publish(&ppc_state, completed_static_links);
+#endif
+#line 10092
+  return 0;
+}
+
+s32 CachedInterpreter::FastMeleeTitleLoop(PowerPC::PowerPCState& ppc_state,
+                                          const MeleeTitleLoopOperands& operands)
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto* const completed_static_links = &operands.links;
+#endif
+#line 10098
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto& [power_pc, current_pc, next_pc, cycle_count_per_iteration,
+               loadstores_per_iteration, fp_inst_per_iteration, static_links] = operands;
+#else
+#line 10098
+  const auto& [power_pc, current_pc, next_pc, cycle_count_per_iteration,
+               loadstores_per_iteration, fp_inst_per_iteration] = operands;
+#endif
+#line 10100
+  (void)power_pc;
+  constexpr s32 fallback_size = sizeof(AnyCallback) + sizeof(operands);
+
+  auto& system = Core::System::GetInstance();
+  u8* ram = system.GetMemory().GetRAM();
+  const u32 ram_size = system.GetMemory().GetRamSizeReal();
+  const u32 ctr_initial = CTR(ppc_state);
+  if (!ppc_state.msr.FP || ppc_state.msr.LE || ram == nullptr || ctr_initial == 0 ||
+      ctr_initial > 512 || cycle_count_per_iteration == 0 || ppc_state.fpscr.VE != 0)
+  {
+    ++s_fast_melee_title_loop_rejects;
+    return fallback_size;
+  }
+
+  const u32 max_by_downcount =
+      ppc_state.downcount > 0 ?
+          std::max<u32>(1, static_cast<u32>(ppc_state.downcount) / cycle_count_per_iteration) :
+          1;
+  const u32 iterations = std::min(ctr_initial, max_by_downcount);
+  const bool cr7_eq = ppc_state.cr.GetBit(30) != 0;
+
+  auto check_u32 = [&](u32 address) {
+    u32 offset = 0;
+    return TryFastAlignedRamOffset(ppc_state, ram, ram_size, address, sizeof(u32), &offset);
+  };
+  auto check_u64 = [&](u32 address) {
+    u32 offset = 0;
+    return TryFastAlignedRamOffset(ppc_state, ram, ram_size, address, sizeof(u64), &offset);
+  };
+
+  u32 pre_r3 = ppc_state.gpr[3];
+  u32 pre_r9 = ppc_state.gpr[9];
+  u32 pre_r10 = ppc_state.gpr[10];
+  u32 pre_r11 = ppc_state.gpr[11];
+  u32 pre_r12 = ppc_state.gpr[12];
+  u32 pre_r18 = ppc_state.gpr[18];
+  u32 pre_r19 = ppc_state.gpr[19];
+  u32 pre_r20 = ppc_state.gpr[20];
+  u32 pre_r21 = ppc_state.gpr[21];
+  u32 pre_r28 = ppc_state.gpr[28];
+  for (u32 i = 0; i < iterations; ++i)
+  {
+    if (!cr7_eq && !check_u32(pre_r28))
+    {
+      ++s_fast_melee_title_loop_rejects;
+      return fallback_size;
+    }
+
+    pre_r3 += 4;
+    if (!check_u32(pre_r3) || !check_u32(pre_r3 - 4) || !check_u32(ppc_state.gpr[1] + 0x54) ||
+        !check_u64(ppc_state.gpr[1] + 0x50) || !check_u32(ppc_state.gpr[7] + pre_r21) ||
+        !check_u32(ppc_state.gpr[8] + pre_r19) || !check_u32(ppc_state.gpr[7] + pre_r20) ||
+        !check_u32(ppc_state.gpr[8] + pre_r18) || !check_u32(ppc_state.gpr[17] + pre_r12) ||
+        !check_u32(ppc_state.gpr[17] + pre_r11) || !check_u32(ppc_state.gpr[6] + pre_r10) ||
+        !check_u32(ppc_state.gpr[6] + pre_r9))
+    {
+      ++s_fast_melee_title_loop_rejects;
+      return fallback_size;
+    }
+
+    if (!cr7_eq)
+    {
+      pre_r28 += 4;
+      if (pre_r28 == ppc_state.gpr[22])
+        pre_r28 = ppc_state.gpr[27];
+    }
+
+    pre_r21 += 4;
+    pre_r20 += 4;
+    pre_r19 += 4;
+    pre_r18 += 4;
+    if (pre_r21 == ppc_state.gpr[26])
+      pre_r21 = 0;
+    if (pre_r20 == ppc_state.gpr[26])
+      pre_r20 = 0;
+    if (pre_r19 == ppc_state.gpr[25])
+      pre_r19 = 0;
+    if (pre_r18 == ppc_state.gpr[25])
+      pre_r18 = 0;
+    pre_r12 += 4;
+    pre_r11 += 4;
+    if (pre_r12 == ppc_state.gpr[24])
+      pre_r12 = 0;
+    if (pre_r11 == ppc_state.gpr[24])
+      pre_r11 = 0;
+    pre_r10 += 4;
+    pre_r9 += 4;
+    if (pre_r10 == ppc_state.gpr[23])
+      pre_r10 = 0;
+    if (pre_r9 == ppc_state.gpr[23])
+      pre_r9 = 0;
+  }
+
+  auto offset_u32 = [&](u32 address) {
+    u32 offset = 0;
+    const bool ok =
+        TryFastAlignedRamOffset(ppc_state, ram, ram_size, address, sizeof(u32), &offset);
+    ASSERT(ok);
+    return offset;
+  };
+  auto offset_u64 = [&](u32 address) {
+    u32 offset = 0;
+    const bool ok =
+        TryFastAlignedRamOffset(ppc_state, ram, ram_size, address, sizeof(u64), &offset);
+    ASSERT(ok);
+    return offset;
+  };
+
+  u32 r3 = ppc_state.gpr[3];
+  u32 r9 = ppc_state.gpr[9];
+  u32 r10 = ppc_state.gpr[10];
+  u32 r11 = ppc_state.gpr[11];
+  u32 r12 = ppc_state.gpr[12];
+  u32 r18 = ppc_state.gpr[18];
+  u32 r19 = ppc_state.gpr[19];
+  u32 r20 = ppc_state.gpr[20];
+  u32 r21 = ppc_state.gpr[21];
+  u32 r28 = ppc_state.gpr[28];
+  u32 r29 = ppc_state.gpr[29];
+  u32 r31 = ppc_state.gpr[31];
+
+  double f2 = ppc_state.ps[2].PS0AsDouble();
+  double f3 = ppc_state.ps[3].PS0AsDouble();
+  double f4 = ppc_state.ps[4].PS0AsDouble();
+  double f5 = ppc_state.ps[5].PS0AsDouble();
+  double f6 = ppc_state.ps[6].PS0AsDouble();
+  double f7 = ppc_state.ps[7].PS0AsDouble();
+  double f8 = ppc_state.ps[8].PS0AsDouble();
+  double f9 = ppc_state.ps[9].PS0AsDouble();
+  double f10 = ppc_state.ps[10].PS0AsDouble();
+  double f11 = ppc_state.ps[11].PS0AsDouble();
+  double f12 = ppc_state.ps[12].PS0AsDouble();
+  double f13 = ppc_state.ps[13].PS0AsDouble();
+  double f14 = ppc_state.ps[14].PS0AsDouble();
+  double f15 = ppc_state.ps[15].PS0AsDouble();
+  double f16 = ppc_state.ps[16].PS0AsDouble();
+  double f17 = ppc_state.ps[17].PS0AsDouble();
+  double f18 = ppc_state.ps[18].PS0AsDouble();
+  const double f19 = ppc_state.ps[19].PS0AsDouble();
+  const double f20 = ppc_state.ps[20].PS0AsDouble();
+  u64 f14_int = ppc_state.ps[14].PS0AsU64();
+  u32 ctr = ctr_initial;
+
+  for (u32 i = 0; i < iterations; ++i)
+  {
+    f13 = f12;
+    if (!cr7_eq)
+    {
+      const u32 address = r28;
+      f13 = LoadFastSingleFromRam(ram, offset_u32(address));
+      r28 += 4;
+      SetFastCompareField(ppc_state, 0, static_cast<s32>(r28), static_cast<s32>(ppc_state.gpr[22]));
+      StoreFastSingleToRam(ram, offset_u32(address), f12);
+      if (r28 == ppc_state.gpr[22])
+        r28 = ppc_state.gpr[27];
+    }
+
+    f8 = FastSingleMAdd(ppc_state, f19, f15, f13);
+    r3 += 4;
+    r29 = ReadRamU32BE(ram, offset_u32(r3));
+    f9 = FastSingleMAdd(ppc_state, f20, f16, f13);
+    StoreFastSingleToRam(ram, offset_u32(ppc_state.gpr[7] + r21), f8);
+    r21 += 4;
+    StoreFastSingleToRam(ram, offset_u32(ppc_state.gpr[8] + r19), f9);
+    f14 = LoadFastSingleFromRam(ram, offset_u32(ppc_state.gpr[7] + r20));
+    r20 += 4;
+    f16 = LoadFastSingleFromRam(ram, offset_u32(ppc_state.gpr[8] + r18));
+    SetFastCompareField(ppc_state, 0, static_cast<s32>(r21), static_cast<s32>(ppc_state.gpr[26]));
+    SetFastCompareField(ppc_state, 1, static_cast<s32>(r20), static_cast<s32>(ppc_state.gpr[26]));
+    r19 += 4;
+    r18 += 4;
+    f15 = f14;
+    f14 = FastSingleAdd(ppc_state, f14, f16);
+    SetFastCompareField(ppc_state, 5, static_cast<s32>(r19), static_cast<s32>(ppc_state.gpr[25]));
+    SetFastCompareField(ppc_state, 6, static_cast<s32>(r18), static_cast<s32>(ppc_state.gpr[25]));
+    if (r21 == ppc_state.gpr[26])
+      r21 = 0;
+
+    r29 ^= 0x80000000u;
+    f9 = FastSingleMAdd(ppc_state, f2, f17, f14);
+    if (r20 == ppc_state.gpr[26])
+      r20 = 0;
+    WriteRamU32BE(ram, offset_u32(ppc_state.gpr[1] + 0x54), r29);
+    if (r19 == ppc_state.gpr[25])
+      r19 = 0;
+    StoreFastSingleToRam(ram, offset_u32(ppc_state.gpr[17] + r12), f9);
+    f14 = FastSingleNMSub(ppc_state, f2, f9, f17);
+    r12 += 4;
+    if (r18 == ppc_state.gpr[25])
+      r18 = 0;
+    f17 = LoadFastSingleFromRam(ram, offset_u32(ppc_state.gpr[17] + r11));
+    SetFastCompareField(ppc_state, 5, static_cast<s32>(r12), static_cast<s32>(ppc_state.gpr[24]));
+    r11 += 4;
+    SetFastCompareField(ppc_state, 6, static_cast<s32>(r11), static_cast<s32>(ppc_state.gpr[24]));
+    if (r12 == ppc_state.gpr[24])
+      r12 = 0;
+    if (r11 == ppc_state.gpr[24])
+      r11 = 0;
+
+    f14 = FastSingleMul(ppc_state, f14, f6);
+    f10 = std::bit_cast<double>(ReadRamU64BE(ram, offset_u64(ppc_state.gpr[1] + 0x50)));
+    f14 = FastSingleMAdd(ppc_state, f11, f7, f14);
+    f9 = FastSingleMAdd(ppc_state, f2, f18, f14);
+    f7 = f14;
+    StoreFastSingleToRam(ram, offset_u32(ppc_state.gpr[6] + r10), f9);
+    f14 = FastSingleNMSub(ppc_state, f2, f9, f18);
+    f8 = FastSingleMul(ppc_state, f4, f12);
+    f18 = LoadFastSingleFromRam(ram, offset_u32(ppc_state.gpr[6] + r9));
+    r10 += 4;
+    r9 += 4;
+    f14 = FastSingleMAdd(ppc_state, f3, f14, f8);
+    SetFastCompareField(ppc_state, 5, static_cast<s32>(r10), static_cast<s32>(ppc_state.gpr[23]));
+    SetFastCompareField(ppc_state, 6, static_cast<s32>(r9), static_cast<s32>(ppc_state.gpr[23]));
+    f14_int = FastFctiwzResult(ppc_state, f14);
+    if (r10 == ppc_state.gpr[23])
+      r10 = 0;
+    if (r9 == ppc_state.gpr[23])
+      r9 = 0;
+    r31 = 0xfffffffc;
+    f12 = FastSingleSub(ppc_state, f10, f5);
+    WriteRamU32BE(ram, offset_u32(r3 + r31), static_cast<u32>(f14_int));
+
+    --ctr;
+  }
+
+  ppc_state.gpr[3] = r3;
+  ppc_state.gpr[9] = r9;
+  ppc_state.gpr[10] = r10;
+  ppc_state.gpr[11] = r11;
+  ppc_state.gpr[12] = r12;
+  ppc_state.gpr[18] = r18;
+  ppc_state.gpr[19] = r19;
+  ppc_state.gpr[20] = r20;
+  ppc_state.gpr[21] = r21;
+  ppc_state.gpr[28] = r28;
+  ppc_state.gpr[29] = r29;
+  ppc_state.gpr[31] = r31;
+  CTR(ppc_state) = ctr;
+
+  ppc_state.ps[7].SetPS0(f7);
+  ppc_state.ps[8].Fill(f8);
+  ppc_state.ps[9].Fill(f9);
+  ppc_state.ps[10].SetPS0(f10);
+  ppc_state.ps[12].Fill(f12);
+  ppc_state.ps[13].SetPS0(f13);
+  ppc_state.ps[14].SetPS0(f14_int);
+  ppc_state.ps[15].SetPS0(f15);
+  ppc_state.ps[16].Fill(f16);
+  ppc_state.ps[17].Fill(f17);
+  ppc_state.ps[18].Fill(f18);
+
+  const u32 cycles = cycle_count_per_iteration * iterations;
+  ppc_state.npc = ctr == 0 ? next_pc : current_pc;
+  ppc_state.pc = ppc_state.npc;
+  ppc_state.downcount -= static_cast<int>(cycles);
+  UpdatePerformanceMonitorIfNeeded(cycles, loadstores_per_iteration * iterations,
+                                   fp_inst_per_iteration * iterations, ppc_state);
+
+  ++s_fast_melee_title_loop_blocks;
+  s_fast_melee_title_loop_iterations =
+      SaturatingAddU32(s_fast_melee_title_loop_iterations, iterations);
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  StaticExitLinks::Publish(&ppc_state, completed_static_links);
+#endif
+#line 10361
+  return 0;
+}
+
+s32 CachedInterpreter::FastOsInterruptFunction(PowerPC::PowerPCState& ppc_state,
+                                               const OsInterruptFunctionOperands& operands)
+{
+  const auto& [power_pc, current_pc, mode, cycles_primary, cycles_secondary] = operands;
+  ppc_state.pc = current_pc;
+  ppc_state.npc = LR(ppc_state) & ~3u;
+
+  if (ppc_state.msr.PR)
+  {
+    GenerateProgramException(ppc_state, ProgramExceptionCause::PrivilegedInstruction);
+    power_pc.CheckExceptions();
+    return 0;
+  }
+
+  const u32 old_msr = ppc_state.msr.Hex;
+  u32 new_msr = old_msr;
+  u32 cycles = cycles_primary;
+
+  switch (mode)
+  {
+  case OS_INTERRUPT_DISABLE:
+    new_msr = old_msr & ~MSR_EE_MASK;
+    ppc_state.gpr[3] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[4] = new_msr;
+    ++s_fast_os_interrupt_disable_ops;
+    break;
+  case OS_INTERRUPT_ENABLE:
+    new_msr = old_msr | MSR_EE_MASK;
+    ppc_state.gpr[3] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[4] = new_msr;
+    ++s_fast_os_interrupt_enable_ops;
+    break;
+  case OS_INTERRUPT_RESTORE:
+    if (ppc_state.gpr[3] != 0)
+    {
+      new_msr = old_msr | MSR_EE_MASK;
+    }
+    else
+    {
+      new_msr = old_msr & ~MSR_EE_MASK;
+      cycles = cycles_secondary;
+    }
+    ppc_state.gpr[4] = (old_msr & MSR_EE_MASK) ? 1 : 0;
+    ppc_state.gpr[5] = new_msr;
+    ++s_fast_os_interrupt_restore_ops;
+    break;
+  default:
+    return 0;
+  }
+
+  ppc_state.msr.Hex = new_msr;
+  if ((new_msr & MSR_EE_MASK) != 0 &&
+      (ppc_state.Exceptions &
+       (EXCEPTION_EXTERNAL_INT | EXCEPTION_PERFORMANCE_MONITOR | EXCEPTION_DECREMENTER)) != 0)
+  {
+    power_pc.CheckExceptions();
+  }
+
+  ppc_state.pc = ppc_state.npc;
+  ppc_state.downcount -= static_cast<int>(cycles);
+  UpdatePerformanceMonitorIfNeeded(cycles, 0, 0, ppc_state);
+  return 0;
+}
+
+s32 CachedInterpreter::FastOsInterruptCallBranch(PowerPC::PowerPCState& ppc_state,
+                                                 const OsInterruptFunctionOperands& operands)
+{
+  const auto& [power_pc, current_pc, mode, cycles_primary, cycles_secondary] = operands;
+  const u32 function_pc = GetOsInterruptTargetPc(mode);
+  const u32 return_pc = current_pc + sizeof(u32);
+
+  LR(ppc_state) = return_pc;
+  if (function_pc == 0 ||
+      !ExecuteFastOsInterruptInline(ppc_state, power_pc, function_pc, return_pc, mode,
+                                    cycles_primary, cycles_secondary))
+  {
+    ppc_state.pc = current_pc;
+    ppc_state.npc = function_pc;
+    ++s_fast_os_interrupt_inline_fallbacks;
+  }
+
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMeleeInputStatusCallBranch(PowerPC::PowerPCState& ppc_state,
+                                                      const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)inst;
+  ExecuteFastMeleeInputStatusInline(ppc_state, power_pc, current_pc);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMeleeStatusFunctionCallBranch(
+    PowerPC::PowerPCState& ppc_state, const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)power_pc;
+  (void)inst;
+  ExecuteFastMeleeStatusInline(ppc_state, current_pc);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMeleeServicePollCallBranch(PowerPC::PowerPCState& ppc_state,
+                                                      const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)power_pc;
+  (void)inst;
+  ExecuteFastMeleeServicePollInline(ppc_state, current_pc);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMeleeSiPollNoEventCallBranch(PowerPC::PowerPCState& ppc_state,
+                                                        const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)power_pc;
+  (void)inst;
+  ExecuteFastMeleeSiPollNoEventInline(ppc_state, current_pc);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastMeleeInputPollNoChangeCallBranch(
+    PowerPC::PowerPCState& ppc_state, const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  (void)power_pc;
+  (void)inst;
+  ExecuteFastMeleeInputPollNoChangeInline(ppc_state, current_pc);
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+static void ExecuteDcbxCacheOperation(Core::System& system, PowerPC::PowerPCState& ppc_state,
+                                      UGeckoInstruction inst, u32 address)
+{
+  if (!ppc_state.m_enable_dcache)
+  {
+    system.GetJitInterface().InvalidateICacheLine(address);
+  }
+  else if (inst.SUBOP10 == 54)
+  {
+    system.GetMMU().StoreDCacheLine(address);
+  }
+  else if (inst.SUBOP10 == 86)
+  {
+    system.GetMMU().FlushDCacheLine(address);
+  }
+  else
+  {
+    system.GetMMU().InvalidateDCacheLine(address);
+  }
+}
+
+s32 CachedInterpreter::FastDcbx(PowerPC::PowerPCState& ppc_state,
+                                const FastInstructionOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst] = operands;
+  auto& system = Core::System::GetInstance();
+  const u32 address = (inst.RA ? ppc_state.gpr[inst.RA] : 0) + ppc_state.gpr[inst.RB];
+
+  if (inst.SUBOP10 == 470 && ppc_state.msr.PR)
+  {
+    GeneratePrivilegedFastInstructionException(ppc_state, current_pc);
+  }
+  else
+  {
+    ExecuteDcbxCacheOperation(system, ppc_state, inst, address);
+  }
+
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+s32 CachedInterpreter::FastDcbxLoop(PowerPC::PowerPCState& ppc_state,
+                                    const DcbxLoopOperands& operands)
+{
+  const auto& [power_pc, current_pc, inst, cycle_count_per_loop, count_gpr, loop_mode] = operands;
+  auto& system = Core::System::GetInstance();
+  const u32 address = ppc_state.gpr[inst.RB];
+
+  if (inst.SUBOP10 == 470 && ppc_state.msr.PR)
+  {
+    GeneratePrivilegedFastInstructionException(ppc_state, current_pc);
+  }
+  else if (!ppc_state.m_enable_dcache)
+  {
+    u32 extra_iterations = 0;
+    if (ppc_state.downcount > 0)
+    {
+      const u32 max_by_cycles = static_cast<u32>(ppc_state.downcount) / cycle_count_per_loop;
+      if (loop_mode == DCBX_LOOP_COUNT_GPR)
+      {
+        const u32 remaining_bytes = ppc_state.gpr[count_gpr];
+        const u32 max_by_count = static_cast<s32>(remaining_bytes) > 0 ?
+                                     (remaining_bytes - 1) / 32 :
+                                     0;
+        extra_iterations = std::min(max_by_cycles, max_by_count);
+      }
+      else
+      {
+        const u32 max_by_ctr = ppc_state.spr[SPR_CTR] - 1;
+        extra_iterations = std::min(max_by_cycles, max_by_ctr);
+      }
+    }
+
+    const u32 line_count = extra_iterations + 1;
+    bool skipped_large_data_flush = false;
+#ifdef __EMSCRIPTEN__
+    // Large dcb* sweeps are overwhelmingly data-buffer flushes in the browser path. Keeping small
+    // invalidations preserves the self-modifying-code heuristic while avoiding multi-megabyte
+    // block-cache scans in hot post-boot loops. Additionally, when the experimental WASM JIT is
+    // not active (interpreter-only mode), there are no compiled blocks to invalidate, so every
+    // invalidation is wasted work - skip them all.
+    skipped_large_data_flush =
+        !s_wasm_jit_enabled || line_count > LARGE_DCBX_DATA_FLUSH_SKIP_LINES;
+#endif
+    if (skipped_large_data_flush)
+    {
+      ++s_fast_dcbx_loop_skipped_large_invalidations;
+      s_fast_dcbx_loop_skipped_large_lines =
+          SaturatingAddU32(s_fast_dcbx_loop_skipped_large_lines, line_count);
+    }
+    else
+    {
+      system.GetJitInterface().InvalidateICacheLines(address, line_count);
+    }
+
+    if (extra_iterations != 0)
+    {
+      const u32 extra_cycles = extra_iterations * cycle_count_per_loop;
+      ppc_state.gpr[inst.RB] += extra_iterations * 32;
+      if (loop_mode == DCBX_LOOP_COUNT_GPR)
+        ppc_state.gpr[count_gpr] -= extra_iterations * 32;
+      else
+        ppc_state.spr[SPR_CTR] -= extra_iterations;
+      ppc_state.downcount -= static_cast<int>(extra_cycles);
+      UpdatePerformanceMonitorIfNeeded(extra_cycles, extra_iterations, 0, ppc_state);
+    }
+
+    ++s_fast_dcbx_loop_blocks;
+    s_fast_dcbx_loop_extra_iterations =
+        SaturatingAddU32(s_fast_dcbx_loop_extra_iterations, extra_iterations);
+    s_fast_dcbx_loop_lines = SaturatingAddU32(s_fast_dcbx_loop_lines, line_count);
+  }
+  else
+  {
+    ExecuteDcbxCacheOperation(system, ppc_state, inst, address);
+  }
+
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+#ifdef __EMSCRIPTEN__
+DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE s32 CachedInterpreter::RunWasmBlock(
+    PowerPC::PowerPCState& ppc_state, const WasmBlockOperands& operands)
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  const auto* const completed_static_links = &operands.links;
+#endif
+#line 10620
+  using WasmBlockFunction = int (*)(int);
+
+  ++s_wasm_block_run_count;
+  const int halted =
+      reinterpret_cast<WasmBlockFunction>(static_cast<std::uintptr_t>(operands.handle))(
+          static_cast<int>(reinterpret_cast<std::uintptr_t>(&ppc_state)));
+  if (halted)
+  {
+    if (halted & WASM_SIDE_EXIT_FLAG)
+    {
+      const u32 cycles = static_cast<u32>(halted) & ~WASM_SIDE_EXIT_FLAG;
+      ppc_state.pc = ppc_state.npc;
+      ppc_state.downcount -= cycles;
+      UpdatePerformanceMonitorIfNeeded(cycles, 0, 0, ppc_state);
+    }
+    return 0;
+  }
+  if (operands.end_block)
+  {
+    ppc_state.pc = ppc_state.npc;
+    ppc_state.downcount -= operands.downcount;
+    UpdatePerformanceMonitorIfNeeded(operands.downcount, operands.num_load_stores,
+                                     operands.num_fp_inst, ppc_state);
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    StaticExitLinks::Publish(&ppc_state, completed_static_links);
+#endif
+#line 10634
+    return 0;
+  }
+  return sizeof(AnyCallback) + sizeof(operands);
+}
+
+bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
+{
+  // §28ce burst smearing: when ENABLED (gate bit CLEARED), reject early if
+  // we've already burned this slice's compile budget. Falls to Interpret;
+  // next slice will re-attempt this block (one extra Interpret cost per
+  // deferred compile is far cheaper than a multi-hundred-ms freeze).
+  if (!DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_COMPILE_THROTTLE))
+  {
+    if (s_wasm_compiles_this_slice >= COMPILE_THROTTLE_MAX_PER_SLICE ||
+        s_wasm_compile_us_this_slice >= COMPILE_THROTTLE_MAX_US_PER_SLICE)
+    {
+      s_wasm_compile_throttle_reject_count.fetch_add(1, std::memory_order_relaxed);
+      s_deferred_wasm_queues[this].Defer(js.blockStart,
+          static_cast<u32>(m_ppc_state.feature_flags), js.curBlock->normalEntry);
+      return false;
+    }
+  }
+  // §28ca: lever-gated min-prefix. Default 4. When bit 21 is CLEARED
+  // (?shortprefix=1), drop to 2 so short blocks that currently fall to
+  // Interpret<false> (54% of attempts in the §28bz audit) compile instead.
+  const u32 MIN_WASM_PREFIX_INSTRUCTIONS =
+      DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_SHORT_PREFIX) ? 4u : 2u;
+
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASMBLOCK))
+    return false;
+  if (!s_wasm_jit_enabled)
+    return false;
+
+  if (IsProfilingEnabled())
+  {
+    LogWasmBlockReject("profiling", nullptr, 0, js.blockStart, code_block.m_num_instructions);
+    return false;
+  }
+  if (jo.memcheck)
+  {
+    LogWasmBlockReject("memcheck", nullptr, 0, js.blockStart, code_block.m_num_instructions);
+    return false;
+  }
+  if (code_block.m_num_instructions == 0)
+  {
+    LogWasmBlockReject("empty", nullptr, 0, js.blockStart, code_block.m_num_instructions);
+    return false;
+  }
+  if (code_block.m_num_instructions >= 4 &&
+      m_code_buffer[0].address == MELEE_IDLE_POLL_LOOP_PC &&
+      m_code_buffer[0].inst.hex == 0x4be74829 &&
+      m_code_buffer[1].address == 0x801a4dac &&
+      m_code_buffer[1].inst.hex == 0x4be74ae9 &&
+      m_code_buffer[2].address == 0x801a4db0 &&
+      m_code_buffer[2].inst.hex == 0x547b063f &&
+      m_code_buffer[3].address == 0x801a4db4 &&
+      m_code_buffer[3].inst.hex == 0x4182fff4)
+  {
+    LogWasmBlockReject("melee-idle-poll-loop", m_code_buffer[0].opinfo,
+                       m_code_buffer[0].inst.hex, m_code_buffer[0].address,
+                       code_block.m_num_instructions);
+    return false;
+  }
+
+  ++s_wasm_block_attempt_count;
+  if (!s_wasm_jit_direct_only && s_wasm_block_mixed_compile_count >= MAX_WASM_MIXED_COMPILED_BLOCKS)
+    return false;
+
+  auto& power_pc = m_system.GetPowerPC();
+  auto& cpu = m_system.GetCPU();
+  auto& breakpoints = power_pc.GetBreakPoints();
+
+  u32 prefix_downcount = 0;
+  u32 prefix_count = 0;
+  u32 prefix_loadstores = 0;
+  u32 prefix_fpinst = 0;
+  bool prefix_ended_block = false;
+  for (u32 i = 0; i < code_block.m_num_instructions; ++i)
+  {
+    const PPCAnalyst::CodeOp& op = m_code_buffer[i];
+    if (HLE::TryReplaceFunction(m_ppc_symbol_db, op.address, PowerPC::CoreMode::JIT))
+    {
+      if (prefix_count == 0)
+        LogWasmBlockReject("hle", op.opinfo, op.inst.hex, op.address, code_block.m_num_instructions);
+      break;
+    }
+
+    if (IsDebuggingEnabled() && !cpu.IsStepping() && breakpoints.IsAddressBreakPoint(op.address))
+    {
+      if (prefix_count == 0)
+        LogWasmBlockReject("breakpoint", op.opinfo, op.inst.hex, op.address,
+                           code_block.m_num_instructions);
+      break;
+    }
+
+    if (op.branchIsIdleLoop)
+    {
+      if (prefix_count == 0)
+        LogWasmBlockReject("idle", op.opinfo, op.inst.hex, op.address, code_block.m_num_instructions);
+      break;
+    }
+
+    if (s_wasm_jit_direct_only && (op.opinfo->flags & FL_USE_FPU) != 0 && !m_ppc_state.msr.FP)
+    {
+      ++s_wasm_direct_tier_reject_count;
+      ++s_wasm_direct_reject_key_counts[(op.inst.OPCD << 10) | op.inst.SUBOP10];
+      if (prefix_count == 0)
+        LogWasmBlockReject("direct-tier-fp-off", op.opinfo, op.inst.hex, op.address,
+                           code_block.m_num_instructions);
+      break;
+    }
+
+    if (s_wasm_jit_direct_only && !IsPpcWasmDirectInstructionCandidate(op))
+    {
+      ++s_wasm_direct_tier_reject_count;
+      ++s_wasm_direct_reject_key_counts[(op.inst.OPCD << 10) | op.inst.SUBOP10];
+      if (prefix_count == 0)
+        LogWasmBlockReject("direct-tier", op.opinfo, op.inst.hex, op.address,
+                           code_block.m_num_instructions);
+      break;
+    }
+
+    prefix_downcount += op.opinfo->num_cycles;
+    if (op.opinfo->flags & FL_LOADSTORE)
+      ++prefix_loadstores;
+    if (op.opinfo->flags & FL_USE_FPU)
+      ++prefix_fpinst;
+    ++prefix_count;
+
+    if (op.canEndBlock)
+    {
+      if (i + 1 < code_block.m_num_instructions && IsWasmSideExitBranch(op) &&
+          op.branchTo != js.blockStart &&
+          !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_SIDE_EXITS))
+      {
+        continue;
+      }
+      prefix_ended_block = true;
+      break;
+    }
+  }
+
+  ++s_wasm_prefix_histogram[std::min<std::size_t>(prefix_count,
+                                                  s_wasm_prefix_histogram.size() - 1)];
+  s_wasm_prefix_instruction_sum =
+      SaturatingAddU32(s_wasm_prefix_instruction_sum, prefix_count);
+  s_wasm_prefix_instruction_max = std::max(s_wasm_prefix_instruction_max, prefix_count);
+  std::vector<PPCAnalyst::CodeOp> merge_storage;
+  bool did_merge = false;
+  u32 merge_downcount = 0, merge_loadstores = 0, merge_fpinst = 0, merge_next_pc = 0;
+  bool merge_write_npc = false;
+  if (prefix_count < MIN_WASM_PREFIX_INSTRUCTIONS)
+  {
+    ++s_wasm_block_too_short_count;
+    if (prefix_ended_block)
+      ++s_wasm_block_too_short_end_count;
+    // §28bx adjacent-block merge (gated DEFAULT-OFF). When a block was
+    // rejected only because a plain unconditional bx (not bl, not idle,
+    // not self) to a compile-time-constant target ended it short, analyze
+    // that successor and — if the combined region is a CLEAN fused block
+    // clearing MIN — emit BOTH original blocks as one WASM function (the
+    // bx is elided; the unconditional A→B edge needs no npc write).
+    // downcount is the SUM (prefix_downcount already counts the bx cycles);
+    // B's terminator / merge_write_npc governs the exit. B's physical
+    // address ranges are unioned into code_block so icbi/dcbi on EITHER
+    // source range invalidates the merged block (the #1 hazard).
+    // §28cx N-block straight-line chain merge. Generalizes the single A→B
+    // fuse into A→B→C→… across successive eligible unconditional bx edges.
+    // Eliding an unconditional bx is fully recoverable: its only semantic
+    // effect is "npc = target" (+ its cycles, already in downcount). If we
+    // continue into the target we append the block MINUS its bx; if the chain
+    // STOPS before a pending target T we set merge_next_pc=T, merge_write_npc
+    // =true to reproduce the elided bx exactly. Every included block's
+    // physical address ranges are unioned into code_block for invalidation.
+    constexpr u32 MERGE_MAX_CHAIN_BLOCKS = 8;  // bound module size + analyze cost
+    constexpr u32 MERGE_MAX_CHAIN_OPS = 64;
+    if (!DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_BLOCK_MERGE) && prefix_ended_block &&
+        prefix_count >= 2)
+    {
+      const PPCAnalyst::CodeOp& term = m_code_buffer[prefix_count - 1];
+      const bool term_eligible = term.inst.OPCD == 18 && !term.inst.LK &&
+                                 !term.branchIsIdleLoop && term.branchTo != 0xFFFFFFFFu &&
+                                 term.branchTo != js.blockStart && term.branchTo != term.address;
+      if (term_eligible)
+      {
+        // seed: A without its bx
+        std::vector<u32> visited_starts;
+        visited_starts.push_back(js.blockStart);
+        merge_storage.reserve((prefix_count - 1) + 16);
+        for (u32 a = 0; a + 1 < prefix_count; ++a)
+          merge_storage.push_back(m_code_buffer[a]);
+        merge_downcount = prefix_downcount;  // already includes A's bx cycles
+        merge_loadstores = prefix_loadstores;
+        merge_fpinst = prefix_fpinst;
+        u32 cur_target = term.branchTo;
+        u32 chain_blocks = 0;
+        bool chained_ok = false;  // included >=1 target block
+        bool finalized = false;   // terminus block appended with its own terminator
+        while (true)
+        {
+          bool visited = false;
+          for (u32 v : visited_starts)
+          {
+            if (v == cur_target)
+            {
+              visited = true;
+              break;
+            }
+          }
+          if (visited || chain_blocks >= MERGE_MAX_CHAIN_BLOCKS ||
+              merge_storage.size() >= MERGE_MAX_CHAIN_OPS)
+          {
+            merge_next_pc = cur_target;
+            merge_write_npc = true;  // elision recovery
+            break;
+          }
+          PPCAnalyst::CodeBuffer c_buffer(m_code_buffer.size());
+          PPCAnalyst::CodeBlock c_block;
+          const u32 c_next = analyzer.Analyze(cur_target, &c_block, &c_buffer, c_buffer.size());
+          if (c_block.m_memory_exception || c_block.m_num_instructions == 0)
+          {
+            merge_next_pc = cur_target;
+            merge_write_npc = true;
+            break;
+          }
+          // validate + scan this block (same guard set as the original B-walk)
+          u32 c_count = 0, c_dc = 0, c_ls = 0, c_fp = 0;
+          bool c_ended = false, c_ok = true;
+          for (u32 j = 0; j < c_block.m_num_instructions; ++j)
+          {
+            const PPCAnalyst::CodeOp& cop = c_buffer[j];
+            if (HLE::TryReplaceFunction(m_ppc_symbol_db, cop.address, PowerPC::CoreMode::JIT) ||
+                (IsDebuggingEnabled() && !cpu.IsStepping() &&
+                 breakpoints.IsAddressBreakPoint(cop.address)) ||
+                cop.branchIsIdleLoop ||
+                (s_wasm_jit_direct_only && (cop.opinfo->flags & FL_USE_FPU) != 0 &&
+                 !m_ppc_state.msr.FP) ||
+                (s_wasm_jit_direct_only && !IsPpcWasmDirectInstructionCandidate(cop)))
+            {
+              c_ok = false;
+              break;
+            }
+            c_dc += cop.opinfo->num_cycles;
+            if (cop.opinfo->flags & FL_LOADSTORE)
+              ++c_ls;
+            if (cop.opinfo->flags & FL_USE_FPU)
+              ++c_fp;
+            ++c_count;
+            if (cop.canEndBlock)
+            {
+              c_ended = true;
+              break;
+            }
+          }
+          const bool c_entire = c_ok && c_count == c_block.m_num_instructions;
+          if (!c_ok || c_count == 0 || !(c_entire || c_ended) ||
+              merge_storage.size() + c_count > MERGE_MAX_CHAIN_OPS)
+          {
+            merge_next_pc = cur_target;
+            merge_write_npc = true;  // can't include T → recover
+            break;
+          }
+          // T is includable
+          visited_starts.push_back(cur_target);
+          chained_ok = true;
+          ++chain_blocks;
+          // does T itself end in an eligible unconditional bx we can chain through?
+          const PPCAnalyst::CodeOp& c_term = c_buffer[c_count - 1];
+          const bool c_term_eligible =
+              c_ended && c_term.inst.OPCD == 18 && !c_term.inst.LK && !c_term.branchIsIdleLoop &&
+              c_term.branchTo != 0xFFFFFFFFu && c_term.branchTo != cur_target &&
+              c_term.branchTo != c_term.address;
+          bool c_next_visited = false;
+          if (c_term_eligible)
+          {
+            for (u32 v : visited_starts)
+            {
+              if (v == c_term.branchTo)
+              {
+                c_next_visited = true;
+                break;
+              }
+            }
+          }
+          const bool can_continue = c_term_eligible && !c_next_visited &&
+                                    (chain_blocks < MERGE_MAX_CHAIN_BLOCKS) &&
+                                    (merge_storage.size() + (c_count - 1) < MERGE_MAX_CHAIN_OPS);
+          // union T's physical addresses (invalidation correctness — every included block)
+          for (auto it = c_block.m_physical_addresses.begin();
+               it != c_block.m_physical_addresses.end(); ++it)
+          {
+            const auto range = *it;
+            code_block.m_physical_addresses.insert(range.first, range.second);
+          }
+          merge_loadstores += c_ls;
+          merge_fpinst += c_fp;
+          merge_downcount += c_dc;
+          if (can_continue)
+          {
+            for (u32 j = 0; j + 1 < c_count; ++j)
+              merge_storage.push_back(c_buffer[j]);  // drop T's bx
+            cur_target = c_term.branchTo;
+            continue;
+          }
+          else
+          {
+            for (u32 j = 0; j < c_count; ++j)
+              merge_storage.push_back(c_buffer[j]);  // keep terminator
+            merge_next_pc = c_next;
+            merge_write_npc = c_entire && !c_ended;  // fall-through writes npc; branch-ended does not
+            finalized = true;
+            break;
+          }
+        }
+        if (chained_ok && merge_storage.size() >= MIN_WASM_PREFIX_INSTRUCTIONS)
+        {
+          did_merge = true;
+        }
+        else
+        {
+          merge_storage.clear();  // discard partial; A falls to interpret
+          did_merge = false;
+        }
+        (void)finalized;
+      }
+    }
+    if (!did_merge)
+      return false;
+  }
+
+  const bool compiled_entire_block =
+      !did_merge && prefix_count == code_block.m_num_instructions;
+  const bool compiled_block_ends_with_branch = !did_merge && prefix_ended_block;
+
+  const auto state_base = reinterpret_cast<std::uintptr_t>(&m_ppc_state);
+  const WasmStateLayout layout = {
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.npc) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_ppc_state.gpr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_ppc_state.ps) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_ppc_state.cr.fields) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_ppc_state.spr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.msr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.fpscr) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.feature_flags) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.pagetable_update_pending) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.xer_ca) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.xer_so_ov) - state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.xer_stringctrl) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.m_enable_dcache) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.gather_pipe_ptr) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.gather_pipe_base_ptr) -
+                       state_base),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_system.GetMemory().GetRAM())),
+      m_system.GetMemory().GetRamSizeReal(),
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(m_system.GetMemory().GetL1Cache())),
+      m_system.GetMemory().GetL1CacheSize(),
+  };
+  s_wasm_downcount_offset =
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.downcount) - state_base);
+  const bool write_npc =
+      did_merge ? merge_write_npc : (compiled_entire_block && !compiled_block_ends_with_branch);
+  const std::span<const PPCAnalyst::CodeOp> ops =
+      did_merge ? std::span<const PPCAnalyst::CodeOp>{merge_storage.data(), merge_storage.size()}
+                : std::span<const PPCAnalyst::CodeOp>{m_code_buffer.data(), prefix_count};
+  const u32 block_next_pc = did_merge ? merge_next_pc : nextPC;
+  const std::vector<u8> bytes =
+      BuildWasmCachedInterpreterBlock(ops, layout, block_next_pc, write_npc,
+                                      !s_wasm_jit_direct_only, true,
+                                      did_merge || prefix_ended_block,
+                                      did_merge || DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASM_LOOPS) ?
+                                          0 :
+                                          js.blockStart);
+  if (bytes.empty())
+  {
+    LogWasmBlockReject("emit", nullptr, 0, js.blockStart, code_block.m_num_instructions);
+    return false;
+  }
+
+  const auto read_u32_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU32));
+  const auto write_u32_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU32));
+  const auto read_u8_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU8));
+  const auto write_u8_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU8));
+  const auto read_u16_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterReadU16));
+  const auto write_u16_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterWriteU16));
+  const auto lfs_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterLfs));
+  const auto stfs_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterStfs));
+  const auto lfd_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterLfd));
+  const auto fmr_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFmr));
+  const auto system_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterSystem));
+  const auto fp_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFpOp));
+  const auto fctiwz_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFctiwz));
+  const auto interpret_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterInterpret));
+  const auto fastcheck_gpfifo_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastCheckGatherPipe));
+  const auto fast_os_interrupt_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastOsInterruptCall));
+  const auto fast_melee_input_status_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeInputStatusCall));
+  const auto fast_melee_status_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeStatusCall));
+  const auto fast_melee_service_poll_call_index = static_cast<int>(
+      reinterpret_cast<std::uintptr_t>(&DolphinWeb_CachedInterpreterFastMeleeServicePollCall));
+  const auto cache_key = DolphinWeb_MakeWasmBlockCacheKey(bytes);
+  const int handle = DolphinWeb_CachedInterpreterCompileWasmBlock(
+      bytes.data(), static_cast<int>(bytes.size()), cache_key.data(), read_u32_index,
+      write_u32_index, read_u8_index, write_u8_index, read_u16_index, write_u16_index, lfs_index,
+      stfs_index, lfd_index, fmr_index, system_index, fp_index, fctiwz_index, interpret_index,
+      fastcheck_gpfifo_index, fast_os_interrupt_call_index, fast_melee_input_status_call_index,
+      fast_melee_status_call_index, fast_melee_service_poll_call_index);
+  if (handle <= 0)
+  {
+    ++s_wasm_block_compile_fail_count;
+    LogWasmBlockReject("compile", nullptr, 0, js.blockStart, code_block.m_num_instructions);
+    return false;
+  }
+
+  ++s_wasm_block_compile_count;
+  if (did_merge)
+    ++s_wasm_block_merge_count;
+  if (did_merge || compiled_entire_block || compiled_block_ends_with_branch)
+    ++s_wasm_block_full_compile_count;
+  else
+    ++s_wasm_block_partial_compile_count;
+  if (!s_wasm_jit_direct_only)
+    ++s_wasm_block_mixed_compile_count;
+  const u32 eff_downcount = did_merge ? merge_downcount : prefix_downcount;
+  const u32 eff_loadstores = did_merge ? merge_loadstores : prefix_loadstores;
+  const u32 eff_fpinst = did_merge ? merge_fpinst : prefix_fpinst;
+  js.downcountAmount = eff_downcount;
+  js.numLoadStoreInst = eff_loadstores;
+  js.numFloatingPointInst = eff_fpinst;
+  // Merged regions are always a clean fused end block (B covers all of B
+  // or ends in a branch) — never the partial non-fused tail below.
+  const bool fuse_end_block =
+      did_merge || compiled_entire_block || compiled_block_ends_with_branch;
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  StaticExitLinks::Descriptor static_links;
+  if (fuse_end_block)
+  {
+    if (write_npc)
+      static_links = StaticExitLinks::Fallthrough(block_next_pc);
+    else
+    {
+      const auto terminal = std::find_if(ops.rbegin(), ops.rend(),
+                                         [](const auto& op) { return !op.skip; });
+      if (terminal != ops.rend() && terminal->canEndBlock)
+        static_links = StaticExitLinks::Branch(terminal->inst.hex, terminal->address);
+    }
+  }
+  auto* const emitted = reinterpret_cast<WasmBlockOperands*>(
+      GetWritableCodePtr() + sizeof(AnyCallback));
+  Write(RunWasmBlock,
+        {handle, block_next_pc, eff_downcount, eff_loadstores, eff_fpinst,
+         static_cast<s32>(fuse_end_block ? 1 : 0), static_links});
+  if (!HasWriteFailed())
+    RegisterStaticExitLinks(&emitted->links);
+#else
+#line 11081
+  Write(RunWasmBlock,
+        {handle, block_next_pc, eff_downcount, eff_loadstores, eff_fpinst,
+         static_cast<s32>(fuse_end_block ? 1 : 0)});
+#endif
+#line 11084
+
+  if (fuse_end_block)
+    return true;
+
+  auto& interpreter = m_system.GetInterpreter();
+  for (u32 i = prefix_count; i < code_block.m_num_instructions; i++)
+  {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    const u32 static_link_op_index = i;
+#endif
+#line 11091
+    PPCAnalyst::CodeOp& op = m_code_buffer[i];
+    js.op = &op;
+
+    js.compilerPC = op.address;
+    js.instructionsLeft = (code_block.m_num_instructions - 1) - i;
+    js.downcountAmount += op.opinfo->num_cycles;
+    if (op.opinfo->flags & FL_LOADSTORE)
+      ++js.numLoadStoreInst;
+    if (op.opinfo->flags & FL_USE_FPU)
+      ++js.numFloatingPointInst;
+
+    if (HandleFunctionHooking(js.compilerPC))
+      break;
+
+    if (!op.skip)
+    {
+      if (IsDebuggingEnabled() && !cpu.IsStepping() &&
+          breakpoints.IsAddressBreakPoint(js.compilerPC))
+      {
+        Write(CheckBreakpoint, {power_pc, js.compilerPC, js.downcountAmount});
+      }
+      if (!js.firstFPInstructionFound && (op.opinfo->flags & FL_USE_FPU) != 0)
+      {
+        Write(CheckFPU, {power_pc, js.compilerPC, js.downcountAmount});
+        js.firstFPInstructionFound = true;
+      }
+
+      if ((jo.memcheck && (op.opinfo->flags & FL_LOADSTORE) != 0) ||
+          (!op.canEndBlock && ShouldHandleFPExceptionForInstruction(&op)))
+      {
+        const InterpretAndCheckExceptionsOperands operands = {
+            {interpreter, Interpreter::GetInterpreterOp(op.inst), js.compilerPC, op.inst},
+            power_pc,
+            js.downcountAmount};
+        Write(op.canEndBlock ? CallbackCast(InterpretAndCheckExceptions<true>) :
+                               CallbackCast(InterpretAndCheckExceptions<false>),
+              operands);
+      }
+      else
+      {
+        TryWriteMeleeIdlePollLoop(i, power_pc);
+        TryWriteMeleeTitleLoop(i, power_pc);
+        TryWriteOsInterruptFunction(i, power_pc);
+        if (!TryWriteDcbxLoop(i, power_pc) && !TryWriteFastInstruction(op, power_pc))
+        {
+          const InterpretOperands operands = {interpreter, Interpreter::GetInterpreterOp(op.inst),
+                                              js.compilerPC, op.inst};
+          Write(op.canEndBlock ? CallbackCast(Interpret<true>) : CallbackCast(Interpret<false>),
+                operands);
+        }
+      }
+
+      if (op.branchIsIdleLoop)
+        Write(CheckIdle, {m_system.GetCoreTiming(), js.blockStart});
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+      if (op.canEndBlock)
+        WriteEndBlock(i == static_link_op_index ?
+                          StaticExitLinks::Branch(op.inst.hex, op.address) :
+                          StaticExitLinks::Descriptor{});
+#else
+#line 11145
+      if (op.canEndBlock)
+        WriteEndBlock();
+#endif
+#line 11147
+    }
+  }
+  if (code_block.m_broken)
+  {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    Write(WriteBrokenBlockNPC, {nextPC});
+    WriteEndBlock(StaticExitLinks::Fallthrough(nextPC));
+#else
+#line 11151
+    Write(WriteBrokenBlockNPC, {nextPC});
+    WriteEndBlock();
+#endif
+#line 11153
+  }
+  return true;
+}
+
+extern "C" u32 GetPpcWasmBlockCompileCount()
+{
+  return s_wasm_block_compile_count;
+}
+
+extern "C" u32 GetPpcWasmBlockRunCount()
+{
+  return s_wasm_block_run_count;
+}
+
+namespace
+{
+void ApplyRequestedWasmPolicy(CachedInterpreter& cpu)
+{
+  const int requested = s_requested_wasm_policy.load(std::memory_order_acquire);
+  if (s_wasm_policy_owner == &cpu &&
+      requested == s_applied_wasm_policy.load(std::memory_order_relaxed))
+    return;
+  const bool next_enabled = requested != 0;
+  if (next_enabled && (!s_wasm_jit_enabled || s_wasm_policy_owner != &cpu))
+  {
+    s_fast_os_interrupt_verified_modes = 0;
+    s_fast_melee_input_status_verified = false;
+    s_fast_melee_input_status_cycles = 0;
+    s_fast_melee_input_status_loadstores = 0;
+    s_fast_melee_status_fn_verified = false;
+    s_fast_melee_service_poll_verified = false;
+    s_fast_melee_service_poll_cycles = 0;
+    s_fast_melee_service_poll_loadstores = 0;
+    s_fast_melee_si_poll_verified = false;
+    s_fast_melee_si_poll_cycles = 0;
+    s_fast_melee_si_poll_loadstores = 0;
+    s_fast_melee_input_poll_verified = false;
+    s_fast_melee_input_poll_cycles = 0;
+    s_fast_melee_input_poll_loadstores = 0;
+  }
+  s_wasm_jit_enabled = next_enabled;
+  s_wasm_jit_direct_only = requested < 2;
+  // Drop code generated under the previous policy, including pre-JIT fallbacks
+  // and compiled callbacks when disabling. Never clear an executing callback.
+  cpu.ClearCache();
+  s_wasm_policy_owner = &cpu;
+  s_applied_wasm_policy.store(requested, std::memory_order_release);
+}
+}
+
+extern "C" void SetPpcWasmJitEnabled(int enabled)
+{
+  s_requested_wasm_policy.store(enabled <= 0 ? 0 : enabled < 2 ? 1 : 2,
+                                std::memory_order_release);
+}
+
+extern "C" void SetPpcProfileEnabled(int enabled)
+{
+  const bool next_enabled = enabled != 0;
+  if (next_enabled && !s_ppc_block_profile_enabled)
+    ResetPpcBlockProfile();
+  s_ppc_block_profile_enabled = next_enabled;
+  DolphinWeb::WasmTimingProfile::SetEnabled(next_enabled);
+}
+
+extern "C" const char* GetPpcProfileStats()
+{
+  static std::string stats;
+  static u32 last_refresh_total_blocks = 0;
+  constexpr u32 STATS_REFRESH_BLOCKS = 1000000;
+
+  if (!s_ppc_block_profile_enabled)
+  {
+    stats.clear();
+    return stats.c_str();
+  }
+
+  if (!stats.empty() &&
+      s_ppc_profile_total_blocks - last_refresh_total_blocks < STATS_REFRESH_BLOCKS)
+  {
+    return stats.c_str();
+  }
+  last_refresh_total_blocks = s_ppc_profile_total_blocks;
+
+  std::vector<PpcBlockProfileEntry> hot_blocks;
+  hot_blocks.reserve(16);
+  for (const PpcBlockProfileEntry& entry : s_ppc_profile_entries)
+  {
+    if (entry.count != 0)
+      hot_blocks.push_back(entry);
+  }
+
+  const std::size_t top_count = std::min<std::size_t>(hot_blocks.size(), 8);
+  std::partial_sort(hot_blocks.begin(), hot_blocks.begin() + top_count, hot_blocks.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                      if (lhs.total_us != rhs.total_us)
+                        return lhs.total_us > rhs.total_us;
+                      return lhs.count > rhs.count;
+                    });
+
+  std::ostringstream out;
+  const u32 average_us = s_ppc_profile_window_sample_blocks == 0 ?
+                             0 :
+                             s_ppc_profile_window_total_us / s_ppc_profile_window_sample_blocks;
+  out << "ppcprof blocks:" << s_ppc_profile_total_blocks
+      << " samples:" << s_ppc_profile_sample_blocks
+      << " window:" << s_ppc_profile_window_sample_blocks
+      << " rate:" << (PPC_PROFILE_SAMPLE_MASK + 1) << " avg:" << average_us
+      << "us max:" << s_ppc_profile_window_max_us
+      << "us col:" << s_ppc_profile_window_collision_count;
+
+  for (std::size_t i = 0; i < top_count; ++i)
+  {
+    const PpcBlockProfileEntry& entry = hot_blocks[i];
+    const u32 block_average_us = entry.count == 0 ? 0 : entry.total_us / entry.count;
+    out << " | pc" << std::hex << entry.pc << std::dec << ":" << entry.count << "/"
+        << entry.total_us << "us avg:" << block_average_us << " max:" << entry.max_us << " "
+        << DescribePpcProfilePc(entry.pc);
+  }
+
+  stats = out.str();
+  ResetPpcBlockProfileWindow();
+  return stats.c_str();
+}
+
+extern "C" const char* GetPpcWasmHelperStats()
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  static StaticExitLinks::Stats::Snapshot static_link_snapshot;
+  static u64 static_link_last_sequence = ~u64{0};
+  if (const auto published = s_static_link_stats.Read())
+    static_link_snapshot = *published;
+#endif
+#line 11280
+  static std::string stats;
+  static int last_refresh_policy = -1;
+  const int applied_policy = s_applied_wasm_policy.load(std::memory_order_acquire);
+  static u32 last_refresh_block_run_count = 0;
+  static u32 last_refresh_block_attempt_count = 0;
+  static u32 last_refresh_block_compile_count = 0;
+  static u32 last_refresh_direct_tier_reject_count = 0;
+  static u32 last_refresh_too_short_count = 0;
+  static u32 last_refresh_dcbx_loop_blocks = 0;
+  static u32 last_refresh_idle_poll_loop_blocks = 0;
+  static u64 last_refresh_fallback_dispatch_total = 0;
+  constexpr u32 STATS_REFRESH_BLOCK_RUNS = 1000;
+  const JitFallbackDispatchStats fallback_dispatch = GetJitFallbackDispatchStats();
+  const u64 fallback_dispatch_total =
+      fallback_dispatch.hit + fallback_dispatch.empty_miss + fallback_dispatch.collision_miss;
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  if (!stats.empty() && applied_policy == last_refresh_policy &&
+      s_wasm_block_run_count - last_refresh_block_run_count < STATS_REFRESH_BLOCK_RUNS &&
+      s_wasm_block_attempt_count == last_refresh_block_attempt_count &&
+      s_wasm_block_compile_count == last_refresh_block_compile_count &&
+      s_wasm_direct_tier_reject_count == last_refresh_direct_tier_reject_count &&
+      s_wasm_block_too_short_count == last_refresh_too_short_count &&
+      s_fast_dcbx_loop_blocks == last_refresh_dcbx_loop_blocks &&
+      s_fast_melee_idle_poll_loop_blocks == last_refresh_idle_poll_loop_blocks &&
+      fallback_dispatch_total == last_refresh_fallback_dispatch_total &&
+      static_link_snapshot.sequence == static_link_last_sequence)
+#else
+#line 11296
+  if (!stats.empty() && applied_policy == last_refresh_policy &&
+      s_wasm_block_run_count - last_refresh_block_run_count < STATS_REFRESH_BLOCK_RUNS &&
+      s_wasm_block_attempt_count == last_refresh_block_attempt_count &&
+      s_wasm_block_compile_count == last_refresh_block_compile_count &&
+      s_wasm_direct_tier_reject_count == last_refresh_direct_tier_reject_count &&
+      s_wasm_block_too_short_count == last_refresh_too_short_count &&
+      s_fast_dcbx_loop_blocks == last_refresh_dcbx_loop_blocks &&
+      s_fast_melee_idle_poll_loop_blocks == last_refresh_idle_poll_loop_blocks &&
+      fallback_dispatch_total == last_refresh_fallback_dispatch_total)
+#endif
+#line 11305
+  {
+    return stats.c_str();
+  }
+  last_refresh_policy = applied_policy;
+  last_refresh_block_run_count = s_wasm_block_run_count;
+  last_refresh_block_attempt_count = s_wasm_block_attempt_count;
+  last_refresh_block_compile_count = s_wasm_block_compile_count;
+  last_refresh_direct_tier_reject_count = s_wasm_direct_tier_reject_count;
+  last_refresh_too_short_count = s_wasm_block_too_short_count;
+  last_refresh_dcbx_loop_blocks = s_fast_dcbx_loop_blocks;
+  last_refresh_idle_poll_loop_blocks = s_fast_melee_idle_poll_loop_blocks;
+  last_refresh_fallback_dispatch_total = fallback_dispatch_total;
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  static_link_last_sequence = static_link_snapshot.sequence;
+#endif
+#line 11317
+
+  std::vector<std::pair<u32, u32>> hot_keys;
+  hot_keys.reserve(16);
+
+  for (std::size_t key = 0; key < s_wasm_helper_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_helper_key_counts[key];
+    if (count != 0)
+      hot_keys.emplace_back(count, static_cast<u32>(key));
+  }
+
+  const std::size_t top_count = std::min<std::size_t>(hot_keys.size(), 8);
+  std::partial_sort(hot_keys.begin(), hot_keys.begin() + top_count, hot_keys.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+
+  std::ostringstream out;
+  out << (applied_policy < 2 ? "tier:guarded " : "tier:mixed ");
+  out << "hotcounts:" << (DOLPHIN_WEB_HOT_COUNTERS ? "on " : "off ");
+  const u32 average_prefix =
+      s_wasm_block_attempt_count == 0 ? 0 : s_wasm_prefix_instruction_sum / s_wasm_block_attempt_count;
+  out << "jit attempts:" << s_wasm_block_attempt_count
+      << " compiled:" << s_wasm_block_compile_count
+      << " full:" << s_wasm_block_full_compile_count
+      << " partial:" << s_wasm_block_partial_compile_count
+      << " mixed:" << s_wasm_block_mixed_compile_count << "/" << MAX_WASM_MIXED_COMPILED_BLOCKS
+      << " short:" << s_wasm_block_too_short_count << "/" << s_wasm_block_too_short_end_count
+      << " merge:" << s_wasm_block_merge_count
+      << " regalloc:" << s_wasm_regalloc_dead_store_skip_count
+      << " emitfail:" << s_wasm_block_emit_fail_count
+      << " compilefail:" << s_wasm_block_compile_fail_count
+      << " pre:" << average_prefix << "/" << s_wasm_prefix_instruction_max
+      << " hist:" << s_wasm_prefix_histogram[0] << "," << s_wasm_prefix_histogram[1] << ","
+      << s_wasm_prefix_histogram[2] << "," << s_wasm_prefix_histogram[3] << ","
+      << s_wasm_prefix_histogram[4] << " ";
+  // §28bz audit: per-block-compile averages for state_ptr traffic (proxy for GPR/FPR
+  // promotion EV). Compute avg per compiled block — runtime cost = avg × block_run_count.
+  const u32 compiles_for_avg = std::max<u32>(s_wasm_block_compile_count, 1);
+  out << "stateu32:" << s_wasm_emit_state_load_u32_count << "ld/"
+      << s_wasm_emit_state_store_u32_count << "st"
+      << "(avg " << (s_wasm_emit_state_load_u32_count / compiles_for_avg) << "/"
+      << (s_wasm_emit_state_store_u32_count / compiles_for_avg) << ") "
+      << "statef64:" << s_wasm_emit_state_load_f64_count << "ld/"
+      << s_wasm_emit_state_store_f64_count << "st "
+      << "statei64:" << s_wasm_emit_state_load_i64_count << "ld/"
+      << s_wasm_emit_state_store_i64_count << "st ";
+  // §28bz audit: §28bt re-dispatch chain depth. Avg chain length = 1 + iter/entry.
+#if DOLPHIN_WEB_HOT_COUNTERS
+  const u32 entries_for_avg = std::max<u32>(s_wasm_redispatch_entry_count, 1);
+  // u64 cast: iter * 100 can overflow u32 at long runs (728M × 100 > 4.29B).
+  const u32 chain_depth_x100 = static_cast<u32>(
+      100u + (static_cast<u64>(s_wasm_redispatch_iter_count) * 100u) / entries_for_avg);
+  out << "redispatch:" << s_wasm_redispatch_entry_count << "ent/"
+      << s_wasm_redispatch_iter_count << "iter(avgx100:" << chain_depth_x100 << ") ";
+#endif
+  // §28cd spike audit: WebAssembly.Module + Instance synchronous wall time on
+  // the pthread CPU loop. Module = full JIT compile, Instance = link/instantiate.
+  // Both block the game loop. Hits/misses tell us cache effectiveness.
+  const u32 module_us_total = s_wasm_module_us_total.load(std::memory_order_relaxed);
+  const u32 module_us_max = s_wasm_module_us_max.load(std::memory_order_relaxed);
+  const u32 instance_us_total = s_wasm_instance_us_total.load(std::memory_order_relaxed);
+  const u32 instance_us_max = s_wasm_instance_us_max.load(std::memory_order_relaxed);
+  const u32 jit_cache_hits = s_wasm_cache_hit_count.load(std::memory_order_relaxed);
+  const u32 jit_cache_misses = s_wasm_cache_miss_count.load(std::memory_order_relaxed);
+  out << "modcompile:" << module_us_total << "us/max" << module_us_max << "us "
+      << "modinst:" << instance_us_total << "us/max" << instance_us_max << "us "
+      << "modcache:" << jit_cache_hits << "hit/" << jit_cache_misses << "miss ";
+  // §28ce burst-smearing stats: throttle reject count + peak burst observed.
+  const u32 throttle_rejects =
+      s_wasm_compile_throttle_reject_count.load(std::memory_order_relaxed);
+  const u32 burst_max =
+      s_wasm_compile_burst_max_per_slice.load(std::memory_order_relaxed);
+  const u32 burst_us_max =
+      s_wasm_compile_us_burst_max_per_slice.load(std::memory_order_relaxed);
+  out << "smearcompile:rej" << throttle_rejects
+      << "/maxN" << burst_max
+      << "/maxUs" << burst_us_max << " ";
+  // §28cn per-slice CPU pthread profiler. maxUs = worst single CoreTiming
+  // slice — if >16000 we blew a frame at 60Hz. runOnlyMaxUs = same but
+  // excluding compile time, so we know whether the spike was compile
+  // burst or actual emulation work.
+  const u32 runloop_count = s_runloop_slice_count.load(std::memory_order_relaxed);
+  const u32 runloop_total = s_runloop_total_us.load(std::memory_order_relaxed);
+  const u32 runloop_max = s_runloop_max_per_slice_us.load(std::memory_order_relaxed);
+  const u32 runloop_runonly_max = s_runloop_max_run_only_us.load(std::memory_order_relaxed);
+  const u32 runloop_avg = runloop_count ? (runloop_total / runloop_count) : 0;
+  const u32 runloop_advance_max = s_runloop_advance_max_us.load(std::memory_order_relaxed);
+  const u32 runloop_exec_max = s_runloop_exec_max_us.load(std::memory_order_relaxed);
+  out << "runloop:" << runloop_count << "slices/avg" << runloop_avg
+      << "us/max" << runloop_max << "us/runOnlyMax" << runloop_runonly_max << "us"
+      << "/advMax" << runloop_advance_max << "us/execMax" << runloop_exec_max << "us ";
+  if (fallback_dispatch.enabled)
+  {
+    out << "fbmap:hit/empty/collision/found/missing:" << fallback_dispatch.hit << "/"
+        << fallback_dispatch.empty_miss << "/" << fallback_dispatch.collision_miss << "/"
+        << fallback_dispatch.slow_found << "/" << fallback_dispatch.slow_missing << " ";
+  }
+  else
+  {
+    out << "fbmap:off ";
+  }
+  const DolphinWeb::WasmTimingProfile::WorstSlice worst_slice =
+      DolphinWeb::WasmTimingProfile::CaptureWorstSlice();
+  out << "sliceprof:total=" << worst_slice.total_us << ",advance=" << worst_slice.advance_us
+      << ",execute=" << worst_slice.execute_us << ",compile=" << worst_slice.compile_us
+      << ",throttle=" << worst_slice.throttle_wait_us << ",dvd=" << worst_slice.dvd_wait_us
+      << ",video=" << worst_slice.video_work_us
+      << ",event=" << DolphinWeb::WasmTimingProfile::EventName(worst_slice.event) << " ";
+  const DolphinWeb::WasmTimingProfile::WorstDvdCompletion& slice_dvd =
+      worst_slice.dvd_completion;
+  out << "slicephase:v=1,throttlesite="
+      << DolphinWeb::WasmTimingProfile::ThrottleSiteName(worst_slice.throttle_site)
+      << ",throttlesiteus=" << worst_slice.throttle_site_us
+      << ",throttlemax=" << worst_slice.throttle_max_us
+      << ",requested=" << worst_slice.throttle_requested_us
+      << ",overshoot=" << worst_slice.throttle_overshoot_us
+      << ",dvdtotal=" << slice_dvd.total_us << ",dvdmap=" << slice_dvd.map_us
+      << ",dvdwait=" << slice_dvd.queue_wait_us << ",dvdpop=" << slice_dvd.queue_pop_us
+      << ",dvdcopy=" << slice_dvd.ram_copy_us
+      << ",dvdfinish=" << slice_dvd.command_finish_us << ",dvdother=" << slice_dvd.other_us
+      << ",dvdbytes=" << slice_dvd.bytes << ",dvdloops=" << slice_dvd.queue_loops << " ";
+  const DolphinWeb::WasmTimingProfile::WorstDvdCompletion worst_dvd =
+      DolphinWeb::WasmTimingProfile::CaptureWorstDvdCompletion();
+  out << "dvdprof:v=1,total=" << worst_dvd.total_us << ",map=" << worst_dvd.map_us
+      << ",wait=" << worst_dvd.queue_wait_us << ",pop=" << worst_dvd.queue_pop_us
+      << ",copy=" << worst_dvd.ram_copy_us << ",finish=" << worst_dvd.command_finish_us
+      << ",other=" << worst_dvd.other_us << ",bytes=" << worst_dvd.bytes
+      << ",loops=" << worst_dvd.queue_loops << " ";
+  const auto emit_throttle_profile = [&out](DolphinWeb::WasmTimingProfile::ThrottleSite site) {
+    const DolphinWeb::WasmTimingProfile::ThrottleProfile profile =
+        DolphinWeb::WasmTimingProfile::CaptureThrottleProfile(site);
+    out << "throttleprof:v=1,site=" << DolphinWeb::WasmTimingProfile::ThrottleSiteName(site)
+        << ",count=" << profile.count << ",slow=" << profile.slow_count
+        << ",total=" << profile.total_actual_us << ",max=" << profile.max_actual_us
+        << ",requested=" << profile.requested_us << ",overshoot=" << profile.overshoot_us << " ";
+  };
+  emit_throttle_profile(DolphinWeb::WasmTimingProfile::ThrottleSite::ViEndField);
+  emit_throttle_profile(DolphinWeb::WasmTimingProfile::ThrottleSite::ViSiPoll);
+  out << "reject:" << s_wasm_direct_tier_reject_count << " ";
+  out << s_wasm_helper_call_count << " calls, " << s_wasm_helper_halt_count << " halt";
+  out << " | imports system:" << s_wasm_system_call_count << " fp:" << s_wasm_fp_call_count
+      << " lfs:" << s_wasm_lfs_call_count << " stfs:" << s_wasm_stfs_call_count
+      << " lfd:" << s_wasm_lfd_call_count << " fmr:" << s_wasm_fmr_call_count
+      << " fctiwz:" << s_wasm_fctiwz_call_count << " psqfast:" << s_wasm_psq_fast_c_count
+      << " gpfifo:" << s_wasm_gpfifo_fastcheck_count;
+  if (s_fast_dcbx_loop_blocks != 0)
+  {
+    out << " | dcbloop blocks:" << s_fast_dcbx_loop_blocks
+        << " lines:" << s_fast_dcbx_loop_lines
+        << " extra:" << s_fast_dcbx_loop_extra_iterations
+        << " skip:" << s_fast_dcbx_loop_skipped_large_invalidations
+        << "/" << s_fast_dcbx_loop_skipped_large_lines;
+  }
+  if (s_fast_float_ops != 0)
+  {
+    out << " | fastfp ops:" << s_fast_float_ops << " fmr:" << s_fast_float_fmr_ops
+        << " fmuls:" << s_fast_float_fmuls_ops << " fmadds:" << s_fast_float_fmadds_ops
+        << " fadds:" << s_fast_float_fadds_ops << " fsubs:" << s_fast_float_fsubs_ops
+        << " fnmsubs:" << s_fast_float_fnmsubs_ops << " fctiwz:" << s_fast_float_fctiwz_ops
+        << " fneg:" << s_fast_float_fneg_ops << " fnabs:" << s_fast_float_fnabs_ops
+        << " fabs:" << s_fast_float_fabs_ops
+        << " lfs:" << s_fast_float_lfs_ops << " lfsx:" << s_fast_float_lfsx_ops
+        << " lfd:" << s_fast_float_lfd_ops << " stfs:" << s_fast_float_stfs_ops
+        << " stfsx:" << s_fast_float_stfsx_ops << " stfiwx:" << s_fast_float_stfiwx_ops
+        << " simple_fmuls:" << s_fast_float_simple_fmuls_ops
+        << " simple_fmadds:" << s_fast_float_simple_fmadds_ops
+        << " simple_fadds:" << s_fast_float_simple_fadds_ops
+        << " simple_fsubs:" << s_fast_float_simple_fsubs_ops
+        << " simple_fnmsubs:" << s_fast_float_simple_fnmsubs_ops
+        << " simple_fctiwz:" << s_fast_float_simple_fctiwz_ops;
+  }
+  if (s_fast_integer_mulli_ops != 0 || s_fast_integer_subfic_ops != 0 ||
+      s_fast_integer_addic_ops != 0 || s_fast_integer_addic_rc_ops != 0)
+  {
+    out << " | fastint mulli:" << s_fast_integer_mulli_ops
+        << " subfic:" << s_fast_integer_subfic_ops
+        << " addic:" << s_fast_integer_addic_ops
+        << " addic_rc:" << s_fast_integer_addic_rc_ops;
+  }
+  if (s_fast_system_isync_ops != 0 || s_fast_system_sync_ops != 0)
+  {
+    out << " | fastsys isync:" << s_fast_system_isync_ops
+        << " sync:" << s_fast_system_sync_ops;
+  }
+  if (s_fast_word_mem_ops != 0)
+  {
+    out << " | fastmem ops:" << s_fast_word_mem_ops << " lwz:" << s_fast_word_mem_lwz_ops
+        << " lwzu:" << s_fast_word_mem_lwzu_ops << " stw:" << s_fast_word_mem_stw_ops
+        << " stwu:" << s_fast_word_mem_stwu_ops << " lwzx:" << s_fast_word_mem_lwzx_ops
+        << " lwzux:" << s_fast_word_mem_lwzux_ops << " stwx:" << s_fast_word_mem_stwx_ops
+        << " stwux:" << s_fast_word_mem_stwux_ops;
+  }
+  // §28cy fastmem-hoist coverage audit (compile-time-only static measurement).
+  out << " fmhoist groups:" << s_fmh_hoistable_groups
+      << " covered:" << s_fmh_covered_accesses << "/total:" << s_fmh_total_dform_accesses
+      << " xform:" << s_fmh_xform_accesses << " blocks:" << s_fmh_blocks_with_hoist;
+  // §28cz runtime fire counters (advance only when ?fastmemhoist=1).
+  out << " fmhfire groups:" << s_fmh_fire_groups << " fast:" << s_fmh_fire_fast
+      << " slow:" << s_fmh_fire_slow;
+  if (s_fast_byte_half_mem_ops != 0 || s_fast_multiword_mem_ops != 0)
+  {
+    out << " | fastmem8_16 ops:" << s_fast_byte_half_mem_ops
+        << " lb:" << s_fast_byte_mem_load_ops << " stb:" << s_fast_byte_mem_store_ops
+        << " lh:" << s_fast_half_mem_load_ops << " sth:" << s_fast_half_mem_store_ops
+        << " mw:" << s_fast_multiword_mem_ops;
+  }
+  if (s_fast_melee_title_loop_compile_attempts != 0 || s_fast_melee_title_loop_blocks != 0 ||
+      s_fast_melee_title_loop_rejects != 0)
+  {
+    out << " | meleeloop attempts:" << s_fast_melee_title_loop_compile_attempts
+        << " crej:" << s_fast_melee_title_loop_compile_rejects
+        << " mm:" << s_fast_melee_title_loop_mismatch_offset << ":"
+        << std::hex << s_fast_melee_title_loop_mismatch_expected << "/"
+        << s_fast_melee_title_loop_mismatch_actual << std::dec
+        << " blocks:" << s_fast_melee_title_loop_blocks
+        << " iters:" << s_fast_melee_title_loop_iterations
+        << " rejects:" << s_fast_melee_title_loop_rejects;
+  }
+  if (s_fast_melee_idle_poll_loop_compile_attempts != 0 ||
+      s_fast_melee_idle_poll_loop_blocks != 0 ||
+      s_fast_melee_idle_poll_loop_rejects != 0 ||
+      s_fast_melee_idle_poll_loop_fallbacks != 0 ||
+      s_fast_melee_idle_poll_loop_throttles != 0)
+  {
+    out << " | fastidlepoll attempts:" << s_fast_melee_idle_poll_loop_compile_attempts
+        << " crej:" << s_fast_melee_idle_poll_loop_compile_rejects
+        << " mm:" << std::hex << s_fast_melee_idle_poll_loop_mismatch_address << ":"
+        << s_fast_melee_idle_poll_loop_mismatch_expected << "/"
+        << s_fast_melee_idle_poll_loop_mismatch_actual << std::dec
+        << " blocks:" << s_fast_melee_idle_poll_loop_blocks
+        << " iters:" << s_fast_melee_idle_poll_loop_iterations
+        << " exits:" << s_fast_melee_idle_poll_loop_exits
+        << " rejects:" << s_fast_melee_idle_poll_loop_rejects
+        << " fallback:" << s_fast_melee_idle_poll_loop_fallbacks
+        << " throttle:" << s_fast_melee_idle_poll_loop_throttles;
+  }
+  if (s_fast_os_interrupt_compile_attempts != 0 || s_fast_os_interrupt_disable_ops != 0 ||
+      s_fast_os_interrupt_enable_ops != 0 || s_fast_os_interrupt_restore_ops != 0 ||
+      s_fast_os_interrupt_inline_ops != 0 || s_fast_os_interrupt_inline_fallbacks != 0)
+  {
+    out << " | fastintr attempts:" << s_fast_os_interrupt_compile_attempts
+        << " crej:" << s_fast_os_interrupt_compile_rejects
+        << " mm:" << std::hex << s_fast_os_interrupt_mismatch_address << ":"
+        << s_fast_os_interrupt_mismatch_expected << "/" << s_fast_os_interrupt_mismatch_actual
+        << std::dec << " dis:" << s_fast_os_interrupt_disable_ops
+        << " en:" << s_fast_os_interrupt_enable_ops
+        << " res:" << s_fast_os_interrupt_restore_ops
+        << " inline:" << s_fast_os_interrupt_inline_ops
+        << " fallback:" << s_fast_os_interrupt_inline_fallbacks;
+  }
+  if (s_fast_melee_input_status_verify_attempts != 0 ||
+      s_fast_melee_input_status_inline_ops != 0 ||
+      s_fast_melee_input_status_inline_fallbacks != 0)
+  {
+    out << " | fastpad verify:" << s_fast_melee_input_status_verify_attempts
+        << "/" << s_fast_melee_input_status_verify_rejects
+        << " inline:" << s_fast_melee_input_status_inline_ops
+        << " fallback:" << s_fast_melee_input_status_inline_fallbacks;
+  }
+  if (s_fast_melee_status_fn_verify_attempts != 0 || s_fast_melee_status_fn_inline_ops != 0 ||
+      s_fast_melee_status_fn_inline_fallbacks != 0)
+  {
+    out << " | faststatus verify:" << s_fast_melee_status_fn_verify_attempts
+        << "/" << s_fast_melee_status_fn_verify_rejects
+        << " inline:" << s_fast_melee_status_fn_inline_ops
+        << " fallback:" << s_fast_melee_status_fn_inline_fallbacks;
+  }
+  if (s_fast_melee_service_poll_verify_attempts != 0 ||
+      s_fast_melee_service_poll_inline_ops != 0 ||
+      s_fast_melee_service_poll_inline_fallbacks != 0)
+  {
+    out << " | fastservice verify:" << s_fast_melee_service_poll_verify_attempts
+        << "/" << s_fast_melee_service_poll_verify_rejects
+        << " inline:" << s_fast_melee_service_poll_inline_ops
+        << " fallback:" << s_fast_melee_service_poll_inline_fallbacks;
+  }
+  if (s_fast_melee_si_poll_verify_attempts != 0 || s_fast_melee_si_poll_inline_ops != 0 ||
+      s_fast_melee_si_poll_inline_fallbacks != 0)
+  {
+    out << " | fastsipoll verify:" << s_fast_melee_si_poll_verify_attempts
+        << "/" << s_fast_melee_si_poll_verify_rejects
+        << " inline:" << s_fast_melee_si_poll_inline_ops
+        << " fallback:" << s_fast_melee_si_poll_inline_fallbacks;
+  }
+  if (s_fast_melee_input_poll_verify_attempts != 0 || s_fast_melee_input_poll_inline_ops != 0 ||
+      s_fast_melee_input_poll_inline_fallbacks != 0)
+  {
+    out << " | fastinputpoll verify:" << s_fast_melee_input_poll_verify_attempts
+        << "/" << s_fast_melee_input_poll_verify_rejects
+        << " inline:" << s_fast_melee_input_poll_inline_ops
+        << " fallback:" << s_fast_melee_input_poll_inline_fallbacks;
+  }
+  if (s_fast_branch_ops != 0)
+  {
+    out << " | fastbranch ops:" << s_fast_branch_ops << " bcx:" << s_fast_branch_bcx_ops
+        << " bx:" << s_fast_branch_bx_ops << " bclr:" << s_fast_branch_bclrx_ops
+        << " bcctr:" << s_fast_branch_bcctrx_ops << " bdnz:" << s_fast_branch_bdnz_ops;
+  }
+
+  std::vector<std::pair<u32, u32>> hot_emit_failures;
+  hot_emit_failures.reserve(8);
+  for (std::size_t key = 0; key < s_wasm_emit_fail_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_emit_fail_key_counts[key];
+    if (count != 0)
+      hot_emit_failures.emplace_back(count, static_cast<u32>(key));
+  }
+  const std::size_t emit_failure_top_count =
+      std::min<std::size_t>(hot_emit_failures.size(), 8);
+  std::partial_sort(hot_emit_failures.begin(),
+                    hot_emit_failures.begin() + emit_failure_top_count,
+                    hot_emit_failures.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < emit_failure_top_count; ++i)
+  {
+    const u32 count = hot_emit_failures[i].first;
+    const u32 key = hot_emit_failures[i].second;
+    out << " | emitkey" << (key >> 10) << "/" << (key & 0x3ff) << ":" << count
+        << "@" << std::hex << s_wasm_emit_fail_sample_pcs[key] << std::dec;
+  }
+
+  std::vector<std::pair<u32, u32>> hot_direct_rejects;
+  hot_direct_rejects.reserve(16);
+  for (std::size_t key = 0; key < s_wasm_direct_reject_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_direct_reject_key_counts[key];
+    if (count != 0)
+      hot_direct_rejects.emplace_back(count, static_cast<u32>(key));
+  }
+
+  const std::size_t direct_reject_top_count =
+      std::min<std::size_t>(hot_direct_rejects.size(), 6);
+  std::partial_sort(hot_direct_rejects.begin(),
+                    hot_direct_rejects.begin() + direct_reject_top_count,
+                    hot_direct_rejects.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < direct_reject_top_count; ++i)
+  {
+    const u32 count = hot_direct_rejects[i].first;
+    const u32 key = hot_direct_rejects[i].second;
+    out << " | rej" << (key >> 10) << "/" << (key & 0x3ff) << ":" << count;
+  }
+
+  for (std::size_t i = 0; i < top_count; ++i)
+  {
+    const u32 count = hot_keys[i].first;
+    const u32 key = hot_keys[i].second;
+    const u32 opcd = key >> 10;
+    const u32 subop = key & 0x3ff;
+    out << " | " << opcd << "/" << subop << ":" << count;
+  }
+
+  std::vector<std::pair<u32, u32>> hot_system_keys;
+  hot_system_keys.reserve(16);
+  for (std::size_t key = 0; key < s_wasm_system_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_system_key_counts[key];
+    if (count != 0)
+      hot_system_keys.emplace_back(count, static_cast<u32>(key));
+  }
+  const std::size_t system_top_count = std::min<std::size_t>(hot_system_keys.size(), 8);
+  std::partial_sort(hot_system_keys.begin(), hot_system_keys.begin() + system_top_count,
+                    hot_system_keys.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < system_top_count; ++i)
+  {
+    const u32 count = hot_system_keys[i].first;
+    const u32 key = hot_system_keys[i].second;
+    out << " | sys" << (key >> 10) << "/" << (key & 0x3ff) << ":" << count;
+  }
+
+  std::vector<std::pair<u32, u32>> hot_fp_keys;
+  hot_fp_keys.reserve(16);
+  for (std::size_t key = 0; key < s_wasm_fp_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_fp_key_counts[key];
+    if (count != 0)
+      hot_fp_keys.emplace_back(count, static_cast<u32>(key));
+  }
+  const std::size_t fp_top_count = std::min<std::size_t>(hot_fp_keys.size(), 8);
+  std::partial_sort(hot_fp_keys.begin(), hot_fp_keys.begin() + fp_top_count, hot_fp_keys.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < fp_top_count; ++i)
+  {
+    const u32 count = hot_fp_keys[i].first;
+    const u32 key = hot_fp_keys[i].second;
+    out << " | fp" << (key >> 10) << "/" << (key & 0x3ff) << ":" << count;
+  }
+
+  static constexpr std::array<std::string_view, static_cast<u32>(PsqFallbackReason::Count)>
+      psq_fallback_labels = {"nofp", "le", "lsqe", "nonfloat", "mem", "ra0", "miss"};
+  for (std::size_t i = 0; i < psq_fallback_labels.size(); ++i)
+  {
+    const u32 count = s_wasm_psq_fallback_counts[i];
+    if (count != 0)
+      out << " | psq-" << psq_fallback_labels[i] << ":" << count;
+  }
+
+  std::vector<std::pair<u32, u32>> hot_psq_types;
+  hot_psq_types.reserve(8);
+  for (std::size_t key = 0; key < s_wasm_psq_type_scale_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_psq_type_scale_counts[key];
+    if (count != 0)
+      hot_psq_types.emplace_back(count, static_cast<u32>(key));
+  }
+  const std::size_t psq_type_top_count = std::min<std::size_t>(hot_psq_types.size(), 6);
+  std::partial_sort(hot_psq_types.begin(), hot_psq_types.begin() + psq_type_top_count,
+                    hot_psq_types.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < psq_type_top_count; ++i)
+  {
+    const u32 key = hot_psq_types[i].second;
+    const bool load = key < 8 * 64;
+    const u32 subkey = load ? key : key - 8 * 64;
+    out << " | psq" << (load ? "l" : "s") << "t" << (subkey / 64) << "q"
+        << (subkey & 0x3f) << ":" << hot_psq_types[i].first << "@"
+        << std::hex << s_wasm_psq_type_scale_sample_addresses[key] << std::dec;
+  }
+
+  auto append_hot_sprs = [&out](std::string_view label, const std::array<u32, 1024>& counts) {
+    std::vector<std::pair<u32, u32>> hot_sprs;
+    hot_sprs.reserve(8);
+    for (std::size_t index = 0; index < counts.size(); ++index)
+    {
+      const u32 count = counts[index];
+      if (count != 0)
+        hot_sprs.emplace_back(count, static_cast<u32>(index));
+    }
+
+    const std::size_t spr_top_count = std::min<std::size_t>(hot_sprs.size(), 4);
+    std::partial_sort(hot_sprs.begin(), hot_sprs.begin() + spr_top_count, hot_sprs.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+    for (std::size_t i = 0; i < spr_top_count; ++i)
+      out << " | " << label << hot_sprs[i].second << ":" << hot_sprs[i].first;
+  };
+  append_hot_sprs("mfspr", s_wasm_helper_mfspr_counts);
+  append_hot_sprs("mtspr", s_wasm_helper_mtspr_counts);
+
+  std::vector<std::pair<u32, u32>> hot_branches;
+  hot_branches.reserve(8);
+  for (std::size_t key = 0; key < s_wasm_helper_branch_key_counts.size(); ++key)
+  {
+    const u32 count = s_wasm_helper_branch_key_counts[key];
+    if (count != 0)
+      hot_branches.emplace_back(count, static_cast<u32>(key));
+  }
+
+  const std::size_t branch_top_count = std::min<std::size_t>(hot_branches.size(), 4);
+  std::partial_sort(hot_branches.begin(), hot_branches.begin() + branch_top_count,
+                    hot_branches.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.first > rhs.first; });
+  for (std::size_t i = 0; i < branch_top_count; ++i)
+  {
+    const u32 count = hot_branches[i].first;
+    const u32 key = hot_branches[i].second;
+    out << " | br" << (key >> 5) << "/" << (key & 31) << ":" << count << "@"
+        << std::hex << s_wasm_helper_branch_sample_pcs[key] << "/"
+        << s_wasm_helper_branch_sample_insts[key] << std::dec;
+  }
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS && DOLPHIN_WEB_STATIC_EXIT_LINK_STATS
+  StaticExitLinks::Stats::Format(out, static_link_snapshot);
+#endif
+#line 11779
+  stats = out.str();
+  return stats.c_str();
+}
+
+extern "C" int TestPpcWasmDirectCandidate(u32 inst_hex)
+{
+  PPCAnalyst::CodeOp op{};
+  op.inst = UGeckoInstruction{inst_hex};
+  op.address = 0x80003100;
+  op.opinfo = PPCTables::GetOpInfo(op.inst, op.address);
+  return IsPpcWasmDirectInstructionCandidate(op) ? 1 : 0;
+}
+
+extern "C" int TestDcbxLoopPattern(u32 dcbx_hex, u32 addi_hex, u32 third_hex, u32 fourth_hex)
+{
+  constexpr u32 dcbx_address = 0x80003000;
+  const UGeckoInstruction dcbx{dcbx_hex};
+  const UGeckoInstruction addi{addi_hex};
+  const UGeckoInstruction third{third_hex};
+  const UGeckoInstruction fourth{fourth_hex};
+  const u32 subop = dcbx.SUBOP10;
+
+  if (dcbx.OPCD != 31 || (subop != 54 && subop != 86 && subop != 470) || dcbx.RA != 0 ||
+      dcbx.RB == 0 || !IsDcbxLoopAddressStep(addi, dcbx.RB))
+  {
+    return 0;
+  }
+
+  if (IsCtrDcbxLoopBranch(third, dcbx_address + 8, dcbx_address))
+    return 1;
+
+  if (GetCountedDcbxLoopRegister(third, dcbx.RB) &&
+      IsCountedDcbxLoopBranch(fourth, dcbx_address + 12, dcbx_address))
+  {
+    return 2;
+  }
+
+  return 0;
+}
+
+extern "C" int TestPpcWasmDirectCandidateCompiles(u32 inst_hex)
+{
+  PPCAnalyst::CodeOp op{};
+  op.inst = UGeckoInstruction{inst_hex};
+  op.address = 0x80003100;
+  op.opinfo = PPCTables::GetOpInfo(op.inst, op.address);
+
+  if (!IsPpcWasmDirectInstructionCandidate(op))
+    return 0;
+
+  const WasmStateLayout layout = {
+      0x0000,      // npc
+      0x0100,      // gpr
+      0x0200,      // ps
+      0x1200,      // cr
+      0x1300,      // spr
+      0x2400,      // msr
+      0x2500,      // fpscr
+      0x2600,      // feature flags
+      0x2700,      // pagetable update pending
+      0x2800,      // xer_ca
+      0x2804,      // xer_so_ov
+      0x2808,      // xer_stringctrl
+      0x280c,      // dcache enabled
+      0x10000000,  // ram base
+      0x01800000,  // ram size
+      0x20000000,  // l1 base
+      0x00040000,  // l1 size
+  };
+
+  const std::array<PPCAnalyst::CodeOp, 1> ops = {op};
+  const std::vector<u8> bytes =
+      BuildWasmCachedInterpreterBlock(ops, layout, op.address + sizeof(u32), true);
+  if (bytes.empty())
+    return -1;
+
+  const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+  return handle > 0 ? 1 : -2;
+}
+
+extern "C" int RunPpcWasmMultipleWordMemorySmoke()
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 256> ram{};
+  state.npc = 0;
+  state.msr.Hex = 0;
+  state.gpr[1] = 0x80000020;
+  state.gpr[17] = 0x17171717;
+  for (u32 reg = 18; reg <= 31; ++reg)
+    state.gpr[reg] = 0x90000000u | (reg * 0x010101u);
+
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  const std::array<PPCAnalyst::CodeOp, 1> store_ops = {
+      MakeWasmBlockTestOp(EncodeDFormForWasmBlockTest(47, 18, 1, 0), 0x80003100)};
+  const std::vector<u8> store_bytes =
+      BuildWasmCachedInterpreterBlock(store_ops, layout, 0x80003104, true);
+  const int store_handle = store_bytes.empty() ? -1 : CompileWasmCachedInterpreterBlockForTest(store_bytes);
+  if (store_handle <= 0)
+    return 10;
+  if (DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+          store_handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state))) != 0)
+  {
+    return 11;
+  }
+
+  for (u32 reg = 18; reg <= 31; ++reg)
+  {
+    const u32 expected = 0x90000000u | (reg * 0x010101u);
+    if (!ReadRamU32BEForWasmBlockTest(ram, 0x20 + (reg - 18) * sizeof(u32), expected))
+      return 20 + static_cast<int>(reg - 18);
+    state.gpr[reg] = 0;
+  }
+
+  const std::array<PPCAnalyst::CodeOp, 1> load_ops = {
+      MakeWasmBlockTestOp(EncodeDFormForWasmBlockTest(46, 18, 1, 0), 0x80003104)};
+  const std::vector<u8> load_bytes =
+      BuildWasmCachedInterpreterBlock(load_ops, layout, 0x80003108, true);
+  const int load_handle = load_bytes.empty() ? -1 : CompileWasmCachedInterpreterBlockForTest(load_bytes);
+  if (load_handle <= 0)
+    return 40;
+  if (DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+          load_handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state))) != 0)
+  {
+    return 41;
+  }
+
+  if (state.gpr[17] != 0x17171717)
+    return 42;
+  for (u32 reg = 18; reg <= 31; ++reg)
+  {
+    const u32 expected = 0x90000000u | (reg * 0x010101u);
+    if (state.gpr[reg] != expected)
+      return 50 + static_cast<int>(reg - 18);
+  }
+  return state.npc == 0x80003108 ? 1 : 70;
+}
+
+extern "C" int RunPpcWasmSinglePrecisionArithmeticSmoke()
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 64> ram{};
+  state.npc = 0;
+  state.msr.Hex = 1u << 13;
+  state.Exceptions = 0;
+  state.fpscr.Hex = 0;
+  state.ps[1].Fill(0.0);
+  state.ps[2].Fill(1.5);
+  state.ps[3].Fill(2.25);
+  state.ps[4].Fill(0.0);
+  state.ps[5].Fill(0.0);
+  state.ps[6].Fill(0.0);
+  state.ps[7].Fill(0.0);
+
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  auto run_op = [&](UGeckoInstruction inst, u32 address, u32 next_pc) {
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, address)};
+    const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, next_pc, true);
+    if (bytes.empty())
+      return -1;
+    const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+    if (handle <= 0)
+      return -2;
+    return DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+        handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+  };
+
+  if (run_op(EncodeAFormForWasmBlockTest(59, 1, 2, 3, 0, 21), 0x80003200, 0x80003204) != 0)
+    return 10;
+  if (!NearlyEqualForWasmBlockTest(state.ps[1].PS0AsDouble(), 3.75) ||
+      !NearlyEqualForWasmBlockTest(state.ps[1].PS1AsDouble(), 3.75))
+  {
+    return 11;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(59, 4, 3, 2, 0, 20), 0x80003204, 0x80003208) != 0)
+    return 20;
+  if (!NearlyEqualForWasmBlockTest(state.ps[4].PS0AsDouble(), 0.75) ||
+      !NearlyEqualForWasmBlockTest(state.ps[4].PS1AsDouble(), 0.75))
+  {
+    return 21;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(59, 7, 2, 3, 0, 18), 0x80003208, 0x8000320c) != 0)
+    return 30;
+  if (!NearlyEqualForWasmBlockTest(state.ps[7].PS0AsDouble(), 0.6666666865) ||
+      !NearlyEqualForWasmBlockTest(state.ps[7].PS1AsDouble(), 0.6666666865))
+  {
+    return 31;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(59, 5, 2, 0, 3, 25), 0x8000320c, 0x80003210) != 0)
+    return 40;
+  if (!NearlyEqualForWasmBlockTest(state.ps[5].PS0AsDouble(), 3.375) ||
+      !NearlyEqualForWasmBlockTest(state.ps[5].PS1AsDouble(), 3.375))
+  {
+    return 41;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(59, 6, 2, 3, 2, 29), 0x80003210, 0x80003214) != 0)
+    return 50;
+  if (!NearlyEqualForWasmBlockTest(state.ps[6].PS0AsDouble(), 4.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[6].PS1AsDouble(), 4.5))
+  {
+    return 51;
+  }
+
+  return state.npc == 0x80003214 ? 1 : 60;
+}
+
+extern "C" int RunPpcWasmDoublePrecisionArithmeticSmoke()
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 64> ram{};
+  state.npc = 0;
+  state.msr.Hex = 1u << 13;
+  state.Exceptions = 0;
+  state.fpscr.Hex = 0;
+  state.ps[1].SetBoth(-1.0, 101.0);
+  state.ps[2].SetPS0(9.0);
+  state.ps[3].SetPS0(4.5);
+  state.ps[4].SetPS0(3.0);
+  state.ps[5].SetBoth(-1.0, 105.0);
+  state.ps[6].SetBoth(-1.0, 106.0);
+  state.ps[7].SetBoth(-1.0, 107.0);
+  state.ps[8].SetBoth(-1.0, 108.0);
+  state.ps[9].SetBoth(-1.0, 109.0);
+  state.ps[10].SetBoth(-1.0, 110.0);
+
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  auto run_op = [&](UGeckoInstruction inst, u32 address, u32 next_pc) {
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, address)};
+    const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, next_pc, true);
+    if (bytes.empty())
+      return -1;
+    const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+    if (handle <= 0)
+      return -2;
+    return DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+        handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+  };
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 1, 2, 3, 0, 21), 0x80003600, 0x80003604) != 0)
+    return 10;
+  if (!NearlyEqualForWasmBlockTest(state.ps[1].PS0AsDouble(), 13.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[1].PS1AsDouble(), 101.0))
+  {
+    return 11;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 5, 2, 4, 0, 18), 0x80003604, 0x80003608) != 0)
+    return 20;
+  if (!NearlyEqualForWasmBlockTest(state.ps[5].PS0AsDouble(), 3.0) ||
+      !NearlyEqualForWasmBlockTest(state.ps[5].PS1AsDouble(), 105.0))
+  {
+    return 21;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 6, 2, 0, 4, 25), 0x80003608, 0x8000360c) != 0)
+    return 30;
+  if (!NearlyEqualForWasmBlockTest(state.ps[6].PS0AsDouble(), 27.0) ||
+      !NearlyEqualForWasmBlockTest(state.ps[6].PS1AsDouble(), 106.0))
+  {
+    return 31;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 7, 2, 3, 0, 20), 0x8000360c, 0x80003610) != 0)
+    return 40;
+  if (!NearlyEqualForWasmBlockTest(state.ps[7].PS0AsDouble(), 4.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[7].PS1AsDouble(), 107.0))
+  {
+    return 41;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 8, 2, 3, 4, 29), 0x80003610, 0x80003614) != 0)
+    return 50;
+  if (!NearlyEqualForWasmBlockTest(state.ps[8].PS0AsDouble(), 31.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[8].PS1AsDouble(), 108.0))
+  {
+    return 51;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 9, 2, 3, 4, 30), 0x80003614, 0x80003618) != 0)
+    return 60;
+  if (!NearlyEqualForWasmBlockTest(state.ps[9].PS0AsDouble(), -22.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[9].PS1AsDouble(), 109.0))
+  {
+    return 61;
+  }
+
+  if (run_op(EncodeAFormForWasmBlockTest(63, 10, 0, 2, 0, 26), 0x80003618, 0x8000361c) != 0)
+    return 70;
+  if (!NearlyEqualForWasmBlockTest(state.ps[10].PS0AsDouble(), 1.0 / 3.0) ||
+      !NearlyEqualForWasmBlockTest(state.ps[10].PS1AsDouble(), 110.0))
+  {
+    return 71;
+  }
+
+  return state.npc == 0x8000361c ? 1 : 80;
+}
+
+extern "C" int RunPpcWasmPairedQuantizedMemorySmoke()
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 256> ram{};
+  state.npc = 0;
+  state.msr.Hex = 1u << 13;
+  state.Exceptions = 0;
+  state.spr[SPR_HID2] = 1u << 31;
+  state.spr[SPR_GQR0] = 0;
+  state.gpr[2] = 0x80000020;
+  state.gpr[4] = 0x80000024;
+  state.gpr[6] = 0xcc008000;
+  state.ps[1].Fill(0.0);
+  state.ps[3].SetBoth(3.5, -4.25);
+  state.ps[5].SetBoth(6.75, -7.5);
+  state.ps[7].SetBoth(1.25, -0.5);
+
+  WriteRamU32BE(ram.data(), 0x20, 0x3fc00000);
+  WriteRamU32BE(ram.data(), 0x24, 0xc0100000);
+
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  auto run_op = [&](UGeckoInstruction inst, u32 address, u32 next_pc) {
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, address)};
+    const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, next_pc, true);
+    if (bytes.empty())
+      return -1;
+    const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+    if (handle <= 0)
+      return -2;
+    return DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+        handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+  };
+
+  if (run_op(EncodeDFormForWasmBlockTest(56, 1, 2, 0), 0x80003400, 0x80003404) != 0)
+    return 10;
+  if (!NearlyEqualForWasmBlockTest(state.ps[1].PS0AsDouble(), 1.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[1].PS1AsDouble(), -2.25))
+  {
+    return 11;
+  }
+
+  if (run_op(EncodeDFormForWasmBlockTest(60, 3, 2, 8), 0x80003404, 0x80003408) != 0)
+    return 20;
+  if (!ReadRamU32BEForWasmBlockTest(ram, 0x28, 0x40600000) ||
+      !ReadRamU32BEForWasmBlockTest(ram, 0x2c, 0xc0880000))
+  {
+    return 21;
+  }
+
+  if (run_op(EncodeDFormForWasmBlockTest(57, 1, 4, 4), 0x80003408, 0x8000340c) != 0)
+    return 30;
+  if (state.gpr[4] != 0x80000028)
+    return 31;
+  if (!NearlyEqualForWasmBlockTest(state.ps[1].PS0AsDouble(), 3.5) ||
+      !NearlyEqualForWasmBlockTest(state.ps[1].PS1AsDouble(), -4.25))
+  {
+    return 32;
+  }
+
+  if (run_op(EncodeDFormForWasmBlockTest(61, 5, 4, 8), 0x8000340c, 0x80003410) != 0)
+    return 40;
+  if (state.gpr[4] != 0x80000030)
+    return 41;
+  if (!ReadRamU32BEForWasmBlockTest(ram, 0x30, 0x40d80000) ||
+      !ReadRamU32BEForWasmBlockTest(ram, 0x34, 0xc0f00000))
+  {
+    return 42;
+  }
+
+  u8* const old_gather_pipe_ptr = state.gather_pipe_ptr;
+  u8* const old_gather_pipe_base_ptr = state.gather_pipe_base_ptr;
+  std::array<u8, 64> gather_pipe{};
+  state.gather_pipe_base_ptr = gather_pipe.data();
+  state.gather_pipe_ptr = gather_pipe.data();
+
+  if (run_op(EncodeDFormForWasmBlockTest(60, 7, 6, 0), 0x80003410, 0x80003414) != 0)
+  {
+    state.gather_pipe_ptr = old_gather_pipe_ptr;
+    state.gather_pipe_base_ptr = old_gather_pipe_base_ptr;
+    return 50;
+  }
+  const bool gather_pipe_ok =
+      state.gather_pipe_ptr == gather_pipe.data() + sizeof(u64) &&
+      ReadRamU32BE(gather_pipe.data(), 0) == 0x3fa00000 &&
+      ReadRamU32BE(gather_pipe.data(), sizeof(u32)) == 0xbf000000;
+  state.gather_pipe_ptr = old_gather_pipe_ptr;
+  state.gather_pipe_base_ptr = old_gather_pipe_base_ptr;
+  if (!gather_pipe_ok)
+    return 51;
+
+  return state.npc == 0x80003414 ? 1 : 60;
+}
+
+extern "C" int RunPpcWasmFloatCompareSmoke()
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 64> ram{};
+  state.npc = 0;
+  state.msr.Hex = 1u << 13;
+  state.Exceptions = 0;
+  state.fpscr.Hex = 0;
+  for (u32 field = 0; field < 8; ++field)
+    state.cr.SetField(field, 0);
+
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  auto run_op = [&](UGeckoInstruction inst, u32 address, u32 next_pc) {
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, address)};
+    const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, next_pc, true);
+    if (bytes.empty())
+      return -1;
+    const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+    if (handle <= 0)
+      return -2;
+    return DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+        handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+  };
+  auto check_compare = [&](u32 crfd, double fa, double fb, u32 xo, u32 expected, u32 address,
+                           u32 next_pc, int failure_base) {
+    state.ps[2].Fill(fa);
+    state.ps[3].Fill(fb);
+    state.fpscr.Hex = 0;
+    state.cr.SetField(crfd, 0);
+    if (run_op(EncodeFloatCompareForWasmBlockTest(crfd, 2, 3, xo), address, next_pc) != 0)
+      return failure_base;
+    if (state.cr.GetField(crfd) != expected)
+      return failure_base + 1;
+    if ((state.fpscr.Hex & FPRF_MASK) != (expected << FPRF_SHIFT))
+      return failure_base + 2;
+    return 0;
+  };
+
+  int result = check_compare(1, 1.5, 2.25, 0, PowerPC::CR_LT, 0x80003300, 0x80003304, 10);
+  if (result != 0)
+    return result;
+  result = check_compare(2, 2.25, 1.5, 0, PowerPC::CR_GT, 0x80003304, 0x80003308, 20);
+  if (result != 0)
+    return result;
+  result = check_compare(3, 1.5, 1.5, 32, PowerPC::CR_EQ, 0x80003308, 0x8000330c, 30);
+  if (result != 0)
+    return result;
+
+  return state.npc == 0x8000330c ? 1 : 40;
+}
+#endif
+
+bool CachedInterpreter::HandleFunctionHooking(u32 address)
+{
+  // CachedInterpreter inherits from JitBase and is considered a JIT by relevant code.
+  // (see JitInterface and how m_mode is set within PowerPC.cpp)
+  const auto result = HLE::TryReplaceFunction(m_ppc_symbol_db, address, PowerPC::CoreMode::JIT);
+  if (!result)
+    return false;
+
+  Write(HLEFunction, {m_system, address, result.hook_index});
+
+  if (result.type != HLE::HookType::Replace)
+    return false;
+
+  js.downcountAmount += js.st.numCycles;
+  WriteEndBlock();
+  return true;
+}
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+bool CachedInterpreter::StaticExitLinksEnabled() const
+{
+  return !SConfig::GetInstance().bJITNoBlockLinking && !IsDebuggingEnabled() &&
+         !IsBranchWatchEnabled() && !IsProfilingEnabled();
+}
+
+void CachedInterpreter::RegisterStaticExitLinks(StaticExitLinks::Descriptor* links)
+{
+  if (HasWriteFailed() || !StaticExitLinksEnabled())
+    return;
+  for (u32 i = 0; i < links->count && i < links->cells.size(); ++i)
+  {
+    auto& cell = links->cells[i];
+    JitBlock::LinkData link{};
+    link.exitPtrs = reinterpret_cast<u8*>(&cell);
+    link.exitAddress = cell.pc;
+    link.linkStatus = false;
+    link.call = cell.call != 0;
+    js.curBlock->linkData.push_back(link);
+  }
+}
+
+void CachedInterpreter::WriteEndBlock(StaticExitLinks::Descriptor links)
+{
+  if (IsProfilingEnabled())
+  {
+    auto* const emitted = reinterpret_cast<EndBlockOperands<true>*>(
+        GetWritableCodePtr() + sizeof(AnyCallback));
+    Write(EndBlock<true>, {{js.downcountAmount, js.numLoadStoreInst, js.numFloatingPointInst, links},
+                           js.curBlock->profile_data.get()});
+    if (!HasWriteFailed())
+      RegisterStaticExitLinks(&emitted->links);
+  }
+  else
+  {
+    auto* const emitted = reinterpret_cast<EndBlockOperands<false>*>(
+        GetWritableCodePtr() + sizeof(AnyCallback));
+    Write(EndBlock<false>, {js.downcountAmount, js.numLoadStoreInst, js.numFloatingPointInst, links});
+    if (!HasWriteFailed())
+      RegisterStaticExitLinks(&emitted->links);
+  }
+}
+#else
+#line 12247
+void CachedInterpreter::WriteEndBlock()
+{
+  if (IsProfilingEnabled())
+  {
+    Write(EndBlock<true>, {{js.downcountAmount, js.numLoadStoreInst, js.numFloatingPointInst},
+                           js.curBlock->profile_data.get()});
+  }
+  else
+  {
+    Write(EndBlock<false>, {js.downcountAmount, js.numLoadStoreInst, js.numFloatingPointInst});
+  }
+}
+
+#endif
+#line 12260
+bool CachedInterpreter::SetEmitterStateToFreeCodeRegion()
+{
+  const auto free = m_free_ranges.by_size_begin();
+  if (free == m_free_ranges.by_size_end())
+  {
+    WARN_LOG_FMT(DYNA_REC, "Failed to find free memory region in code region.");
+    return false;
+  }
+  SetCodePtr(free.from(), free.to());
+  return true;
+}
+
+void CachedInterpreter::FreeRanges()
+{
+  for (const auto& [from, to] : m_block_cache.GetRangesToFree())
+    m_free_ranges.insert(from, to);
+  m_block_cache.ClearRangesToFree();
+}
+
+void CachedInterpreter::ResetFreeMemoryRanges()
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  m_block_cache.AdvanceStaticLinkEpoch();
+#endif
+#line 12281
+  m_free_ranges.clear();
+  m_free_ranges.insert(region, region + region_size);
+}
+
+void CachedInterpreter::Jit(u32 em_address)
+{
+  Jit(em_address, true);
+}
+
+void CachedInterpreter::Jit(u32 em_address, bool clear_cache_and_retry_on_failure)
+{
+#ifdef __EMSCRIPTEN__
+  // Called only with no cached callback active (cache miss or debugger guard).
+  ApplyRequestedWasmPolicy(*this);
+#endif
+  if (IsAlmostFull() || SConfig::GetInstance().bJITNoBlockCache)
+  {
+    ClearCache();
+  }
+  FreeRanges();
+
+#ifdef __EMSCRIPTEN__
+  // SNES Touch: blocks run on past conditional branches (see EmitConditionalSideExit).
+  if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_SIDE_EXITS))
+    analyzer.ClearOption(PPCAnalyst::PPCAnalyzer::OPTION_CONDITIONAL_CONTINUE);
+  else
+    analyzer.SetOption(PPCAnalyst::PPCAnalyzer::OPTION_CONDITIONAL_CONTINUE);
+#endif
+  const u32 nextPC =
+      analyzer.Analyze(em_address, &code_block, &m_code_buffer, m_code_buffer.size());
+  if (code_block.m_memory_exception)
+  {
+    // Address of instruction could not be translated
+    m_ppc_state.npc = nextPC;
+    m_ppc_state.Exceptions |= EXCEPTION_ISI;
+    m_system.GetPowerPC().CheckExceptions();
+    WARN_LOG_FMT(POWERPC, "ISI exception at {:#010x}", nextPC);
+    return;
+  }
+
+  if (SetEmitterStateToFreeCodeRegion())
+  {
+    JitBlock* b = m_block_cache.AllocateBlock(em_address);
+    b->normalEntry = b->near_begin = GetWritableCodePtr();
+
+    if (DoJit(em_address, b, nextPC))
+    {
+      // Record what memory region was used so we know what to free if this block gets invalidated.
+      b->near_end = GetWritableCodePtr();
+      b->far_begin = b->far_end = nullptr;
+
+      // Mark the memory region that this code block uses in the RangeSizeSet.
+      if (b->near_begin != b->near_end)
+        m_free_ranges.erase(b->near_begin, b->near_end);
+
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+      m_block_cache.FinalizeBlock(*b, jo.enableBlocklink || StaticExitLinksEnabled(),
+                                  code_block, m_code_buffer);
+#else
+#line 12329
+      m_block_cache.FinalizeBlock(*b, jo.enableBlocklink, code_block, m_code_buffer);
+#endif
+#line 12330
+
+#ifdef JIT_LOG_GENERATED_CODE
+      LogGeneratedCode();
+#endif
+
+      return;
+    }
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    b->linkData.clear();
+#endif
+#line 12337
+  }
+
+  if (clear_cache_and_retry_on_failure)
+  {
+    WARN_LOG_FMT(DYNA_REC, "flushing code caches, please report if this happens a lot");
+    ClearCache();
+    Jit(em_address, false);
+    return;
+  }
+
+  PanicAlertFmtT("JIT failed to find code space after a cache clear. This should never happen. "
+                 "Please report this incident on the bug tracker. Dolphin will now exit.");
+  std::exit(-1);
+}
+
+bool CachedInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
+{
+  js.blockStart = em_address;
+  js.firstFPInstructionFound = false;
+  js.fifoBytesSinceCheck = 0;
+  js.downcountAmount = 0;
+  js.numLoadStoreInst = 0;
+  js.numFloatingPointInst = 0;
+  js.curBlock = b;
+
+  auto& interpreter = m_system.GetInterpreter();
+  auto& power_pc = m_system.GetPowerPC();
+  auto& cpu = m_system.GetCPU();
+  auto& breakpoints = power_pc.GetBreakPoints();
+
+#ifdef __EMSCRIPTEN__
+  if (auto deferred = s_deferred_wasm_queues.find(this); deferred != s_deferred_wasm_queues.end())
+    deferred->second.Recompiled(em_address, static_cast<u32>(m_ppc_state.feature_flags));
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  if (TryWriteWasmBlock(nextPC))
+    return !HasWriteFailed();
+#else
+#line 12370
+  if (TryWriteWasmBlock(nextPC))
+    return true;
+#endif
+#line 12372
+#endif
+
+  if (IsProfilingEnabled())
+    Write(StartProfiledBlock, {js.curBlock->profile_data.get()});
+
+  for (u32 i = 0; i < code_block.m_num_instructions; i++)
+  {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    const u32 static_link_op_index = i;
+#endif
+#line 12379
+    PPCAnalyst::CodeOp& op = m_code_buffer[i];
+    js.op = &op;
+
+    js.compilerPC = op.address;
+    js.instructionsLeft = (code_block.m_num_instructions - 1) - i;
+    js.downcountAmount += op.opinfo->num_cycles;
+    if (op.opinfo->flags & FL_LOADSTORE)
+      ++js.numLoadStoreInst;
+    if (op.opinfo->flags & FL_USE_FPU)
+      ++js.numFloatingPointInst;
+
+    if (HandleFunctionHooking(js.compilerPC))
+      break;
+
+    if (!op.skip)
+    {
+      if (IsDebuggingEnabled() && !cpu.IsStepping() &&
+          breakpoints.IsAddressBreakPoint(js.compilerPC))
+      {
+        Write(CheckBreakpoint, {power_pc, js.compilerPC, js.downcountAmount});
+      }
+      if (!js.firstFPInstructionFound && (op.opinfo->flags & FL_USE_FPU) != 0)
+      {
+        Write(CheckFPU, {power_pc, js.compilerPC, js.downcountAmount});
+        js.firstFPInstructionFound = true;
+      }
+
+      // Instruction may cause a DSI Exception or Program Exception.
+      if ((jo.memcheck && (op.opinfo->flags & FL_LOADSTORE) != 0) ||
+          (!op.canEndBlock && ShouldHandleFPExceptionForInstruction(&op)))
+      {
+        const InterpretAndCheckExceptionsOperands operands = {
+            {interpreter, Interpreter::GetInterpreterOp(op.inst), js.compilerPC, op.inst},
+            power_pc,
+            js.downcountAmount};
+        Write(op.canEndBlock ? CallbackCast(InterpretAndCheckExceptions<true>) :
+                               CallbackCast(InterpretAndCheckExceptions<false>),
+              operands);
+      }
+      else
+      {
+        TryWriteMeleeIdlePollLoop(i, power_pc);
+        TryWriteMeleeTitleLoop(i, power_pc);
+        TryWriteOsInterruptFunction(i, power_pc);
+        if (!TryWriteDcbxLoop(i, power_pc) && !TryWriteFastInstruction(op, power_pc))
+        {
+          const InterpretOperands operands = {interpreter, Interpreter::GetInterpreterOp(op.inst),
+                                              js.compilerPC, op.inst};
+          Write(op.canEndBlock ? CallbackCast(Interpret<true>) : CallbackCast(Interpret<false>),
+                operands);
+        }
+      }
+
+      if (op.branchIsIdleLoop)
+        Write(CheckIdle, {m_system.GetCoreTiming(), js.blockStart});
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+      if (op.canEndBlock)
+        WriteEndBlock(i == static_link_op_index ?
+                          StaticExitLinks::Branch(op.inst.hex, op.address) :
+                          StaticExitLinks::Descriptor{});
+#else
+#line 12434
+      if (op.canEndBlock)
+        WriteEndBlock();
+#endif
+#line 12436
+    }
+  }
+  if (code_block.m_broken)
+  {
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+    Write(WriteBrokenBlockNPC, {nextPC});
+    WriteEndBlock(StaticExitLinks::Fallthrough(nextPC));
+#else
+#line 12440
+    Write(WriteBrokenBlockNPC, {nextPC});
+    WriteEndBlock();
+#endif
+#line 12442
+  }
+
+  if (HasWriteFailed())
+  {
+    WARN_LOG_FMT(DYNA_REC, "JIT ran out of space in code region during code generation.");
+    return false;
+  }
+  return true;
+}
+
+void CachedInterpreter::EraseSingleBlock(const JitBlock& block)
+{
+  m_block_cache.EraseSingleBlock(block);
+  FreeRanges();
+}
+
+std::vector<JitBase::MemoryStats> CachedInterpreter::GetMemoryStats() const
+{
+  return {{"free", m_free_ranges.get_stats()}};
+}
+
+std::size_t CachedInterpreter::DisassembleNearCode(const JitBlock& block,
+                                                   std::ostream& stream) const
+{
+  return Disassemble(block, stream);
+}
+
+std::size_t CachedInterpreter::DisassembleFarCode(const JitBlock& block, std::ostream& stream) const
+{
+  stream << "N/A\n";
+  return 0;
+}
+
+void CachedInterpreter::ClearCache()
+{
+#if DOLPHIN_WEB_STATIC_EXIT_LINKS
+  m_block_cache.AdvanceStaticLinkEpoch();
+#endif
+#line 12477
+#ifdef __EMSCRIPTEN__
+  s_deferred_wasm_queues.erase(this);
+#endif
+  m_block_cache.Clear();
+  m_block_cache.ClearRangesToFree();
+  ClearCodeSpace();
+  ResetFreeMemoryRanges();
+  RefreshConfig();
+  Host_JitCacheInvalidation();
+}
+
+void CachedInterpreter::LogGeneratedCode() const
+{
+  std::ostringstream stream;
+
+  stream << "\nPPC Code Buffer:\n";
+  for (const PPCAnalyst::CodeOp& op :
+       std::span{m_code_buffer.data(), code_block.m_num_instructions})
+  {
+    fmt::print(stream, "0x{:08x}\t\t{}\n", op.address,
+               Common::GekkoDisassembler::Disassemble(op.inst.hex, op.address));
+  }
+
+  stream << "\nHost Code:\n";
+  Disassemble(*js.curBlock, stream);
+
+  // TODO C++20: std::ostringstream::view()
+  DEBUG_LOG_FMT(DYNA_REC, "{}", std::move(stream).str());
+}

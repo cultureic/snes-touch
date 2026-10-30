@@ -1,6 +1,6 @@
 export const DEFAULT_UPSTREAM_CORE_URL = "./cores/dolphin/dolphin-core-upstream.js";
-// SNES Touch: our rebuild with controller ports 2-4 (SetInputStateForPort)
-export const DEFAULT_UPSTREAM_CORE_SHA256 = "aaffed1b524e2ad2c16549d2da2958f5e2c97cb0654057f4465b5fcd11ee41d7";
+// SNES Touch: our rebuild with controller ports 2-4 (SetInputStateForPort) and the mcrf JIT fix
+export const DEFAULT_UPSTREAM_CORE_SHA256 = "c90580f1dc69372ef8ae032fe0836e5abbffda16421fceea4a37c58c0c198f79";
 export const DISCIO_UPSTREAM_CORE_URL = "./cores/dolphin/dolphin-upstream.js";
 export const WORKERFS_MOUNT_DIR = "/workerfs";
 export const XFB_FAST_PATH_FLAGS = Object.freeze({

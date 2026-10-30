@@ -1401,6 +1401,10 @@ const CACHED_INTERPRETER_DISABLE_BITS = {
   wasmaddze:   1 << 14,  // SUBOP10=202 addzex only
   blockredispatch: 1 << 15, // §28bt in-place block re-dispatch (off => baseline path)
   blockmerge:      1 << 17, // §28bx adjacent-block merge (default-off; ?blockmerge=1 to enable)
+  // SNES Touch: compiled blocks run on past conditional branches (default-on; ?sideexit=0 to turn off)
+  sideexit:        1 << 18,
+  // SNES Touch: blocks that branch to their own start loop inside WASM (default-on; ?wasmloop=0 to turn off)
+  wasmloop:        1 << 16,
   regalloc:        1 << 20, // §28by GPR regalloc / dead-store-skip (default-off; ?regalloc=1 to enable)
   shortprefix:     1 << 21, // §28ca lower JIT min-prefix 4→2 (default-off; ?shortprefix=1 to enable)
   smearcompile:    1 << 22, // §28ce cap JIT compiles/slice (default-off; ?smearcompile=1 to enable)
@@ -1505,6 +1509,12 @@ function requestedCachedInterpreterDisableMask() {
   // unchecked OOB WASM load) — kept off until A/B + correctness verified.
   if (params.get("fastmemhoist") === "1") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.fastmemhoist;
+  }
+  if (params.get("sideexit") === "0") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.sideexit;
+  }
+  if (params.get("wasmloop") === "0") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmloop;
   }
   return mask >>> 0;
 }

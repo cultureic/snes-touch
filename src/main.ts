@@ -1,5 +1,5 @@
 import './style.css'
-import { gameAudioStream, trackAudioContexts, unlockAudio } from './audio'
+import { gameAudioStream, setMuted as setPageMuted, trackAudioContexts, unlockAudio } from './audio'
 import { type Button, TouchController } from './controller'
 import { coreFor, Emulator, loadCore, onCoreProgress } from './emulator'
 import { Gamepads } from './gamepads'
@@ -66,6 +66,7 @@ const ui = {
   loadButton: element<HTMLButtonElement>('load-button'),
   saveInfo: element('save-info'),
   resetButton: element<HTMLButtonElement>('reset-button'),
+  soundButton: element<HTMLButtonElement>('sound-button'),
   inviteButton: element<HTMLButtonElement>('invite-button'),
   inviteLabel: element('invite-label'),
   inviteError: element('invite-error'),
@@ -482,6 +483,7 @@ async function play(game: db.GameMeta, rom: Uint8Array | File) {
     }
     current.emulator = emulator
     showFeatures(emulator)
+    setSound(false) // every game starts silent; the pause menu turns the sound on
     setStatus()
     if (autosave) toast('Resumed where you left off')
     current.timers.push(window.setInterval(() => void saveSram(current), SRAM_EVERY))
@@ -598,6 +600,19 @@ ui.statusBack.addEventListener('click', () => void quit('status back button'))
 ui.ffButton.addEventListener('click', () => {
   const on = session?.emulator?.toggleFastForward()
   if (on !== undefined) ui.ffButton.setAttribute('aria-pressed', String(on))
+})
+
+let soundOn = false
+function setSound(on: boolean) {
+  soundOn = on
+  setPageMuted(!on)
+  session?.emulator?.setMuted?.(!on)
+  ui.soundButton.setAttribute('aria-pressed', String(on))
+  ui.soundButton.textContent = on ? 'Sound: on' : 'Sound: off'
+}
+ui.soundButton.addEventListener('click', () => {
+  setSound(!soundOn)
+  if (soundOn) unlockAudio() // the tap that turns it on also counts as the gesture browsers want
 })
 
 // The system back gesture leaves the game (it is saved on the way out). An invite link opened
