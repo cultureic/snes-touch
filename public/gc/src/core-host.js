@@ -1413,6 +1413,8 @@ const CACHED_INTERPRETER_DISABLE_BITS = {
   fastmemhoist:    1 << 23, // §28cz per-block fastmem bounds-check hoist (ENABLE polarity; default-off; ?fastmemhoist=1)
   // SNES Touch: hot compiled blocks are recompiled together and chain to each other (default-on; ?wasmregion=0 to turn off)
   wasmregion:      1 << 24,
+  // SNES Touch: read MSR.FP/LE once per block and compile psq_l/psq_st for the GQRs it reads (ENABLE polarity; default-off; ?fpplan=1)
+  fpplan:          1 << 26,
   // Aliases the plan / TL;DR uses interchangeably:
   fastinputpoll: 1 << 1, // legacy synonym for meleecall (input-poll lives there)
   fastmem:       1 << 7, // legacy synonym for fastsystem (load/store-ish helpers)
@@ -1513,6 +1515,9 @@ function requestedCachedInterpreterDisableMask() {
   // unchecked OOB WASM load) — kept off until A/B + correctness verified.
   if (params.get("fastmemhoist") === "1") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.fastmemhoist;
+  }
+  if (params.get("fpplan") === "1") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.fpplan;
   }
   if (params.get("sideexit") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.sideexit;

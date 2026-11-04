@@ -2870,6 +2870,56 @@ void EmitStoreNpcConst(std::vector<u8>& body, const WasmStateLayout& layout, u32
   EmitStoreStateU32Const(body, layout.npc_offset, value);
 }
 
+// SNES Touch: a block that can't write the MSR or an SPR (no mtmsr, mtspr, rfi or sc) reads
+// MSR.FP and MSR.LE once at entry instead of before every floating-point and paired-single
+// instruction (66,000 reloads in Need for Speed: Underground 2's hot code, each with its own
+// fallback). Its psq_l/psq_st are compiled for the format their GQR holds at compile time, the way
+// Dolphin's own JITs treat GQRs a block reads but never writes: the entry also checks those GQRs
+// (and HID2.LSQE) still hold those values, and if not, each of them goes to the interpreter helper
+// as before. Opt-in (?fpplan=1): measured ~5% slower in that race, the entry work costing more
+// than the per-instruction loads it saves in small blocks.
+constexpr u32 DOLPHIN_WEB_ENABLE_FP_PLAN = 1u << 26;
+struct WasmFpPlan
+{
+  bool active = false;
+  u32 fp_local = 0;   // MSR.FP, 0 or 1
+  u32 le_local = 0;   // !MSR.LE, 0 or 1
+  u32 psq_local = 0;  // FP, !LE, LSQE and the compile-time GQRs all hold
+  u32 gqrs = 0;       // GQRs the block's psq ops read, specialized on
+  std::array<u32, 8> gqr{};
+};
+WasmFpPlan s_wasm_fp_plan;
+const u32* s_wasm_gqr_source = nullptr;  // the live GQR0..7, read at compile time
+u32 s_wasm_psq_specialized = 0;
+u32 s_wasm_psq_guard_fail = 0;
+
+// Pushes a value that is nonzero iff MSR.FP.
+void EmitMsrFp(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  if (s_wasm_fp_plan.active)
+  {
+    EmitLocalGet(body, s_wasm_fp_plan.fp_local);
+    return;
+  }
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1u << 13);
+  body.push_back(0x71);
+}
+
+// Pushes 1 iff MSR.LE is clear.
+void EmitMsrLeClear(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  if (s_wasm_fp_plan.active)
+  {
+    EmitLocalGet(body, s_wasm_fp_plan.le_local);
+    return;
+  }
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 1);
+  body.push_back(0x71);
+  body.push_back(0x45);
+}
+
 void EmitLoadXer(std::vector<u8>& body, const WasmStateLayout& layout)
 {
   EmitStateLoadU16(body, layout.xer_stringctrl_offset);
@@ -4639,9 +4689,7 @@ void EmitFctiwzFast(std::vector<u8>& body, const WasmStateLayout& layout,
     return;
   }
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   body.push_back(0x04);
   body.push_back(0x40);
 
@@ -4767,9 +4815,7 @@ void EmitFloatCompare(std::vector<u8>& body, const WasmStateLayout& layout,
 {
   const UGeckoInstruction inst = op.inst;
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   body.push_back(0x04);
   body.push_back(0x40);
 
@@ -4813,16 +4859,11 @@ void EmitFloatCompare(std::vector<u8>& body, const WasmStateLayout& layout,
 void EmitAlignedFloatFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
                                        bool l1_cache, u32 bytes = sizeof(u32))
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitLocalGet(body, 1);
@@ -4840,16 +4881,11 @@ void EmitAlignedFloatFastPathCondition(std::vector<u8>& body, const WasmStateLay
 
 void EmitGatherPipeFloatStoreCondition(std::vector<u8>& body, const WasmStateLayout& layout)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitLocalGet(body, 1);
@@ -5082,10 +5118,7 @@ void EmitMultipleWordMemory(std::vector<u8>& body, const WasmStateLayout& layout
   const u32 first_reg = load ? inst.RD : inst.RS;
   const u32 bytes = (32 - first_reg) * sizeof(u32);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
 
   EmitLocalGet(body, 1);
   EmitI32Const(body, 3);
@@ -5155,9 +5188,7 @@ void EmitStfiwx(std::vector<u8>& body, const WasmStateLayout& layout, const PPCA
 void EmitFpuAvailableOrFallback(std::vector<u8>& body, const PPCAnalyst::CodeOp& op,
                                 const WasmStateLayout& layout, u32 downcount)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   body.push_back(0x04);
   body.push_back(0x40);
 }
@@ -5577,6 +5608,11 @@ void EmitI64Const(std::vector<u8>& body, u64 value)
 // Pushes 1 when MSR.FP is set, else 0.
 void EmitFpuAvailableBit(std::vector<u8>& body, const WasmStateLayout& layout)
 {
+  if (s_wasm_fp_plan.active)
+  {
+    EmitLocalGet(body, s_wasm_fp_plan.fp_local);
+    return;
+  }
   EmitStateLoadU32(body, layout.msr_offset);
   EmitI32Const(body, 13);
   body.push_back(0x76);  // i32.shr_u
@@ -5942,16 +5978,11 @@ bool IsPpcWasmSpecializedFpuInstruction(UGeckoInstruction inst)
 void EmitPsqFloatFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
                                    UGeckoInstruction inst, bool store)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
@@ -5980,16 +6011,11 @@ void EmitPsqTypeScaleFastPathCondition(std::vector<u8>& body, const WasmStateLay
                                        UGeckoInstruction inst, bool store, u32 type, u32 scale,
                                        u32 element_bytes, bool l1_cache)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
@@ -6035,16 +6061,11 @@ void EmitPsqTypeScaleFastPathCondition(std::vector<u8>& body, const WasmStateLay
 void EmitPsqGatherPipeFloatStoreCondition(std::vector<u8>& body, const WasmStateLayout& layout,
                                           UGeckoInstruction inst)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
@@ -6148,6 +6169,128 @@ void EmitStorePsqU8Scale61(std::vector<u8>& body, const WasmStateLayout& layout,
     EmitStorePsqU8Scale61Lane(body, layout, inst.RS, 1, sizeof(u8));
 }
 
+// SNES Touch: psq_st of the integer formats (u8, u16, s8, s16) at any scale, in main RAM. Need for
+// Speed: Underground 2 stores u8 at scale 7 about 650,000 times a second, and every one went
+// through the helper. Like the interpreter's ScaleAndClamp: single(value) * 2^scale in single
+// precision, clamped to the format's range, truncated (a NaN becomes 0 either way).
+void EmitF32Const(std::vector<u8>& body, float value)
+{
+  body.push_back(0x43);
+  const u32 bits = std::bit_cast<u32>(value);
+  for (u32 i = 0; i < sizeof(bits); ++i)
+    body.push_back(static_cast<u8>(bits >> (i * 8)));
+}
+
+// One lane at the effective address (local 1) + byte_offset; the factor 2^scale is the f32
+// constant `factor`, or (factor < 0) the f64 in local 6. Uses locals 2 and 3.
+void EmitStorePsqIntegerLane(std::vector<u8>& body, const WasmStateLayout& layout, u32 fs,
+                             u32 lane, u32 byte_offset, u32 type, float factor)
+{
+  const bool word = type == QUANTIZE_U16 || type == QUANTIZE_S16;
+  const bool sign = type == QUANTIZE_S8 || type == QUANTIZE_S16;
+  EmitStateLoadF64(body, PsOffset(layout, fs, lane));
+  body.push_back(0xb6);  // f32.demote_f64
+  if (factor >= 0)
+  {
+    EmitF32Const(body, factor);
+  }
+  else
+  {
+    EmitLocalGet(body, 6);
+    body.push_back(0xb6);
+  }
+  body.push_back(0x94);  // f32.mul
+  EmitF32Const(body, sign ? (word ? -32768.0f : -128.0f) : 0.0f);
+  body.push_back(0x97);  // f32.max
+  EmitF32Const(body, sign ? (word ? 32767.0f : 127.0f) : (word ? 65535.0f : 255.0f));
+  body.push_back(0x96);  // f32.min
+  body.push_back(0xfc);  // i32.trunc_sat_f32_s
+  EmitU32Leb(body, 0);
+  if (word)
+  {
+    EmitLocalSet(body, 2);
+    EmitBswap16FromLocal(body, 2);
+  }
+  EmitLocalSet(body, 3);
+  EmitRamAddress(body, layout);
+  EmitLocalGet(body, 3);
+  body.push_back(word ? 0x3b : 0x3a);  // i32.store16 / i32.store8
+  body.push_back(0x00);
+  EmitU32Leb(body, byte_offset);
+}
+
+void EmitStorePsqIntegerType(std::vector<u8>& body, const WasmStateLayout& layout,
+                             UGeckoInstruction inst, u32 type, float factor)
+{
+  EmitStorePsqIntegerLane(body, layout, inst.RS, 0, 0, type, factor);
+  if (!inst.W)
+  {
+    EmitStorePsqIntegerLane(body, layout, inst.RS, 1, PairedQuantizedElementBytes(type), type,
+                            factor);
+  }
+}
+
+// FP on, big-endian, LSQE set, GQR store type 4..7, and the pair inside main RAM.
+void EmitPsqIntegerStoreFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
+                                          UGeckoInstruction inst)
+{
+  EmitMsrFp(body, layout);
+  EmitI32Const(body, 0);
+  body.push_back(0x47);
+  EmitMsrLeClear(body, layout);
+  body.push_back(0x71);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+  EmitI32Const(body, 31);
+  body.push_back(0x76);
+  body.push_back(0x71);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 7);
+  body.push_back(0x71);
+  EmitI32Const(body, QUANTIZE_U8);
+  body.push_back(0x4f);  // i32.ge_u
+  body.push_back(0x71);
+  EmitIsMem1AddressForSize(body, layout, inst.W ? sizeof(u16) : 2 * sizeof(u16));
+  body.push_back(0x71);
+}
+
+// The format and scale read from the GQR at run time.
+void EmitStorePsqInteger(std::vector<u8>& body, const WasmStateLayout& layout,
+                         UGeckoInstruction inst)
+{
+  // local 6 = 2^scale: exponent field 1023 + scale, scale sign-extended from 6 bits
+  EmitI32Const(body, 1023);
+  EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+  EmitI32Const(body, 8);
+  body.push_back(0x76);
+  EmitI32Const(body, 26);
+  body.push_back(0x74);
+  EmitI32Const(body, 26);
+  body.push_back(0x75);
+  body.push_back(0x6a);  // i32.add
+  body.push_back(0xac);  // i64.extend_i32_s
+  EmitI64Const(body, 52);
+  body.push_back(0x86);
+  body.push_back(0xbf);
+  EmitLocalSet(body, 6);
+
+  const u32 types[] = {QUANTIZE_U8, QUANTIZE_S16, QUANTIZE_U16, QUANTIZE_S8};
+  for (u32 i = 0; i < 3; ++i)
+  {
+    EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + inst.I));
+    EmitI32Const(body, 7);
+    body.push_back(0x71);
+    EmitI32Const(body, types[i]);
+    body.push_back(0x46);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitStorePsqIntegerType(body, layout, inst, types[i], -1.0f);
+    body.push_back(0x05);
+  }
+  EmitStorePsqIntegerType(body, layout, inst, types[3], -1.0f);
+  for (u32 i = 0; i < 3; ++i)
+    body.push_back(0x0b);
+}
+
 // SNES Touch: psq_l of the integer formats (u8, u16, s8, s16) at any scale, in main RAM. Need
 // for Speed: Underground 2 does over a million of these a minute from two loops and every one
 // went through the interpreter helper. Dequantizing is value * 2^-scale, where the 6-bit scale is
@@ -6158,16 +6301,11 @@ void EmitStorePsqU8Scale61(std::vector<u8>& body, const WasmStateLayout& layout,
 void EmitPsqIntegerLoadFastPathCondition(std::vector<u8>& body, const WasmStateLayout& layout,
                                          UGeckoInstruction inst)
 {
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1u << 13);
-  body.push_back(0x71);
+  EmitMsrFp(body, layout);
   EmitI32Const(body, 0);
   body.push_back(0x47);
 
-  EmitStateLoadU32(body, layout.msr_offset);
-  EmitI32Const(body, 1);
-  body.push_back(0x71);
-  body.push_back(0x45);
+  EmitMsrLeClear(body, layout);
   body.push_back(0x71);
 
   EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
@@ -6283,10 +6421,122 @@ void EmitLoadPsqInteger(std::vector<u8>& body, const WasmStateLayout& layout,
     body.push_back(0x0b);
 }
 
+// psq_l/psq_st for the format its GQR held when the block was compiled (see WasmFpPlan): one
+// guard local and the address range, instead of reading MSR, HID2 and the GQR and trying each
+// format in turn. The same loads, conversions and stores as the generic paths below.
+void EmitPairedQuantizedFloatMemorySpecialized(std::vector<u8>& body,
+                                               const WasmStateLayout& layout,
+                                               const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool load = inst.OPCD == 56 || inst.OPCD == 57;
+  const bool update = inst.OPCD == 57 || inst.OPCD == 61;
+  const u32 gqr = s_wasm_fp_plan.gqr[inst.I];
+  const u32 type = load ? (gqr >> 16) & 7 : gqr & 7;
+  const u32 scale = load ? (gqr >> 24) & 0x3f : (gqr >> 8) & 0x3f;
+  const bool fast = type == QUANTIZE_FLOAT || type >= QUANTIZE_U8;
+  const bool l1_store = !load && type == QUANTIZE_U8 && scale == 61;
+  const u32 element_bytes = PairedQuantizedElementBytes(type);
+  const auto emit_update = [&] {
+    if (!update)
+      return;
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
+  };
+  ++s_wasm_psq_specialized;
+
+  EmitEffectiveAddress12(body, layout, inst, update);
+  EmitLocalSet(body, 1);
+
+  if (fast)
+  {
+    const u32 bytes = inst.W ? element_bytes : 2 * element_bytes;
+    EmitLocalGet(body, s_wasm_fp_plan.psq_local);
+    EmitIsMem1AddressForSize(body, layout, bytes);
+    body.push_back(0x71);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    if (load && type == QUANTIZE_FLOAT)
+    {
+      EmitLoadPsqFloatLane(body, layout, inst.RD, 0, 0);
+      if (inst.W)
+      {
+        EmitStateStoreU32Prefix(body);
+        EmitF64ConstBits(body, UINT64_C(0x3ff0000000000000));
+        EmitStateStoreF64Suffix(body, PsOffset(layout, inst.RD, 1));
+      }
+      else
+      {
+        EmitLoadPsqFloatLane(body, layout, inst.RD, 1, sizeof(u32));
+      }
+    }
+    else if (load)
+    {
+      // 2^-scale, the 6-bit scale signed (as EmitLoadPsqInteger builds it at run time)
+      const s32 signed_scale = static_cast<s32>(scale << 26) >> 26;
+      EmitF64ConstBits(body, static_cast<u64>(1023 - signed_scale) << 52);
+      EmitLocalSet(body, 6);
+      EmitLoadPsqIntegerType(body, layout, inst, type);
+    }
+    else if (type == QUANTIZE_FLOAT)
+    {
+      EmitStorePsqFloatLane(body, layout, inst.RS, 0, 0);
+      if (!inst.W)
+        EmitStorePsqFloatLane(body, layout, inst.RS, 1, sizeof(u32));
+    }
+    else
+    {
+      EmitStorePsqIntegerType(body, layout, inst, type, PairedQuantizeScale(scale));
+    }
+    emit_update();
+    body.push_back(0x05);
+  }
+  if (l1_store)
+  {
+    // u8 at scale 61 also goes to the locked L1 cache
+    EmitLocalGet(body, s_wasm_fp_plan.psq_local);
+    EmitIsL1CacheAddressForSize(body, layout, inst.W ? sizeof(u8) : 2 * sizeof(u8));
+    body.push_back(0x71);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitStorePsqU8Scale61(body, layout, inst);
+    emit_update();
+    body.push_back(0x05);
+  }
+  if (!load && type == QUANTIZE_FLOAT)
+  {
+    EmitPsqGatherPipeFloatStoreCondition(body, layout, inst);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitStorePsqFloatToGatherPipeLane(body, layout, inst.RS, 0);
+    if (!inst.W)
+      EmitStorePsqFloatToGatherPipeLane(body, layout, inst.RS, 1);
+    emit_update();
+    EmitFastCheckGatherPipeIfFull(body, layout);
+    body.push_back(0x05);
+    EmitFpCall(body, op, downcount);
+    body.push_back(0x0b);
+  }
+  else
+  {
+    EmitFpCall(body, op, downcount);
+  }
+  if (l1_store)
+    body.push_back(0x0b);
+  if (fast)
+    body.push_back(0x0b);
+}
+
 void EmitPairedQuantizedFloatMemory(std::vector<u8>& body, const WasmStateLayout& layout,
                                     const PPCAnalyst::CodeOp& op, u32 downcount)
 {
   const UGeckoInstruction inst = op.inst;
+  if (s_wasm_fp_plan.active && ((s_wasm_fp_plan.gqrs >> inst.I) & 1) != 0)
+  {
+    EmitPairedQuantizedFloatMemorySpecialized(body, layout, op, downcount);
+    return;
+  }
   const bool load = inst.OPCD == 56 || inst.OPCD == 57;
   const bool update = inst.OPCD == 57 || inst.OPCD == 61;
 
@@ -6373,25 +6623,27 @@ void EmitPairedQuantizedFloatMemory(std::vector<u8>& body, const WasmStateLayout
   }
 
   body.push_back(0x05);
+  // SNES Touch: the other integer formats and scales, before the helper
   if (load)
-  {
-    // SNES Touch: the other integer formats and scales, before the helper
     EmitPsqIntegerLoadFastPathCondition(body, layout, inst);
-    body.push_back(0x04);
-    body.push_back(0x40);
+  else
+    EmitPsqIntegerStoreFastPathCondition(body, layout, inst);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  if (load)
     EmitLoadPsqInteger(body, layout, inst);
-    if (update)
-    {
-      EmitStateStoreU32Prefix(body);
-      EmitLocalGet(body, 1);
-      EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
-    }
-    body.push_back(0x05);
+  else
+    EmitStorePsqInteger(body, layout, inst);
+  if (update)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 1);
+    EmitStateStoreU32Suffix(body, GprOffset(layout, inst.RA));
   }
+  body.push_back(0x05);
   EmitFpCall(body, op, downcount);
   body.push_back(0x0b);
-  if (load)
-    body.push_back(0x0b);
+  body.push_back(0x0b);
   if (!load)
     body.push_back(0x0b);
   body.push_back(0x0b);
@@ -8568,6 +8820,42 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
       ? std::vector<u8>{0x06, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f, 0x01, 0x7f}
       : std::vector<u8>{0x05, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f};
 
+  // SNES Touch: see WasmFpPlan. Three more i32 locals after the others.
+  s_wasm_fp_plan = {};
+  if (DolphinWebFeatureEnabled(DOLPHIN_WEB_ENABLE_FP_PLAN))
+  {
+    bool fp = false;
+    bool writes_msr_or_spr = false;
+    for (const PPCAnalyst::CodeOp& op : ops)
+    {
+      if (op.skip)
+        continue;
+      const UGeckoInstruction inst = op.inst;
+      fp |= (op.opinfo->flags & FL_USE_FPU) != 0;
+      writes_msr_or_spr |= (inst.OPCD == 31 && (inst.SUBOP10 == 146 || inst.SUBOP10 == 467)) ||
+                           inst.OPCD == 17 || (inst.OPCD == 19 && inst.SUBOP10 == 50);
+    }
+    if (fp && !writes_msr_or_spr)
+    {
+      s_wasm_fp_plan.active = true;
+      s_wasm_fp_plan.fp_local = s_fmh_plan.active || jumps.active ? 41 : 40;
+      s_wasm_fp_plan.le_local = s_wasm_fp_plan.fp_local + 1;
+      s_wasm_fp_plan.psq_local = s_wasm_fp_plan.fp_local + 2;
+      body[0] += 1;
+      body.insert(body.end(), {0x03, 0x7f});
+      if (s_wasm_gqr_source != nullptr)
+      {
+        for (const PPCAnalyst::CodeOp& op : ops)
+        {
+          if (!op.skip && IsPairedQuantizedFloatMemoryCandidate(op.inst))
+            s_wasm_fp_plan.gqrs |= 1u << op.inst.I;
+        }
+        for (u32 i = 0; i < 8; ++i)
+          s_wasm_fp_plan.gqr[i] = s_wasm_gqr_source[i];
+      }
+    }
+  }
+
   // §28cx C1: set up the GPR register cache for this block, then eagerly load
   // every GPR the block reads or writes into its local. Eager (not lazy) load
   // guarantees a GPR is resident on every control-flow path before any
@@ -8594,6 +8882,58 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
       body.push_back(0x02);  // align=2
       EmitU32Leb(body, layout.gpr_offset + static_cast<u32>(bit) * static_cast<u32>(sizeof(u32)));
       EmitLocalSet(body, WASM_GPR_LOCAL_BASE + static_cast<u32>(bit));
+    }
+  }
+
+  if (s_wasm_fp_plan.active)
+  {
+    EmitStateLoadU32(body, layout.msr_offset);
+    EmitI32Const(body, 13);
+    body.push_back(0x76);
+    EmitI32Const(body, 1);
+    body.push_back(0x71);
+    EmitLocalSet(body, s_wasm_fp_plan.fp_local);
+    EmitStateLoadU32(body, layout.msr_offset);
+    EmitI32Const(body, 1);
+    body.push_back(0x71);
+    body.push_back(0x45);
+    EmitLocalSet(body, s_wasm_fp_plan.le_local);
+    if (s_wasm_fp_plan.gqrs != 0)
+    {
+      EmitLocalGet(body, s_wasm_fp_plan.fp_local);
+      EmitLocalGet(body, s_wasm_fp_plan.le_local);
+      body.push_back(0x71);
+      EmitStateLoadU32(body, SprOffset(layout, SPR_HID2));
+      EmitI32Const(body, 31);
+      body.push_back(0x76);
+      body.push_back(0x71);
+      for (u32 i = 0; i < 8; ++i)
+      {
+        if (((s_wasm_fp_plan.gqrs >> i) & 1) == 0)
+          continue;
+        EmitStateLoadU32(body, SprOffset(layout, SPR_GQR0 + i));
+        EmitI32Const(body, s_wasm_fp_plan.gqr[i]);
+        body.push_back(0x46);
+        body.push_back(0x71);
+      }
+      body.push_back(0x22);  // local.tee
+      EmitU32Leb(body, s_wasm_fp_plan.psq_local);
+      body.push_back(0x45);
+      body.push_back(0x04);
+      body.push_back(0x40);
+      const u32 counter =
+          static_cast<u32>(reinterpret_cast<std::uintptr_t>(&s_wasm_psq_guard_fail));
+      EmitI32Const(body, 0);
+      EmitI32Const(body, 0);
+      body.push_back(0x28);
+      body.push_back(0x02);
+      EmitU32Leb(body, counter);
+      EmitI32Const(body, 1);
+      body.push_back(0x6a);
+      body.push_back(0x36);
+      body.push_back(0x02);
+      EmitU32Leb(body, counter);
+      body.push_back(0x0b);
     }
   }
 
@@ -8681,6 +9021,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
             s_wasm_emit_fail_sample_pcs[key] = op.address;
         }
         s_gpr_rc.active = false;  // §28cx C1: don't leak cache state on abort
+        s_wasm_fp_plan.active = false;
         s_fmh_plan.active = false;  // §28cz: don't leak hoist plan on abort
         s_fmh_plan.ops.clear();
         return {};
@@ -8715,6 +9056,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
   EmitSection(bytes, 10, code);
 
   s_gpr_rc.active = false;  // §28cx C1: cache state is per-block; clear on exit
+  s_wasm_fp_plan.active = false;
   s_fmh_plan.active = false;  // §28cz: hoist plan is per-block; clear on exit
   s_fmh_plan.ops.clear();
   return bytes;
@@ -8776,6 +9118,10 @@ std::size_t s_wasm_region_body_bytes = 0;
 u32 s_wasm_region_window_slices = 0;
 u32 s_wasm_region_windows_since_build = 0;
 u32 s_wasm_region_outside_percent = 0;
+// Last window: runs outside the region under other CPU flags / same flags, and hot blocks seen.
+u32 s_wasm_region_outside_flags_percent = 0;
+u32 s_wasm_region_outside_same_percent = 0;
+u32 s_wasm_region_hot_blocks = 0;
 u32 s_wasm_region_pc_offset = 0;
 u32 s_wasm_region_npc_offset = 0;
 u32 s_wasm_region_feature_flags_offset = 0;
@@ -8784,6 +9130,25 @@ u32 s_wasm_region_failures = 0;
 u32 s_wasm_region_members = 0;
 u32 s_wasm_region_bytes = 0;
 u32 s_wasm_region_cut = 0;
+// Why wrappers hand back to the dispatcher, and what the dispatcher runs (cumulative).
+enum WasmRegionExit : u32
+{
+  WASM_REGION_EXIT_SLICE,
+  WASM_REGION_EXIT_FEATURES,
+  WASM_REGION_EXIT_DEAD,
+  WASM_REGION_EXIT_OUTSIDE_STATIC,
+  WASM_REGION_EXIT_OUTSIDE_DYNAMIC,
+  WASM_REGION_EXIT_HALT,
+  WASM_REGION_EXIT_COUNT
+};
+std::array<u32, WASM_REGION_EXIT_COUNT> s_wasm_region_exits{};
+s32 s_wasm_region_first_handle = 0;
+s32 s_wasm_region_end_handle = 0;
+u32 s_wasm_region_entries = 0;
+u32 s_wasm_standalone_runs = 0;
+u32 s_wasm_slices = 0;
+// Blocks the dispatcher runs that aren't compiled at all.
+u32 s_dispatch_interpreted = 0;
 
 bool WasmRegionsEnabled()
 {
@@ -8908,6 +9273,19 @@ void EmitI32LoadAbsolute(std::vector<u8>& body, u32 address)
   EmitU32Leb(body, address);
 }
 
+void EmitCountWasmRegionExit(std::vector<u8>& body, WasmRegionExit reason)
+{
+  const u32 counter =
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&s_wasm_region_exits[reason]));
+  EmitI32Const(body, 0);
+  EmitI32LoadAbsolute(body, counter);
+  EmitI32Const(body, 1);
+  body.push_back(0x6a);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, counter);
+}
+
 // Locals: 0 state, 1 the block's result, then its cycles, then the new downcount; 2 npc.
 void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, u32 index,
                            u32 count, const std::unordered_map<u32, u32>& index_of_pc,
@@ -8939,6 +9317,7 @@ void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, 
   body.push_back(0x45);  // i32.eqz: halted, for RunWasmBlock to see
   body.push_back(0x04);
   body.push_back(0x40);
+  EmitCountWasmRegionExit(body, WASM_REGION_EXIT_HALT);
   EmitLocalGet(body, 1);
   body.push_back(0x0f);
   body.push_back(0x0b);
@@ -8979,15 +9358,21 @@ void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, 
   EmitLocalGet(body, 1);
   EmitI32Const(body, 0);
   body.push_back(0x4c);  // i32.le_s
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitCountWasmRegionExit(body, WASM_REGION_EXIT_SLICE);
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
   EmitLocalGet(body, 0);
   body.push_back(0x28);
   body.push_back(0x02);
   EmitU32Leb(body, s_wasm_region_feature_flags_offset);
   EmitI32Const(body, feature_flags);
   body.push_back(0x47);  // i32.ne
-  body.push_back(0x72);  // i32.or
   body.push_back(0x04);
   body.push_back(0x40);
+  EmitCountWasmRegionExit(body, WASM_REGION_EXIT_FEATURES);
   EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
   body.push_back(0x0f);
   body.push_back(0x0b);
@@ -9009,6 +9394,7 @@ void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, 
     body.push_back(0x12);  // return_call
     EmitU32Leb(body, wrappers + found->second);
     body.push_back(0x0b);
+    EmitCountWasmRegionExit(body, WASM_REGION_EXIT_DEAD);
     EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
     body.push_back(0x0f);
     body.push_back(0x0b);
@@ -9064,6 +9450,8 @@ void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, 
     body.push_back(0x0b);
   }
 
+  EmitCountWasmRegionExit(body, block.dynamic_exit ? WASM_REGION_EXIT_OUTSIDE_DYNAMIC :
+                                                      WASM_REGION_EXIT_OUTSIDE_STATIC);
   EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
   body.push_back(0x0b);
   EmitU32Leb(code, static_cast<u32>(body.size()));
@@ -9185,6 +9573,8 @@ void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen)
     *members[k]->handle_slot = base + static_cast<s32>(k);
   }
   region->base_handle = base;
+  s_wasm_region_first_handle = base;
+  s_wasm_region_end_handle = base + static_cast<s32>(count);
   s_wasm_region = std::move(region);
   ++s_wasm_region_builds;
   s_wasm_region_members = count;
@@ -9206,6 +9596,8 @@ void MaybeBuildWasmRegion(CachedInterpreter& cpu)
   std::vector<std::pair<u32, const void*>> hot;
   u64 total = 0;
   u64 outside = 0;
+  u64 outside_flags = 0;
+  u64 outside_same = 0;
   for (auto& [key, block] : s_wasm_region_blocks)
   {
     const u32 runs = *block.runs_slot;
@@ -9221,12 +9613,16 @@ void MaybeBuildWasmRegion(CachedInterpreter& cpu)
     else
     {
       outside += window;
+      (block.feature_flags == feature_flags ? outside_same : outside_flags) += window;
     }
     total += window;
     if (window >= WASM_REGION_MIN_WINDOW_RUNS && block.feature_flags == feature_flags)
       hot.emplace_back(window, key);
   }
   s_wasm_region_outside_percent = total ? static_cast<u32>(100 * outside / total) : 0;
+  s_wasm_region_outside_flags_percent = total ? static_cast<u32>(100 * outside_flags / total) : 0;
+  s_wasm_region_outside_same_percent = total ? static_cast<u32>(100 * outside_same / total) : 0;
+  s_wasm_region_hot_blocks = static_cast<u32>(hot.size());
   if (total < WASM_REGION_MIN_WINDOW_TOTAL || hot.size() < 2)
     return;
   if (s_wasm_region && (s_wasm_region_windows_since_build < WASM_REGION_REBUILD_WINDOWS ||
@@ -9480,6 +9876,8 @@ void CachedInterpreter::ExecuteOneBlock([[maybe_unused]] bool allow_redispatch)
 #line 7825
   for (;;)
   {
+    if (*reinterpret_cast<const AnyCallback*>(normal_entry) != AnyCallbackCast(RunWasmBlock))
+      ++s_dispatch_interpreted;
 #if DOLPHIN_WEB_STATIC_EXIT_LINKS
     static_link_scope.BeginBlock(m_block_cache.StaticLinkEpoch(),
                                 static_cast<u32>(ppc_state.feature_flags));
@@ -9783,6 +10181,7 @@ void CachedInterpreter::Run()
     // The compile budget has been replenished and no cached callback is active.
     RetryDeferredWasmBlocks(*this);
     MaybeBuildWasmRegion(*this);
+    ++s_wasm_slices;
     // Start new timing slice
     // Metrics-off runs avoid all per-slice clocks. BeginSlice also resets
     // the exclusive wait/work attribution for this one CoreTiming slice.
@@ -12292,6 +12691,10 @@ DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE s32 CachedInterpreter::RunWasmBlock(
 
   ++s_wasm_block_run_count;
   ++operands.runs;
+  if (operands.handle >= s_wasm_region_first_handle && operands.handle < s_wasm_region_end_handle)
+    ++s_wasm_region_entries;
+  else
+    ++s_wasm_standalone_runs;
   const int halted =
       reinterpret_cast<WasmBlockFunction>(static_cast<std::uintptr_t>(operands.handle))(
           static_cast<int>(reinterpret_cast<std::uintptr_t>(&ppc_state)));
@@ -12682,6 +13085,7 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
   s_wasm_region_pc_offset =
       static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.pc) - state_base);
   s_wasm_region_npc_offset = layout.npc_offset;
+  s_wasm_gqr_source = &m_ppc_state.spr[SPR_GQR0];
   s_wasm_region_feature_flags_offset = layout.feature_flags_offset;
   const bool write_npc =
       did_merge ? merge_write_npc : (compiled_entire_block && !compiled_block_ends_with_branch);
@@ -13162,7 +13566,20 @@ extern "C" const char* GetPpcWasmHelperStats()
       << "region:" << s_wasm_region_builds << "built/" << s_wasm_region_failures << "failed/"
       << s_wasm_region_members << "blocks/" << s_wasm_region_bytes << "bytes/"
       << s_wasm_region_cut << "cut/" << s_wasm_region_outside_percent << "%out/"
-      << (s_wasm_region_body_bytes >> 10) << "KiBkept ";
+      << s_wasm_psq_specialized << "psqspec/" << s_wasm_psq_guard_fail << "psqguardfail/"
+      << (s_wasm_region_body_bytes >> 10) << "KiBkept "
+      << "regionexit:slice=" << s_wasm_region_exits[WASM_REGION_EXIT_SLICE]
+      << ",features=" << s_wasm_region_exits[WASM_REGION_EXIT_FEATURES]
+      << ",dead=" << s_wasm_region_exits[WASM_REGION_EXIT_DEAD]
+      << ",outstatic=" << s_wasm_region_exits[WASM_REGION_EXIT_OUTSIDE_STATIC]
+      << ",outdyn=" << s_wasm_region_exits[WASM_REGION_EXIT_OUTSIDE_DYNAMIC]
+      << ",halt=" << s_wasm_region_exits[WASM_REGION_EXIT_HALT]
+      << " regionruns:entries=" << s_wasm_region_entries << ",standalone=" << s_wasm_standalone_runs
+      << ",slices=" << s_wasm_slices << ",interpreted=" << s_dispatch_interpreted
+      << " regionwindow:hot=" << s_wasm_region_hot_blocks
+      << ",outflags=" << s_wasm_region_outside_flags_percent
+      << "%,outsame=" << s_wasm_region_outside_same_percent << "% ";
+
   // §28ce burst-smearing stats: throttle reject count + peak burst observed.
   const u32 throttle_rejects =
       s_wasm_compile_throttle_reject_count.load(std::memory_order_relaxed);
@@ -14129,6 +14546,237 @@ extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmEstimateSmoke(u32 iterations, u32 
   }
   emscripten_log(EM_LOG_CONSOLE, "estimate smoke: %u runs, %u took the interpreter path\n",
               iterations * static_cast<u32>(insts.size()), s_wasm_fp_call_count - helper_calls_before);
+  return 1;
+}
+
+// SNES Touch: psq_l/psq_st compiled for the GQR held at compile time (WasmFpPlan) against the same
+// instruction compiled generically, on random formats, scales, W and update bits, offsets and data.
+// Only the formats both paths do inline (the helper needs a booted machine). Returns 1, or
+// 100 + reason at the first mismatch.
+extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmPsqSpecializedSmoke(u32 iterations, u32 seed)
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 256> ram{};
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  u64 rng = 0x2545f4914f6cdd1dULL ^ seed;
+  const auto next = [&rng] {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  static constexpr std::array<u32, 5> load_types = {QUANTIZE_FLOAT, QUANTIZE_U8, QUANTIZE_U16,
+                                                    QUANTIZE_S8, QUANTIZE_S16};
+  const u32 specialized_before = s_wasm_psq_specialized;
+  for (u32 iteration = 0; iteration < iterations; ++iteration)
+  {
+    const bool load = (next() & 3) != 0;
+    const bool update = (next() & 1) != 0;
+    const u32 w = next() & 1;
+    const u32 type = load ? load_types[next() % load_types.size()] : QUANTIZE_FLOAT;
+    const u32 scale = next() & 63;
+    const u32 gqr = load ? (type << 16) | (scale << 24) : (next() & 0x3f00);  // store: float
+    const u32 element = PairedQuantizedElementBytes(type);
+    const u32 offset = static_cast<u32>(next() % (ram.size() - 2 * element - 64));
+    const s32 displacement = static_cast<s32>(next() % 64) - 16;  // the 12-bit immediate
+    const u32 base = 0x80000000u + offset + 16;
+    const u32 rd = 1, ra = 3;
+    const UGeckoInstruction inst{((load ? (update ? 57u : 56u) : (update ? 61u : 60u)) << 26) |
+                                 (rd << 21) | (ra << 16) | (w << 15) | (1u << 12) |
+                                 (static_cast<u32>(displacement) & 0xfff)};
+    state.spr[SPR_GQR0 + 1] = gqr;
+    state.spr[SPR_HID2] = 1u << 31;
+    state.msr.Hex = 1u << 13;
+    s_wasm_gqr_source = &state.spr[SPR_GQR0];
+
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, 0x80003600)};
+    const u32 previous_mask = s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+    s_dolphin_web_disable_mask.store(previous_mask | DOLPHIN_WEB_ENABLE_FP_PLAN);
+    const std::vector<u8> special = BuildWasmCachedInterpreterBlock(ops, layout, 0x80003604, true);
+    s_dolphin_web_disable_mask.store(previous_mask & ~DOLPHIN_WEB_ENABLE_FP_PLAN);
+    const std::vector<u8> generic = BuildWasmCachedInterpreterBlock(ops, layout, 0x80003604, true);
+    s_dolphin_web_disable_mask.store(previous_mask, std::memory_order_relaxed);
+    if (special.empty() || generic.empty())
+      return 101;
+    const int special_handle = CompileWasmCachedInterpreterBlockForTest(special);
+    const int generic_handle = CompileWasmCachedInterpreterBlockForTest(generic);
+    if (special_handle <= 0 || generic_handle <= 0)
+      return 102;
+
+    std::array<u8, 256> ram_in{};
+    for (u8& byte : ram_in)
+      byte = static_cast<u8>(next());
+    const u64 f0 = next(), f1 = next(), s0 = next() & 0xffffffff, s1 = next() & 0xffffffff;
+    // stores: finite singles, so both paths round the same way
+    const double v0 = static_cast<double>(std::bit_cast<float>(static_cast<u32>(s0 & 0xbfffffff)));
+    const double v1 = static_cast<double>(std::bit_cast<float>(static_cast<u32>(s1 & 0xbfffffff)));
+    struct Result
+    {
+      u64 l0, l1;
+      u32 ra;
+      std::array<u8, 256> ram;
+    };
+    const auto run = [&](int handle) {
+      ram = ram_in;
+      state.Exceptions = 0;
+      state.gpr[ra] = base;
+      if (load)
+        state.ps[rd].SetBoth(f0, f1);
+      else
+        state.ps[rd].SetBoth(v0, v1);
+      const int halted = DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+          handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+      return std::pair{halted, Result{state.ps[rd].PS0AsU64(), state.ps[rd].PS1AsU64(),
+                                      state.gpr[ra], ram}};
+    };
+    const auto [special_halt, a] = run(special_handle);
+    const auto [generic_halt, b] = run(generic_handle);
+    const int reason = special_halt != 0 || generic_halt != 0 ? 3 :
+                       a.l0 != b.l0 ? 4 : a.l1 != b.l1 ? 5 : a.ra != b.ra ? 6 :
+                       a.ram != b.ram ? 7 : 0;
+    if (reason != 0)
+    {
+      emscripten_log(EM_LOG_CONSOLE,
+                     "psq smoke iteration %u reason %d: %s update %d W %d type %u scale %u gqr %08x "
+                     "base %08x disp %d | special %016llx %016llx ra %08x | generic %016llx "
+                     "%016llx ra %08x",
+                     iteration, reason, load ? "load" : "store", update ? 1 : 0, w, type, scale,
+                     gqr, base, displacement, static_cast<unsigned long long>(a.l0),
+                     static_cast<unsigned long long>(a.l1), a.ra,
+                     static_cast<unsigned long long>(b.l0), static_cast<unsigned long long>(b.l1),
+                     b.ra);
+      return 100 + reason;
+    }
+  }
+  emscripten_log(EM_LOG_CONSOLE, "psq smoke: %u cases, %u compiled specialized\n", iterations,
+                 s_wasm_psq_specialized - specialized_before);
+  s_wasm_gqr_source = nullptr;
+  return 1;
+}
+
+// SNES Touch: integer psq_st compiled inline (generic and, with ?fpplan=1, specialized) against
+// StoreQuantizedLane, the C++ fast path that mirrors the interpreter's ScaleAndClamp, on random
+// formats, scales, W bits and values (NaN, infinities, signed zeros, out-of-range and fractional
+// values). Returns 1, or 200 + reason at the first mismatch.
+extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmPsqStoreSmoke(u32 iterations, u32 seed)
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 256> ram{};
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  u64 rng = 0x853c49e6748fea9bULL ^ seed;
+  const auto next = [&rng] {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  const auto random_value = [&]() -> double {
+    const u64 r = next();
+    switch (r & 7)
+    {
+    case 0:
+    {
+      static constexpr std::array<double, 8> specials = {
+          std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity(), 0.0, -0.0, 1e30, -1e30, 0.5};
+      return specials[(r >> 3) & 7];
+    }
+    case 1:
+      return std::bit_cast<double>(next());  // any bits
+    default:
+      return static_cast<double>(static_cast<float>((static_cast<s64>(next() % 4000001) -
+                                                     2000000) / 1000.0));
+    }
+  };
+  for (u32 iteration = 0; iteration < iterations; ++iteration)
+  {
+    static constexpr std::array<u32, 4> types = {QUANTIZE_U8, QUANTIZE_U16, QUANTIZE_S8,
+                                                 QUANTIZE_S16};
+    const u32 type = types[next() & 3];
+    const u32 scale = next() & 63;
+    const u32 w = next() & 1;
+    const bool update = (next() & 1) != 0;
+    const u32 element = PairedQuantizedElementBytes(type);
+    const u32 offset = static_cast<u32>(next() % (ram.size() - 2 * element - 64)) + 16;
+    const s32 displacement = static_cast<s32>(next() % 32) - 16;
+    const u32 base = 0x80000000u + offset;
+    const u32 ea_offset = offset + static_cast<u32>(displacement);
+    const UGeckoInstruction inst{((update ? 61u : 60u) << 26) | (1u << 21) | (3u << 16) |
+                                 (w << 15) | (1u << 12) |
+                                 (static_cast<u32>(displacement) & 0xfff)};
+    state.spr[SPR_GQR0 + 1] = type | (scale << 8);
+    state.spr[SPR_HID2] = 1u << 31;
+    state.msr.Hex = 1u << 13;
+    s_wasm_gqr_source = &state.spr[SPR_GQR0];
+    std::array<u8, 256> ram_in{};
+    for (u8& byte : ram_in)
+      byte = static_cast<u8>(next());
+    const double v0 = random_value(), v1 = random_value();
+
+    std::array<u8, 256> expected = ram_in;
+    const auto reference = [&](u32 at, double value) {
+      switch (type)
+      {
+      case QUANTIZE_U8:
+        StoreQuantizedLane<u8>(expected.data(), at, value, scale);
+        break;
+      case QUANTIZE_U16:
+        StoreQuantizedLane<u16>(expected.data(), at, value, scale);
+        break;
+      case QUANTIZE_S8:
+        StoreQuantizedLane<s8>(expected.data(), at, value, scale);
+        break;
+      default:
+        StoreQuantizedLane<s16>(expected.data(), at, value, scale);
+        break;
+      }
+    };
+    reference(ea_offset, v0);
+    if (!w)
+      reference(ea_offset + element, v1);
+
+    for (u32 plan = 0; plan < 2; ++plan)
+    {
+      const u32 previous_mask = s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+      s_dolphin_web_disable_mask.store(plan ? previous_mask | DOLPHIN_WEB_ENABLE_FP_PLAN :
+                                              previous_mask & ~DOLPHIN_WEB_ENABLE_FP_PLAN);
+      const std::array<PPCAnalyst::CodeOp, 1> ops = {MakeWasmBlockTestOp(inst, 0x80003700)};
+      const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, 0x80003704, true);
+      s_dolphin_web_disable_mask.store(previous_mask, std::memory_order_relaxed);
+      if (bytes.empty())
+        return 201;
+      const int handle = CompileWasmCachedInterpreterBlockForTest(bytes);
+      if (handle <= 0)
+        return 202;
+      ram = ram_in;
+      state.Exceptions = 0;
+      state.gpr[3] = base;
+      state.ps[1].SetBoth(v0, v1);
+      if (DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+              handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state))) != 0)
+        return 203;
+      const int reason = ram != expected ? 4 :
+                         state.gpr[3] != (update ? base + static_cast<u32>(displacement) : base) ? 5 :
+                                                                                                   0;
+      if (reason != 0)
+      {
+        emscripten_log(EM_LOG_CONSOLE,
+                       "psq store smoke iteration %u reason %d plan %u: type %u scale %u W %u "
+                       "values %016llx %016llx at %u: got %02x%02x%02x%02x want %02x%02x%02x%02x",
+                       iteration, reason, plan, type, scale, w,
+                       static_cast<unsigned long long>(std::bit_cast<u64>(v0)),
+                       static_cast<unsigned long long>(std::bit_cast<u64>(v1)), ea_offset,
+                       ram[ea_offset], ram[ea_offset + 1], ram[ea_offset + 2], ram[ea_offset + 3],
+                       expected[ea_offset], expected[ea_offset + 1], expected[ea_offset + 2],
+                       expected[ea_offset + 3]);
+        return 200 + reason;
+      }
+    }
+  }
+  emscripten_log(EM_LOG_CONSOLE, "psq store smoke: %u cases x 2 builds\n", iterations);
+  s_wasm_gqr_source = nullptr;
   return 1;
 }
 #endif
