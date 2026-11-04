@@ -17,14 +17,17 @@ import type { Machine } from './machine'
 // paired-single and quantized-load instructions natively, writes GX commands straight into the
 // gather pipe, dispatches compiled blocks directly, runs blocks on past conditional branches,
 // loops small loops inside WebAssembly, jumps inside a block's WebAssembly function when a branch
-// lands in the same block, and skips the software fused multiply-add when it can give the same
-// bits without it. That emulates about 190 million PowerPC cycles a second on a fast computer,
-// well under the GameCube's 486 MHz, so the emulated CPU runs at half its clock (oc=0.5): games
-// burn much of the clock waiting in loops Dolphin can't skip, and a lower clock cuts that waiting.
-// Need for Speed: Underground 2's race clock went from about a third of real speed to about two
-// thirds at the same frame rate, and to about four fifths with the jumps inside blocks. A game that
-// already ran at full speed used less than half the clock here, so it loses nothing. The page's own
-// gamepad polling is off, since it would overwrite the app's input.
+// lands in the same block, skips the software fused multiply-add when it can give the same bits
+// without it, computes the reciprocal (square root) estimates from the hardware tables, and
+// recompiles hot blocks together into one module so they hand over to each other without the
+// dispatcher. Even so the JIT is well short of the GameCube's 486 MHz, so the emulated CPU runs at
+// half its clock (oc=0.5): games burn much of the clock waiting in loops Dolphin can't skip, and a
+// lower clock cuts that waiting. Need for Speed: Underground 2's race clock went from about a third
+// of real speed to about two thirds at the same frame rate, to about four fifths with the jumps
+// inside blocks, and to about 95% with the estimates and the block regions (about 120% with no
+// speed limit). 0.65 gave that game no more frames and slowed its heaviest stretches. A game that
+// already ran at full speed used less than half the clock here, so it loses nothing. The page's
+// own gamepad polling is off, since it would overwrite the app's input.
 const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=0.5&pacing=tick&nogamepad=1'
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3

@@ -1411,6 +1411,8 @@ const CACHED_INTERPRETER_DISABLE_BITS = {
   shortprefix:     1 << 21, // §28ca lower JIT min-prefix 4→2 (default-off; ?shortprefix=1 to enable)
   smearcompile:    1 << 22, // §28ce cap JIT compiles/slice (default-off; ?smearcompile=1 to enable)
   fastmemhoist:    1 << 23, // §28cz per-block fastmem bounds-check hoist (ENABLE polarity; default-off; ?fastmemhoist=1)
+  // SNES Touch: hot compiled blocks are recompiled together and chain to each other (default-on; ?wasmregion=0 to turn off)
+  wasmregion:      1 << 24,
   // Aliases the plan / TL;DR uses interchangeably:
   fastinputpoll: 1 << 1, // legacy synonym for meleecall (input-poll lives there)
   fastmem:       1 << 7, // legacy synonym for fastsystem (load/store-ish helpers)
@@ -1517,6 +1519,9 @@ function requestedCachedInterpreterDisableMask() {
   }
   if (params.get("wasmloop") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmloop;
+  }
+  if (params.get("wasmregion") === "0") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmregion;
   }
   if (params.get("innerjump") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.innerjump;

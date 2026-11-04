@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -216,6 +217,42 @@ EM_JS(int, DolphinWeb_CachedInterpreterCompileWasmBlock,
   wasmTable.grow(1);
   wasmTable.set(index, fn);
   return index | 0;
+});
+
+// SNES Touch: compiles a wasm region (see BuildWasmRegion) with the block imports and puts its
+// `count` wrappers, exported as table "t", at the end of the function table. Returns the first
+// index, or 0 on failure.
+EM_JS(int, DolphinWeb_CompileWasmRegion,
+      (const unsigned char* bytes_ptr, int bytes_len, int count, const int* import_indices), {
+  const names = ["read_u32", "write_u32", "read_u8", "write_u8", "read_u16", "write_u16", "lfs",
+                 "stfs", "lfd", "fmr", "system", "fp", "fctiwz", "interpret", "fastcheck_gpfifo",
+                 "fast_os_interrupt_call", "fast_melee_input_status_call",
+                 "fast_melee_status_call", "fast_melee_service_poll_call"];
+  const env = { memory: wasmMemory };
+  const indices = new Int32Array(Module.HEAPU8.buffer, import_indices, names.length);
+  for (let i = 0; i < names.length; i++)
+    env[names[i]] = wasmTable.get(indices[i]);
+  const t0 = performance.now();
+  let table;
+  try {
+    const mod = new WebAssembly.Module(Module.HEAPU8.slice(bytes_ptr, bytes_ptr + bytes_len));
+    table = new WebAssembly.Instance(mod, { env }).exports.t;
+  } catch (e) {
+    console.error("[wasm-region] compile failed: " + e);
+    return 0;
+  }
+  const base = wasmTable.length;
+  wasmTable.grow(count);
+  for (let i = 0; i < count; i++)
+    wasmTable.set(base + i, table.get(i));
+  console.log("[wasm-region] " + count + " blocks, " + bytes_len + " bytes, " +
+              (performance.now() - t0).toFixed(1) + " ms");
+  return base | 0;
+});
+
+EM_JS(void, DolphinWeb_ReleaseWasmRegion, (int base, int count), {
+  for (let i = 0; i < count; i++)
+    wasmTable.set(base + i, null);
 });
 
 static std::array<char, 86> DolphinWeb_MakeWasmBlockCacheKey(std::span<const u8> bytes)
@@ -3550,6 +3587,8 @@ struct WasmInternalJumps
 // natural end still has to charge.
 bool s_wasm_built_internal_jumps = false;
 u32 s_wasm_built_tail_cycles = 0;
+// SNES Touch: the last built block's function body, for the wasm region.
+std::vector<u8> s_wasm_built_body;
 
 bool WasmInternalBranchTarget(const PPCAnalyst::CodeOp& op, bool is_last, u32* target)
 {
@@ -4722,8 +4761,9 @@ void EmitFloatCompareResult(std::vector<u8>& body, const WasmStateLayout& layout
   EmitStateStoreU32Suffix(body, layout.fpscr_offset);
 }
 
+// `lane` 1 is ps_cmpu1/ps_cmpo1 (SNES Touch); fcmpu/fcmpo and ps_cmpu0/ps_cmpo0 compare lane 0.
 void EmitFloatCompare(std::vector<u8>& body, const WasmStateLayout& layout,
-                      const PPCAnalyst::CodeOp& op, u32 downcount)
+                      const PPCAnalyst::CodeOp& op, u32 downcount, u32 lane = 0)
 {
   const UGeckoInstruction inst = op.inst;
 
@@ -4733,25 +4773,25 @@ void EmitFloatCompare(std::vector<u8>& body, const WasmStateLayout& layout,
   body.push_back(0x04);
   body.push_back(0x40);
 
-  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
-  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
   body.push_back(0x61);
-  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
-  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
   body.push_back(0x61);
   body.push_back(0x71);
 
   body.push_back(0x04);
   body.push_back(0x40);
-  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
-  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
   body.push_back(0x63);
   body.push_back(0x04);
   body.push_back(0x40);
   EmitFloatCompareResult(body, layout, inst, PowerPC::CR_LT);
   body.push_back(0x05);
-  EmitStateLoadF64(body, PsOffset(layout, inst.FA, 0));
-  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FA, lane));
+  EmitStateLoadF64(body, PsOffset(layout, inst.FB, lane));
   body.push_back(0x64);
   body.push_back(0x04);
   body.push_back(0x40);
@@ -5385,6 +5425,12 @@ bool IsPairedSingleUnarySubop(u32 subop10)
   return subop10 == 40 || subop10 == 72 || subop10 == 136 || subop10 == 264;
 }
 
+// ps_cmpu0, ps_cmpo0, ps_cmpu1, ps_cmpo1 (SNES Touch)
+bool IsPairedSingleCompareSubop(u32 subop10)
+{
+  return subop10 == 0 || subop10 == 32 || subop10 == 64 || subop10 == 96;
+}
+
 bool IsPairedSingleMergeSubop(u32 subop10)
 {
   return subop10 == 528 || subop10 == 560 || subop10 == 592 || subop10 == 624;
@@ -5503,22 +5549,271 @@ void EmitDoublePrecisionArithmetic(std::vector<u8>& body, const WasmStateLayout&
   body.push_back(0x0b);
 }
 
+// SNES Touch: the reciprocal and reciprocal square root estimates (frsqrte, ps_rsqrte, fres,
+// ps_res), bit-exact with Common::ApproximateReciprocalSquareRoot / ApproximateReciprocal, which
+// read the hardware's tables. Blocks used to stop compiling at ps_rsqrte, which left the vector
+// math after it (normalising, mostly ps_madds0 and ps_mul) to the interpreter. Inputs that need one
+// of those functions' special cases (zero, negative, denormal, NaN, infinity, out of range) go to
+// the interpreter; the inline path changes nothing in FPSCR there, so like the other emitters it
+// only skips FPRF.
+void EmitI64Const(std::vector<u8>& body, u64 value)
+{
+  body.push_back(0x42);
+  s64 rest = static_cast<s64>(value);
+  bool more = true;
+  while (more)
+  {
+    u8 byte = rest & 0x7f;
+    rest >>= 7;
+    const bool sign_bit = (byte & 0x40) != 0;
+    if ((rest == 0 && !sign_bit) || (rest == -1 && sign_bit))
+      more = false;
+    else
+      byte |= 0x80;
+    body.push_back(byte);
+  }
+}
+
+// Pushes 1 when MSR.FP is set, else 0.
+void EmitFpuAvailableBit(std::vector<u8>& body, const WasmStateLayout& layout)
+{
+  EmitStateLoadU32(body, layout.msr_offset);
+  EmitI32Const(body, 13);
+  body.push_back(0x76);  // i32.shr_u
+  EmitI32Const(body, 1);
+  body.push_back(0x71);  // i32.and
+}
+
+// Pushes 1 when the double in i64 local `bits` is positive, normal and below 2^(exponent - 1023).
+void EmitPositiveNormalBelow(std::vector<u8>& body, u32 bits, u64 exponent)
+{
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 1ULL << 52);
+  body.push_back(0x7d);  // i64.sub
+  EmitI64Const(body, (exponent - 1) << 52);
+  body.push_back(0x54);  // i64.lt_u
+}
+
+// Pushes 1 when the double in i64 local `bits` has a biased exponent in [895, 1149), the range
+// ApproximateReciprocal computes from its table.
+void EmitReciprocalEstimateInRange(std::vector<u8>& body, u32 bits)
+{
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 52);
+  body.push_back(0x88);  // i64.shr_u
+  body.push_back(0xa7);  // i32.wrap_i64
+  EmitI32Const(body, 0x7ff);
+  body.push_back(0x71);
+  EmitI32Const(body, 895);
+  body.push_back(0x6b);  // i32.sub
+  EmitI32Const(body, 1149 - 895);
+  body.push_back(0x49);  // i32.lt_u
+}
+
+// With the table index source in local 1, pushes m_base then m_dec of table[local1 >> shift].
+// Uses local 2.
+void EmitEstimateTableEntry(std::vector<u8>& body, u32 table, u32 shift)
+{
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, shift);
+  body.push_back(0x76);  // i32.shr_u
+  EmitI32Const(body, 3);
+  body.push_back(0x74);  // i32.shl
+  body.push_back(0x22);  // local.tee
+  EmitU32Leb(body, 2);
+  body.push_back(0x28);  // i32.load m_base
+  body.push_back(0x02);
+  EmitU32Leb(body, table);
+  EmitLocalGet(body, 2);
+  body.push_back(0x28);  // i32.load m_dec
+  body.push_back(0x02);
+  EmitU32Leb(body, table + 4);
+}
+
+// Pushes the bits of ApproximateReciprocalSquareRoot(x) for a positive normal x whose bits are in
+// i64 local `bits`. Uses locals 1 and 2.
+void EmitReciprocalSqrtEstimateBits(std::vector<u8>& body, u32 bits)
+{
+  const u32 table =
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(Common::frsqrte_expected.data()));
+  // ((0x3FF << 52) - ((exponent - (0x3FE << 52)) / 2)) & (0x7FF << 52); the difference is a
+  // multiple of 2^52, so the division is an arithmetic shift.
+  EmitI64Const(body, 0x3FFULL << 52);
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 0x7FFULL << 52);
+  body.push_back(0x83);  // i64.and
+  EmitI64Const(body, 0x3FEULL << 52);
+  body.push_back(0x7d);  // i64.sub
+  EmitI64Const(body, 1);
+  body.push_back(0x87);  // i64.shr_s
+  body.push_back(0x7d);  // i64.sub
+  EmitI64Const(body, 0x7FFULL << 52);
+  body.push_back(0x83);
+  // i = (exponent_lsb | mantissa) >> 37, 16 bits; entry = table[i / 2048]
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 37);
+  body.push_back(0x88);  // i64.shr_u
+  body.push_back(0xa7);  // i32.wrap_i64
+  EmitI32Const(body, 0xffff);
+  body.push_back(0x71);
+  EmitLocalSet(body, 1);
+  EmitEstimateTableEntry(body, table, 11);
+  // m_base + m_dec * (i % 2048)
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 2047);
+  body.push_back(0x71);
+  body.push_back(0x6c);  // i32.mul
+  body.push_back(0x6a);  // i32.add
+  body.push_back(0xad);  // i64.extend_i32_u
+  EmitI64Const(body, 26);
+  body.push_back(0x86);  // i64.shl
+  body.push_back(0x84);  // i64.or
+}
+
+// Pushes the bits of ApproximateReciprocal(x) for an x in EmitReciprocalEstimateInRange's range
+// whose bits are in i64 local `bits`. Uses locals 1 and 2.
+void EmitReciprocalEstimateBits(std::vector<u8>& body, u32 bits)
+{
+  const u32 table =
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(Common::fres_expected.data()));
+  // sign | ((0x7FD << 52) - exponent)
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 1ULL << 63);
+  body.push_back(0x83);
+  EmitI64Const(body, 0x7FDULL << 52);
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 0x7FFULL << 52);
+  body.push_back(0x83);
+  body.push_back(0x7d);
+  body.push_back(0x84);
+  // i = mantissa >> 37, 15 bits; entry = table[i / 1024]
+  EmitLocalGet(body, bits);
+  EmitI64Const(body, 37);
+  body.push_back(0x88);
+  body.push_back(0xa7);
+  EmitI32Const(body, 0x7fff);
+  body.push_back(0x71);
+  EmitLocalSet(body, 1);
+  EmitEstimateTableEntry(body, table, 10);
+  // m_base - (m_dec * (i % 1024) + 1) / 2
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 1023);
+  body.push_back(0x71);
+  body.push_back(0x6c);  // i32.mul
+  EmitI32Const(body, 1);
+  body.push_back(0x6a);
+  EmitI32Const(body, 1);
+  body.push_back(0x76);  // i32.shr_u
+  body.push_back(0x6b);  // i32.sub
+  body.push_back(0xad);
+  EmitI64Const(body, 29);
+  body.push_back(0x86);
+  body.push_back(0x84);
+}
+
+// frsqrte (63/26): ps0 = ApproximateReciprocalSquareRoot(b.ps0), as a double.
 void EmitFrsqrte(std::vector<u8>& body, const WasmStateLayout& layout,
                  const PPCAnalyst::CodeOp& op, u32 downcount)
 {
   const UGeckoInstruction inst = op.inst;
 
-  EmitFpuAvailableOrFallback(body, op, layout, downcount);
-
-  EmitF64ConstBits(body, std::bit_cast<u64>(1.0));
-  EmitStateLoadF64(body, PsOffset(layout, inst.FB, 0));
-  body.push_back(0x9f);  // f64.sqrt
-  body.push_back(0xa3);  // f64.div
-  EmitLocalSet(body, 6);
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 0));
+  EmitLocalSet(body, 4);
+  EmitFpuAvailableBit(body, layout);
+  EmitPositiveNormalBelow(body, 4, 0x7FF);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
 
   EmitStateStoreU32Prefix(body);
-  EmitLocalGet(body, 6);
-  EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, 0));
+  EmitReciprocalSqrtEstimateBits(body, 4);
+  EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 0));
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// ps_rsqrte (4/26): both lanes = single(ApproximateReciprocalSquareRoot(b)). Below 2^241 the
+// estimate is a normal single, so FPSCR.NI's flush cannot apply.
+void EmitPairedSingleReciprocalSqrtEstimate(std::vector<u8>& body, const WasmStateLayout& layout,
+                                            const PPCAnalyst::CodeOp& op, u32 downcount)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 0));
+  EmitLocalSet(body, 4);
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 1));
+  EmitLocalSet(body, 5);
+  EmitFpuAvailableBit(body, layout);
+  EmitPositiveNormalBelow(body, 4, 1023 + 241);
+  body.push_back(0x71);
+  EmitPositiveNormalBelow(body, 5, 1023 + 241);
+  body.push_back(0x71);
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  for (u32 lane = 0; lane < 2; ++lane)
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitReciprocalSqrtEstimateBits(body, 4 + lane);
+    body.push_back(0xbf);  // f64.reinterpret_i64
+    body.push_back(0xb6);  // f32.demote_f64
+    body.push_back(0xbb);  // f64.promote_f32
+    EmitStateStoreF64Suffix(body, PsOffset(layout, inst.FD, lane));
+  }
+
+  body.push_back(0x05);
+  EmitFpCall(body, op, downcount);
+  body.push_back(0x0b);
+}
+
+// fres (59/24): both lanes = ApproximateReciprocal(b.ps0). ps_res (4/24): each lane =
+// ApproximateReciprocal of that lane. Both store the doubles unrounded, like the interpreter (in
+// this exponent range they are singles already).
+void EmitReciprocalEstimate(std::vector<u8>& body, const WasmStateLayout& layout,
+                            const PPCAnalyst::CodeOp& op, u32 downcount, bool paired)
+{
+  const UGeckoInstruction inst = op.inst;
+
+  EmitStateLoadI64(body, PsOffset(layout, inst.FB, 0));
+  EmitLocalSet(body, 4);
+  if (paired)
+  {
+    EmitStateLoadI64(body, PsOffset(layout, inst.FB, 1));
+    EmitLocalSet(body, 5);
+  }
+  EmitFpuAvailableBit(body, layout);
+  EmitReciprocalEstimateInRange(body, 4);
+  body.push_back(0x71);
+  if (paired)
+  {
+    EmitReciprocalEstimateInRange(body, 5);
+    body.push_back(0x71);
+  }
+  body.push_back(0x04);
+  body.push_back(0x40);
+
+  if (paired)
+  {
+    for (u32 lane = 0; lane < 2; ++lane)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitReciprocalEstimateBits(body, 4 + lane);
+      EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, lane));
+    }
+  }
+  else
+  {
+    EmitStateStoreU32Prefix(body);
+    EmitReciprocalEstimateBits(body, 4);
+    body.push_back(0x22);  // local.tee
+    EmitU32Leb(body, 5);
+    EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 0));
+    EmitStateStoreU32Prefix(body);
+    EmitLocalGet(body, 5);
+    EmitStateStoreI64Suffix(body, PsOffset(layout, inst.FD, 1));
+  }
 
   body.push_back(0x05);
   EmitFpCall(body, op, downcount);
@@ -5542,6 +5837,10 @@ bool IsPairedQuantizedFloatMemoryCandidate(UGeckoInstruction inst)
 
 bool IsPpcWasmDirectHelperFpuInstruction(UGeckoInstruction inst)
 {
+  // SNES Touch: psq_lx, psq_stx, psq_lux, psq_stux. The interpreter runs them either way; as a
+  // helper call the rest of the block stays compiled.
+  if (inst.OPCD == 4)
+    return inst.SUBOP6 == 6 || inst.SUBOP6 == 7 || inst.SUBOP6 == 38 || inst.SUBOP6 == 39;
   if (inst.Rc || inst.OPCD != 63)
     return false;
 
@@ -5630,10 +5929,11 @@ bool IsPpcWasmSpecializedFpuInstruction(UGeckoInstruction inst)
   case 4:
     return (IsPairedSingleMergeSubop(inst.SUBOP10) ||
             IsPairedSingleArithmeticSubop(inst.SUBOP5) ||
-            IsPairedSingleUnarySubop(inst.SUBOP10)) &&
+            IsPairedSingleUnarySubop(inst.SUBOP10) || IsPairedSingleCompareSubop(inst.SUBOP10) ||
+            inst.SUBOP5 == 24 || inst.SUBOP5 == 26) &&
            !inst.Rc;
   case 59:
-    return IsSinglePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc;
+    return (IsSinglePrecisionArithmeticSubop(inst.SUBOP5) || inst.SUBOP5 == 24) && !inst.Rc;
   default:
     return false;
   }
@@ -6509,6 +6809,21 @@ bool EmitWasmSupportedIntegerInstruction(std::vector<u8>& body, const WasmStateL
       EmitPairedSingleMove(body, layout, op, downcount);
       return true;
     }
+    if (IsPairedSingleCompareSubop(inst.SUBOP10) && !inst.Rc)
+    {
+      EmitFloatCompare(body, layout, op, downcount, inst.SUBOP10 >= 64 ? 1 : 0);
+      return true;
+    }
+    if (inst.SUBOP5 == 26 && !inst.Rc)
+    {
+      EmitPairedSingleReciprocalSqrtEstimate(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP5 == 24 && !inst.Rc)
+    {
+      EmitReciprocalEstimate(body, layout, op, downcount, true);
+      return true;
+    }
     return false;
 
   case 48:  // lfs
@@ -6550,6 +6865,11 @@ bool EmitWasmSupportedIntegerInstruction(std::vector<u8>& body, const WasmStateL
     if (IsSinglePrecisionArithmeticSubop(inst.SUBOP5) && !inst.Rc)
     {
       EmitSinglePrecisionArithmetic(body, layout, op, downcount);
+      return true;
+    }
+    if (inst.SUBOP5 == 24 && !inst.Rc)  // fres (SNES Touch)
+    {
+      EmitReciprocalEstimate(body, layout, op, downcount, false);
       return true;
     }
     return false;
@@ -8153,27 +8473,10 @@ void AnalyzeFastmemHoistPlan(const std::span<const PPCAnalyst::CodeOp> ops)
   flush_group();
 }
 
-std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::CodeOp> ops,
-                                                const WasmStateLayout& layout, u32 next_pc,
-                                                bool write_npc,
-                                                bool allow_interpret_fallback = false,
-                                                bool record_emit_failure = false,
-                                                bool last_op_ends_block = true,
-                                                u32 loop_pc = 0,
-                                                bool allow_internal_jumps = false)
+// The type and import sections every block module has (and the wasm region, whose block bodies
+// call the imports by index).
+void EmitWasmBlockTypesAndImports(std::vector<u8>& bytes)
 {
-  AnalyzeFastmemHoistability(ops);
-  AnalyzeFastmemHoistPlan(ops);  // §28cz build the hoist plan (no-op unless enable bit set)
-  const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
-  WasmInternalJumps jumps;
-  if (allow_internal_jumps && !s_fmh_plan.active && s_wasm_downcount_offset != 0 &&
-      last_op != ops.rend())
-  {
-    jumps = PlanWasmInternalJumps(ops, last_op_ends_block ? &*last_op : nullptr);
-  }
-  s_wasm_built_internal_jumps = jumps.active;
-  std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
-
   std::vector<u8> types;
   types.push_back(0x04);
   types.insert(types.end(), {0x60, 0x01, 0x7f, 0x01, 0x7f});
@@ -8219,6 +8522,29 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
   EmitU32Leb(imports, DOLPHIN_WASM_MEMORY_PAGES);
   EmitU32Leb(imports, DOLPHIN_WASM_MEMORY_PAGES);
   EmitSection(bytes, 2, imports);
+}
+
+std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::CodeOp> ops,
+                                                const WasmStateLayout& layout, u32 next_pc,
+                                                bool write_npc,
+                                                bool allow_interpret_fallback = false,
+                                                bool record_emit_failure = false,
+                                                bool last_op_ends_block = true,
+                                                u32 loop_pc = 0,
+                                                bool allow_internal_jumps = false)
+{
+  AnalyzeFastmemHoistability(ops);
+  AnalyzeFastmemHoistPlan(ops);  // §28cz build the hoist plan (no-op unless enable bit set)
+  const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
+  WasmInternalJumps jumps;
+  if (allow_internal_jumps && !s_fmh_plan.active && s_wasm_downcount_offset != 0 &&
+      last_op != ops.rend())
+  {
+    jumps = PlanWasmInternalJumps(ops, last_op_ends_block ? &*last_op : nullptr);
+  }
+  s_wasm_built_internal_jumps = jumps.active;
+  std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+  EmitWasmBlockTypesAndImports(bytes);
 
   EmitSection(bytes, 3, {0x01, 0x00});
 
@@ -8380,6 +8706,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
   }
   EmitI32Const(body, 0);
   body.push_back(0x0b);
+  s_wasm_built_body = body;
 
   std::vector<u8> code;
   code.push_back(0x01);
@@ -8391,6 +8718,529 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
   s_fmh_plan.active = false;  // §28cz: hoist plan is per-block; clear on exit
   s_fmh_plan.ops.clear();
   return bytes;
+}
+
+// SNES Touch: wasm regions. Every compiled block is its own WebAssembly module, so going from one
+// block to the next meant returning to the C++ dispatcher, looking the next block up and calling
+// into another module: about a quarter of the emulation thread in Need for Speed: Underground 2.
+// Once enough blocks are hot they are compiled again, together, into one module. Each block gets
+// a wrapper that does what RunWasmBlock does at the block's end (pc = npc, charge its cycles) and,
+// while the timeslice lasts and the CPU features are the ones the region was built for,
+// tail-calls the next block's wrapper directly: the block's static exits are compared first, then
+// a small hash of the region's blocks. Anything else returns to the dispatcher with nothing left
+// to charge. Runs are counted per window of timeslices (the dispatcher's for every block, the
+// wrappers' for members); the region is built from the hottest blocks and rebuilt only when much
+// of the work runs outside it, because each rebuild starts its code over in V8's baseline tier.
+// A destroyed member is cut off in place. ?wasmregion=0 turns it off.
+constexpr u32 DOLPHIN_WEB_DISABLE_WASM_REGIONS = 1u << 24;
+constexpr u32 WASM_REGION_WINDOW_SLICES = 30000;
+constexpr u32 WASM_REGION_MIN_WINDOW_RUNS = 64;      // to be a member
+constexpr u64 WASM_REGION_MIN_WINDOW_TOTAL = 100000;  // to bother at all
+constexpr u32 WASM_REGION_REBUILD_WINDOWS = 4;        // between builds
+constexpr u32 WASM_REGION_REBUILD_OUTSIDE_PERCENT = 20;
+constexpr std::size_t WASM_REGION_MAX_BLOCKS = 4000;
+// Bodies kept for blocks that may join a region; past this, new blocks are left out.
+constexpr std::size_t WASM_REGION_MAX_BODY_BYTES = 96u << 20;
+constexpr u32 WASM_REGION_IMPORTED_FUNCTIONS = WASM_IMPORT_FAST_MELEE_SERVICE_POLL_CALL_INDEX + 1;
+constexpr u32 WASM_REGION_HASH_MULTIPLIER = 0x9e3779b1;
+
+struct WasmRegionBlock
+{
+  u32 pc = 0;
+  u32 feature_flags = 0;
+  u32 downcount = 0;  // what RunWasmBlock charges at the block's natural end
+  s32 handle = 0;     // the block's own module
+  s32* handle_slot = nullptr;  // its WasmBlockOperands::handle
+  const u32* runs_slot = nullptr;  // its WasmBlockOperands::runs (dispatcher entries)
+  u32 seen_runs = 0;
+  u32 seen_member_runs = 0;
+  std::vector<u8> body;
+  std::vector<u32> exits;  // static successors
+  bool dynamic_exit = false;
+  s32 region_index = -1;
+};
+
+struct WasmRegion
+{
+  std::vector<const void*> members;  // keys of s_wasm_region_blocks, null once destroyed
+  std::unique_ptr<u32[]> valid;
+  std::unique_ptr<u32[]> runs;  // counted by the wrappers
+  std::unique_ptr<u32[]> hash;  // {pc, index} pairs; pc 0 is empty, 1 removed
+  u32 hash_bits = 0;
+  s32 base_handle = 0;
+};
+
+std::unordered_map<const void*, WasmRegionBlock> s_wasm_region_blocks;
+std::unique_ptr<WasmRegion> s_wasm_region;
+std::size_t s_wasm_region_body_bytes = 0;
+u32 s_wasm_region_window_slices = 0;
+u32 s_wasm_region_windows_since_build = 0;
+u32 s_wasm_region_outside_percent = 0;
+u32 s_wasm_region_pc_offset = 0;
+u32 s_wasm_region_npc_offset = 0;
+u32 s_wasm_region_feature_flags_offset = 0;
+u32 s_wasm_region_builds = 0;
+u32 s_wasm_region_failures = 0;
+u32 s_wasm_region_members = 0;
+u32 s_wasm_region_bytes = 0;
+u32 s_wasm_region_cut = 0;
+
+bool WasmRegionsEnabled()
+{
+  return !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASM_REGIONS);
+}
+
+u32 WasmRegionHashSlot(u32 pc, u32 bits)
+{
+  return ((pc >> 2) * WASM_REGION_HASH_MULTIPLIER) >> (32 - bits);
+}
+
+// Called for each whole-block wasm compile, right after BuildWasmCachedInterpreterBlock.
+void RegisterWasmRegionBlock(const void* key, s32* handle_slot, const u32* runs_slot, u32 pc,
+                             u32 feature_flags, u32 downcount, s32 handle,
+                             std::span<const PPCAnalyst::CodeOp> ops, bool write_npc,
+                             u32 next_pc)
+{
+  if (!WasmRegionsEnabled() || (feature_flags & FEATURE_FLAG_PERFMON) != 0 ||
+      s_wasm_built_body.empty() ||
+      s_wasm_region_body_bytes + s_wasm_built_body.size() > WASM_REGION_MAX_BODY_BYTES)
+  {
+    return;
+  }
+  WasmRegionBlock block;
+  block.pc = pc;
+  block.feature_flags = feature_flags;
+  block.downcount = downcount;
+  block.handle = handle;
+  block.handle_slot = handle_slot;
+  block.runs_slot = runs_slot;
+  block.seen_runs = *runs_slot;
+  block.body = std::move(s_wasm_built_body);
+  s_wasm_built_body.clear();
+  const auto add_exit = [&block](u32 target) {
+    if (std::find(block.exits.begin(), block.exits.end(), target) == block.exits.end())
+      block.exits.push_back(target);
+  };
+  if (write_npc)
+    add_exit(next_pc);
+  for (const PPCAnalyst::CodeOp& op : ops)
+  {
+    if (op.skip || !op.canEndBlock)
+      continue;
+    if ((op.inst.OPCD == 16 || op.inst.OPCD == 18) && op.branchTo != UINT32_MAX)
+    {
+      add_exit(op.branchTo);
+      // bc's not-taken path, or where a call returns to
+      if (op.inst.OPCD == 16 || op.inst.LK)
+        add_exit(op.address + 4);
+    }
+    else
+    {
+      block.dynamic_exit = true;
+      add_exit(op.address + 4);
+    }
+  }
+  s_wasm_region_body_bytes += block.body.size();
+  if (const auto old = s_wasm_region_blocks.find(key); old != s_wasm_region_blocks.end())
+    s_wasm_region_body_bytes -= old->second.body.size();
+  s_wasm_region_blocks.insert_or_assign(key, std::move(block));
+}
+
+void ForgetWasmRegionBlock(const void* key)
+{
+  const auto found = s_wasm_region_blocks.find(key);
+  if (found == s_wasm_region_blocks.end())
+    return;
+  const s32 index = found->second.region_index;
+  if (index >= 0 && s_wasm_region)
+  {
+    // The region may be running right now (an icbi inside it), so cut the block off in place.
+    WasmRegion& region = *s_wasm_region;
+    region.valid[index] = 0;
+    region.members[index] = nullptr;
+    const u32 mask = (1u << region.hash_bits) - 1;
+    for (u32 slot = WasmRegionHashSlot(found->second.pc, region.hash_bits);
+         region.hash[2 * slot] != 0; slot = (slot + 1) & mask)
+    {
+      if (region.hash[2 * slot + 1] == static_cast<u32>(index))
+      {
+        region.hash[2 * slot] = 1;
+        break;
+      }
+    }
+    ++s_wasm_region_cut;
+  }
+  s_wasm_region_body_bytes -= found->second.body.size();
+  s_wasm_region_blocks.erase(found);
+}
+
+std::array<int, WASM_REGION_IMPORTED_FUNCTIONS> WasmBlockImportIndices()
+{
+  const auto index = [](auto function) {
+    return static_cast<int>(reinterpret_cast<std::uintptr_t>(function));
+  };
+  return {index(&DolphinWeb_CachedInterpreterReadU32),
+          index(&DolphinWeb_CachedInterpreterWriteU32),
+          index(&DolphinWeb_CachedInterpreterReadU8),
+          index(&DolphinWeb_CachedInterpreterWriteU8),
+          index(&DolphinWeb_CachedInterpreterReadU16),
+          index(&DolphinWeb_CachedInterpreterWriteU16),
+          index(&DolphinWeb_CachedInterpreterLfs),
+          index(&DolphinWeb_CachedInterpreterStfs),
+          index(&DolphinWeb_CachedInterpreterLfd),
+          index(&DolphinWeb_CachedInterpreterFmr),
+          index(&DolphinWeb_CachedInterpreterSystem),
+          index(&DolphinWeb_CachedInterpreterFpOp),
+          index(&DolphinWeb_CachedInterpreterFctiwz),
+          index(&DolphinWeb_CachedInterpreterInterpret),
+          index(&DolphinWeb_CachedInterpreterFastCheckGatherPipe),
+          index(&DolphinWeb_CachedInterpreterFastOsInterruptCall),
+          index(&DolphinWeb_CachedInterpreterFastMeleeInputStatusCall),
+          index(&DolphinWeb_CachedInterpreterFastMeleeStatusCall),
+          index(&DolphinWeb_CachedInterpreterFastMeleeServicePollCall)};
+}
+
+void EmitI32LoadAbsolute(std::vector<u8>& body, u32 address)
+{
+  EmitI32Const(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, address);
+}
+
+// Locals: 0 state, 1 the block's result, then its cycles, then the new downcount; 2 npc.
+void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, u32 index,
+                           u32 count, const std::unordered_map<u32, u32>& index_of_pc,
+                           const WasmRegion& region, u32 feature_flags)
+{
+  const u32 wrappers = WASM_REGION_IMPORTED_FUNCTIONS + count;
+  const auto valid_address = [&region](u32 member) {
+    return static_cast<u32>(reinterpret_cast<std::uintptr_t>(&region.valid[member]));
+  };
+  std::vector<u8> body = {0x01, 0x02, 0x7f};
+  const u32 runs = static_cast<u32>(reinterpret_cast<std::uintptr_t>(&region.runs[index]));
+  EmitI32Const(body, 0);
+  EmitI32LoadAbsolute(body, runs);
+  EmitI32Const(body, 1);
+  body.push_back(0x6a);
+  body.push_back(0x36);  // i32.store
+  body.push_back(0x02);
+  EmitU32Leb(body, runs);
+  EmitLocalGet(body, 0);
+  body.push_back(0x10);  // call the block
+  EmitU32Leb(body, WASM_REGION_IMPORTED_FUNCTIONS + index);
+  body.push_back(0x22);  // local.tee
+  EmitU32Leb(body, 1);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x71);
+  body.push_back(0x45);  // i32.eqz: halted, for RunWasmBlock to see
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitLocalGet(body, 1);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
+  EmitLocalGet(body, 1);  // side exit: the cycles it ran
+  EmitI32Const(body, ~WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x71);
+  EmitLocalSet(body, 1);
+  body.push_back(0x05);  // natural end
+  EmitI32Const(body, block.downcount);
+  EmitLocalSet(body, 1);
+  body.push_back(0x0b);
+
+  // pc = npc
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_region_npc_offset);
+  body.push_back(0x22);
+  EmitU32Leb(body, 2);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_region_pc_offset);
+  // downcount -= cycles
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_downcount_offset);
+  EmitLocalGet(body, 1);
+  body.push_back(0x6b);
+  body.push_back(0x22);
+  EmitU32Leb(body, 1);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_downcount_offset);
+  // Back to the dispatcher once the timeslice is over or the CPU features changed.
+  EmitLocalGet(body, 1);
+  EmitI32Const(body, 0);
+  body.push_back(0x4c);  // i32.le_s
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_region_feature_flags_offset);
+  EmitI32Const(body, feature_flags);
+  body.push_back(0x47);  // i32.ne
+  body.push_back(0x72);  // i32.or
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
+
+  for (const u32 target : block.exits)
+  {
+    const auto found = index_of_pc.find(target);
+    if (found == index_of_pc.end())
+      continue;
+    EmitLocalGet(body, 2);
+    EmitI32Const(body, target);
+    body.push_back(0x46);  // i32.eq
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitI32LoadAbsolute(body, valid_address(found->second));
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitLocalGet(body, 0);
+    body.push_back(0x12);  // return_call
+    EmitU32Leb(body, wrappers + found->second);
+    body.push_back(0x0b);
+    EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+    body.push_back(0x0f);
+    body.push_back(0x0b);
+  }
+
+  if (block.dynamic_exit)
+  {
+    const u32 hash = static_cast<u32>(reinterpret_cast<std::uintptr_t>(region.hash.get()));
+    EmitLocalGet(body, 2);
+    EmitI32Const(body, 2);
+    body.push_back(0x76);
+    EmitI32Const(body, WASM_REGION_HASH_MULTIPLIER);
+    body.push_back(0x6c);
+    EmitI32Const(body, 32 - region.hash_bits);
+    body.push_back(0x76);
+    EmitLocalSet(body, 1);
+    body.push_back(0x02);
+    body.push_back(0x40);
+    body.push_back(0x03);
+    body.push_back(0x40);
+    const auto emit_slot_word = [&body, hash](u32 word) {
+      EmitLocalGet(body, 1);
+      EmitI32Const(body, 3);
+      body.push_back(0x74);
+      body.push_back(0x28);
+      body.push_back(0x02);
+      EmitU32Leb(body, hash + 4 * word);
+    };
+    emit_slot_word(0);
+    EmitLocalGet(body, 2);
+    body.push_back(0x46);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitLocalGet(body, 0);
+    emit_slot_word(1);
+    body.push_back(0x13);  // return_call_indirect through the region's table
+    EmitU32Leb(body, 0);
+    EmitU32Leb(body, 0);
+    body.push_back(0x0b);
+    emit_slot_word(0);
+    body.push_back(0x45);
+    body.push_back(0x0d);  // br_if: an empty slot, not in the region
+    EmitU32Leb(body, 1);
+    EmitLocalGet(body, 1);
+    EmitI32Const(body, 1);
+    body.push_back(0x6a);
+    EmitI32Const(body, (1u << region.hash_bits) - 1);
+    body.push_back(0x71);
+    EmitLocalSet(body, 1);
+    body.push_back(0x0c);
+    EmitU32Leb(body, 0);
+    body.push_back(0x0b);
+    body.push_back(0x0b);
+  }
+
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x0b);
+  EmitU32Leb(code, static_cast<u32>(body.size()));
+  code.insert(code.end(), body.begin(), body.end());
+}
+
+std::vector<u8> BuildWasmRegionModule(const std::vector<WasmRegionBlock*>& members,
+                                      const std::unordered_map<u32, u32>& index_of_pc,
+                                      const WasmRegion& region, u32 feature_flags)
+{
+  const u32 count = static_cast<u32>(members.size());
+  std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+  EmitWasmBlockTypesAndImports(bytes);
+
+  // The blocks, then their wrappers, all (state) -> result.
+  std::vector<u8> functions;
+  EmitU32Leb(functions, 2 * count);
+  functions.insert(functions.end(), 2 * count, 0x00);
+  EmitSection(bytes, 3, functions);
+
+  // Table "t" holds the wrappers: the dispatcher's entries and the hash's tail-call targets.
+  std::vector<u8> table = {0x01, 0x70, 0x01};
+  EmitU32Leb(table, count);
+  EmitU32Leb(table, count);
+  EmitSection(bytes, 4, table);
+
+  std::vector<u8> exports = {0x01};
+  EmitName(exports, "t");
+  exports.push_back(0x01);
+  exports.push_back(0x00);
+  EmitSection(bytes, 7, exports);
+
+  std::vector<u8> elements = {0x01, 0x00, 0x41, 0x00, 0x0b};
+  EmitU32Leb(elements, count);
+  for (u32 k = 0; k < count; ++k)
+    EmitU32Leb(elements, WASM_REGION_IMPORTED_FUNCTIONS + count + k);
+  EmitSection(bytes, 9, elements);
+
+  std::vector<u8> code;
+  EmitU32Leb(code, 2 * count);
+  for (const WasmRegionBlock* block : members)
+  {
+    EmitU32Leb(code, static_cast<u32>(block->body.size()));
+    code.insert(code.end(), block->body.begin(), block->body.end());
+  }
+  for (u32 k = 0; k < count; ++k)
+    EmitWasmRegionWrapper(code, *members[k], k, count, index_of_pc, region, feature_flags);
+  EmitSection(bytes, 10, code);
+  return bytes;
+}
+
+// At a timeslice boundary, so no compiled block is running. `chosen` is hottest first.
+void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen)
+{
+  std::vector<WasmRegionBlock*> members;
+  std::vector<const void*> keys;
+  std::unordered_map<u32, u32> index_of_pc;
+  for (const void* key : chosen)
+  {
+    if (members.size() >= WASM_REGION_MAX_BLOCKS)
+      break;
+    WasmRegionBlock& block = s_wasm_region_blocks.find(key)->second;
+    if (index_of_pc.contains(block.pc))
+      continue;
+    index_of_pc.emplace(block.pc, static_cast<u32>(members.size()));
+    members.push_back(&block);
+    keys.push_back(key);
+  }
+  const u32 count = static_cast<u32>(members.size());
+  if (count < 2)
+    return;
+
+  auto region = std::make_unique<WasmRegion>();
+  region->members = std::move(keys);
+  region->valid = std::make_unique<u32[]>(count);
+  region->runs = std::make_unique<u32[]>(count);
+  region->hash_bits = 4;
+  while ((1u << region->hash_bits) < 2 * count)
+    ++region->hash_bits;
+  const u32 mask = (1u << region->hash_bits) - 1;
+  region->hash = std::make_unique<u32[]>(2 * (mask + 1));
+  for (u32 k = 0; k < count; ++k)
+  {
+    region->valid[k] = 1;
+    u32 slot = WasmRegionHashSlot(members[k]->pc, region->hash_bits);
+    while (region->hash[2 * slot] != 0)
+      slot = (slot + 1) & mask;
+    region->hash[2 * slot] = members[k]->pc;
+    region->hash[2 * slot + 1] = k;
+  }
+
+  const std::vector<u8> bytes = BuildWasmRegionModule(members, index_of_pc, *region, feature_flags);
+  const auto imports = WasmBlockImportIndices();
+  const int base = DolphinWeb_CompileWasmRegion(bytes.data(), static_cast<int>(bytes.size()),
+                                                static_cast<int>(count), imports.data());
+  if (base <= 0)
+  {
+    ++s_wasm_region_failures;
+    return;
+  }
+
+  if (s_wasm_region)
+  {
+    for (const void* key : s_wasm_region->members)
+    {
+      const auto found = key ? s_wasm_region_blocks.find(key) : s_wasm_region_blocks.end();
+      if (found == s_wasm_region_blocks.end())
+        continue;
+      found->second.region_index = -1;
+      *found->second.handle_slot = found->second.handle;
+    }
+    DolphinWeb_ReleaseWasmRegion(s_wasm_region->base_handle,
+                                 static_cast<int>(s_wasm_region->members.size()));
+  }
+  for (u32 k = 0; k < count; ++k)
+  {
+    members[k]->region_index = static_cast<s32>(k);
+    members[k]->seen_member_runs = 0;
+    *members[k]->handle_slot = base + static_cast<s32>(k);
+  }
+  region->base_handle = base;
+  s_wasm_region = std::move(region);
+  ++s_wasm_region_builds;
+  s_wasm_region_members = count;
+  s_wasm_region_bytes = static_cast<u32>(bytes.size());
+}
+
+// Once per window of timeslices: how much ran, and how much of it went through the dispatcher
+// outside the region. Builds the first region, and rebuilds when the region misses too much.
+void MaybeBuildWasmRegion(CachedInterpreter& cpu)
+{
+  if (++s_wasm_region_window_slices < WASM_REGION_WINDOW_SLICES || !s_wasm_jit_enabled ||
+      !WasmRegionsEnabled())
+  {
+    return;
+  }
+  s_wasm_region_window_slices = 0;
+  ++s_wasm_region_windows_since_build;
+  const u32 feature_flags = static_cast<u32>(cpu.m_ppc_state.feature_flags);
+  std::vector<std::pair<u32, const void*>> hot;
+  u64 total = 0;
+  u64 outside = 0;
+  for (auto& [key, block] : s_wasm_region_blocks)
+  {
+    const u32 runs = *block.runs_slot;
+    u32 window = runs - block.seen_runs;
+    block.seen_runs = runs;
+    if (block.region_index >= 0)
+    {
+      // Entered from the dispatcher (counted above) or from another member: the wrapper counts both.
+      const u32 member_runs = s_wasm_region->runs[block.region_index];
+      window = member_runs - block.seen_member_runs;
+      block.seen_member_runs = member_runs;
+    }
+    else
+    {
+      outside += window;
+    }
+    total += window;
+    if (window >= WASM_REGION_MIN_WINDOW_RUNS && block.feature_flags == feature_flags)
+      hot.emplace_back(window, key);
+  }
+  s_wasm_region_outside_percent = total ? static_cast<u32>(100 * outside / total) : 0;
+  if (total < WASM_REGION_MIN_WINDOW_TOTAL || hot.size() < 2)
+    return;
+  if (s_wasm_region && (s_wasm_region_windows_since_build < WASM_REGION_REBUILD_WINDOWS ||
+                        s_wasm_region_outside_percent < WASM_REGION_REBUILD_OUTSIDE_PERCENT))
+  {
+    return;
+  }
+  std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::vector<const void*> chosen;
+  chosen.reserve(hot.size());
+  for (const auto& entry : hot)
+    chosen.push_back(entry.second);
+  BuildWasmRegion(feature_flags, chosen);
+  s_wasm_region_windows_since_build = 0;
 }
 
 int CompileWasmCachedInterpreterBlockForTest(const std::vector<u8>& bytes)
@@ -8505,6 +9355,15 @@ bool NearlyEqualForWasmBlockTest(double lhs, double rhs)
   return std::abs(lhs - rhs) <= 0.000001;
 }
 }  // namespace
+#endif
+
+#ifdef __EMSCRIPTEN__
+void DolphinWeb_ForgetWasmRegionBlock(const u8* normal_entry)
+{
+  // A wasm block's operands follow its callback pointer.
+  if (!s_wasm_region_blocks.empty())
+    ForgetWasmRegionBlock(normal_entry + sizeof(s32 (*)(PowerPC::PowerPCState&, const void*)));
+}
 #endif
 
 // Per-helper disable bitmask setter. Wired from the JS host via
@@ -8923,6 +9782,7 @@ void CachedInterpreter::Run()
     }
     // The compile budget has been replenished and no cached callback is active.
     RetryDeferredWasmBlocks(*this);
+    MaybeBuildWasmRegion(*this);
     // Start new timing slice
     // Metrics-off runs avoid all per-slice clocks. BeginSlice also resets
     // the exclusive wait/work attribution for this one CoreTiming slice.
@@ -11431,6 +12291,7 @@ DOLPHIN_WEB_DIRECT_WASM_BLOCK_INLINE s32 CachedInterpreter::RunWasmBlock(
   using WasmBlockFunction = int (*)(int);
 
   ++s_wasm_block_run_count;
+  ++operands.runs;
   const int halted =
       reinterpret_cast<WasmBlockFunction>(static_cast<std::uintptr_t>(operands.handle))(
           static_cast<int>(reinterpret_cast<std::uintptr_t>(&ppc_state)));
@@ -11818,6 +12679,10 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
   };
   s_wasm_downcount_offset =
       static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.downcount) - state_base);
+  s_wasm_region_pc_offset =
+      static_cast<u32>(reinterpret_cast<std::uintptr_t>(&m_ppc_state.pc) - state_base);
+  s_wasm_region_npc_offset = layout.npc_offset;
+  s_wasm_region_feature_flags_offset = layout.feature_flags_offset;
   const bool write_npc =
       did_merge ? merge_write_npc : (compiled_entire_block && !compiled_block_ends_with_branch);
   const std::span<const PPCAnalyst::CodeOp> ops =
@@ -11936,6 +12801,12 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
          static_cast<s32>(fuse_end_block ? 1 : 0), static_links});
   if (!HasWriteFailed())
     RegisterStaticExitLinks(&emitted->links);
+  if (fuse_end_block && !HasWriteFailed())
+  {
+    RegisterWasmRegionBlock(emitted, &emitted->handle, &emitted->runs, js.blockStart,
+                            static_cast<u32>(m_ppc_state.feature_flags), eff_downcount, handle,
+                            ops, write_npc, block_next_pc);
+  }
 #else
 #line 11081
   Write(RunWasmBlock,
@@ -12287,7 +13158,11 @@ extern "C" const char* GetPpcWasmHelperStats()
   const u32 jit_cache_misses = s_wasm_cache_miss_count.load(std::memory_order_relaxed);
   out << "modcompile:" << module_us_total << "us/max" << module_us_max << "us "
       << "modinst:" << instance_us_total << "us/max" << instance_us_max << "us "
-      << "modcache:" << jit_cache_hits << "hit/" << jit_cache_misses << "miss ";
+      << "modcache:" << jit_cache_hits << "hit/" << jit_cache_misses << "miss "
+      << "region:" << s_wasm_region_builds << "built/" << s_wasm_region_failures << "failed/"
+      << s_wasm_region_members << "blocks/" << s_wasm_region_bytes << "bytes/"
+      << s_wasm_region_cut << "cut/" << s_wasm_region_outside_percent << "%out/"
+      << (s_wasm_region_body_bytes >> 10) << "KiBkept ";
   // §28ce burst-smearing stats: throttle reject count + peak burst observed.
   const u32 throttle_rejects =
       s_wasm_compile_throttle_reject_count.load(std::memory_order_relaxed);
@@ -13132,6 +14007,129 @@ extern "C" int RunPpcWasmFloatCompareSmoke()
     return result;
 
   return state.npc == 0x8000330c ? 1 : 40;
+}
+
+// SNES Touch: runs the compiled estimate and paired compare instructions against the interpreter
+// on random inputs (frsqrte, ps_rsqrte, fres, ps_res, ps_cmpu0, ps_cmpo1). Returns 1, or
+// 100 * (case + 1) + reason at the first mismatch, which it also prints. Clobbers the PowerPC
+// state, so only run it before a game boots.
+extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmEstimateSmoke(u32 iterations, u32 seed)
+{
+  auto& system = Core::System::GetInstance();
+  auto& state = system.GetPPCState();
+  auto& interpreter = system.GetInterpreter();
+  std::array<u8, 64> ram{};
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  const std::array<UGeckoInstruction, 6> insts = {
+      EncodeAFormForWasmBlockTest(63, 1, 0, 2, 0, 26),  // frsqrte f1, f2
+      EncodeAFormForWasmBlockTest(4, 1, 0, 2, 0, 26),   // ps_rsqrte f1, f2
+      EncodeAFormForWasmBlockTest(59, 1, 0, 2, 0, 24),  // fres f1, f2
+      EncodeAFormForWasmBlockTest(4, 1, 0, 2, 0, 24),   // ps_res f1, f2
+      UGeckoInstruction{(4u << 26) | (3u << 23) | (2u << 16) | (3u << 11)},               // ps_cmpu0 cr3
+      UGeckoInstruction{(4u << 26) | (5u << 23) | (2u << 16) | (3u << 11) | (96u << 1)},  // ps_cmpo1 cr5
+  };
+  std::array<int, insts.size()> handles{};
+  for (u32 k = 0; k < insts.size(); ++k)
+  {
+    const std::array<PPCAnalyst::CodeOp, 1> ops = {
+        MakeWasmBlockTestOp(insts[k], 0x80003400 + 4 * k)};
+    const std::vector<u8> bytes = BuildWasmCachedInterpreterBlock(ops, layout, 0x80003500, true);
+    if (bytes.empty())
+      return 100 * (k + 1) + 1;
+    handles[k] = CompileWasmCachedInterpreterBlockForTest(bytes);
+    if (handles[k] <= 0)
+      return 100 * (k + 1) + 2;
+  }
+
+  u64 rng = 0x9e3779b97f4a7c15ULL ^ seed;
+  const auto next = [&rng] {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  static constexpr std::array<u64, 16> specials = {
+      0x0000000000000000, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000,
+      0x7ff8000000000000, 0x7ff0000000000001, 0xfff8000000000000, 0x0000000000000001,
+      0x000fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff, 0x3ff0000000000000,
+      0xbff0000000000000, 0x4f00000000000000, 0x4effffffffffffff, 0x8010000000000000,
+  };
+  const auto random_bits = [&]() -> u64 {
+    const u64 r = next();
+    const u64 mantissa = next() & ((1ULL << 52) - 1);
+    const u64 sign = (r >> 8) & 1 ? (1ULL << 63) : 0;
+    switch (r & 15)
+    {
+    case 0:
+      return specials[(r >> 4) & 15];
+    case 1:  // fres's exponent range edges
+      return sign | (u64{893 + ((r >> 12) % 5)} << 52) | mantissa;
+    case 2:
+      return sign | (u64{1146 + ((r >> 12) % 5)} << 52) | mantissa;
+    case 3:  // ps_rsqrte's single range edge
+      return (u64{1262 + ((r >> 12) % 4)} << 52) | mantissa;
+    case 4:  // denormal
+      return sign | mantissa;
+    case 5:
+    case 6:
+      return sign | (((r >> 12) % 2047) << 52) | mantissa;
+    default:  // positive normal, the inline path
+      return ((1 + (r >> 12) % 2046) << 52) | mantissa;
+    }
+  };
+
+  const u32 helper_calls_before = s_wasm_fp_call_count;
+  for (u32 iteration = 0; iteration < iterations; ++iteration)
+  {
+    const u64 a0 = random_bits(), a1 = random_bits(), b0 = random_bits(), b1 = random_bits();
+    const u64 sentinel = next();
+    const bool ni = (next() & 3) == 0;
+    for (u32 k = 0; k < insts.size(); ++k)
+    {
+      const auto setup = [&] {
+        state.msr.Hex = 1u << 13;
+        state.Exceptions = 0;
+        state.fpscr.Hex = 0;
+        state.fpscr.NI = ni;
+        state.ps[1].SetBoth(sentinel, ~sentinel);
+        state.ps[2].SetBoth(a0, a1);
+        state.ps[3].SetBoth(b0, b1);
+        state.cr.SetField(3, 0);
+        state.cr.SetField(5, 0);
+      };
+      setup();
+      if (DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+              handles[k], static_cast<int>(reinterpret_cast<std::uintptr_t>(&state))) != 0)
+        return 100 * (k + 1) + 3;
+      const u64 w0 = state.ps[1].PS0AsU64(), w1 = state.ps[1].PS1AsU64();
+      const u32 wf = state.fpscr.Hex, wc3 = state.cr.GetField(3), wc5 = state.cr.GetField(5);
+      setup();
+      Interpreter::GetInterpreterOp(insts[k])(interpreter, insts[k]);
+      const u64 e0 = state.ps[1].PS0AsU64(), e1 = state.ps[1].PS1AsU64();
+      const u32 ef = state.fpscr.Hex, ec3 = state.cr.GetField(3), ec5 = state.cr.GetField(5);
+      // The inline estimates skip FPRF, like every inline FP path; the compares set it.
+      const u32 fpscr_mask = k < 4 ? ~static_cast<u32>(FPRF_MASK) : ~0u;
+      const int reason = w0 != e0 ? 4 : w1 != e1 ? 5 : ((wf ^ ef) & fpscr_mask) ? 6 :
+                         (wc3 != ec3 || wc5 != ec5) ? 7 : 0;
+      if (reason != 0)
+      {
+        emscripten_log(EM_LOG_CONSOLE, "estimate smoke case %u iteration %u reason %d: in %016llx %016llx %016llx "
+                    "%016llx ni %d | wasm %016llx %016llx fpscr %08x cr %x %x | interp %016llx "
+                    "%016llx fpscr %08x cr %x %x\n",
+                    k, iteration, reason, static_cast<unsigned long long>(a0),
+                    static_cast<unsigned long long>(a1), static_cast<unsigned long long>(b0),
+                    static_cast<unsigned long long>(b1), ni ? 1 : 0,
+                    static_cast<unsigned long long>(w0), static_cast<unsigned long long>(w1), wf,
+                    wc3, wc5, static_cast<unsigned long long>(e0),
+                    static_cast<unsigned long long>(e1), ef, ec3, ec5);
+        return 100 * (k + 1) + reason;
+      }
+    }
+  }
+  emscripten_log(EM_LOG_CONSOLE, "estimate smoke: %u runs, %u took the interpreter path\n",
+              iterations * static_cast<u32>(insts.size()), s_wasm_fp_call_count - helper_calls_before);
+  return 1;
 }
 #endif
 
