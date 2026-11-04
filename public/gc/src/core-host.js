@@ -1408,13 +1408,15 @@ const CACHED_INTERPRETER_DISABLE_BITS = {
   // SNES Touch: branches inside a compiled block jump inside its WebAssembly function (default-on; ?innerjump=0 to turn off)
   innerjump:       1 << 19,
   regalloc:        1 << 20, // §28by GPR regalloc / dead-store-skip (default-off; ?regalloc=1 to enable)
-  shortprefix:     1 << 21, // §28ca lower JIT min-prefix 4→2 (default-off; ?shortprefix=1 to enable)
+  shortprefix:     1 << 21, // §28ca JIT min-prefix (SNES Touch: every block compiles by default; ?shortprefix=0 for a minimum of 4)
   smearcompile:    1 << 22, // §28ce cap JIT compiles/slice (default-off; ?smearcompile=1 to enable)
   fastmemhoist:    1 << 23, // §28cz per-block fastmem bounds-check hoist (ENABLE polarity; default-off; ?fastmemhoist=1)
   // SNES Touch: hot compiled blocks are recompiled together and chain to each other (default-on; ?wasmregion=0 to turn off)
   wasmregion:      1 << 24,
   // SNES Touch: read MSR.FP/LE once per block and compile psq_l/psq_st for the GQRs it reads (ENABLE polarity; default-off; ?fpplan=1)
   fpplan:          1 << 26,
+  // SNES Touch: the region's blocks are grouped into functions that branch between their members (default-on; ?wasmcluster=0 for one wrapper per block)
+  wasmcluster:     1 << 28,
   // Aliases the plan / TL;DR uses interchangeably:
   fastinputpoll: 1 << 1, // legacy synonym for meleecall (input-poll lives there)
   fastmem:       1 << 7, // legacy synonym for fastsystem (load/store-ish helpers)
@@ -1490,11 +1492,13 @@ function requestedCachedInterpreterDisableMask() {
   if (params.get("regalloc") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.regalloc;
   }
-  // §28ca short-prefix: DEFAULT-OFF. Drops MIN_WASM_PREFIX_INSTRUCTIONS 4→2
-  // so blocks of 2-3 PPC ops compile to WASM instead of falling to
-  // Interpret<false>. Audit (§28bz) showed 54% of JIT attempts reject as
-  // "too short" — biggest single bottleneck surface. ?shortprefix=1 to opt in.
-  if (params.get("shortprefix") !== "1") {
+  // §28ca short-prefix. SNES Touch: DEFAULT-ON. Every block compiles to WASM,
+  // however short, instead of blocks under 4 PPC ops falling to
+  // Interpret<false>: the hot ones join the region's grouped functions, where
+  // reaching them is a branch rather than a trip through the dispatcher
+  // (Need for Speed: Underground 2's race ~9% faster). ?shortprefix=0 for the
+  // old minimum of 4.
+  if (params.get("shortprefix") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.shortprefix;
   }
   // §28ce compile-burst smearing: DEFAULT-OFF. Caps JIT compiles per Run()
@@ -1527,6 +1531,9 @@ function requestedCachedInterpreterDisableMask() {
   }
   if (params.get("wasmregion") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmregion;
+  }
+  if (params.get("wasmcluster") === "0") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmcluster;
   }
   if (params.get("innerjump") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.innerjump;

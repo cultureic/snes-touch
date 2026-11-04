@@ -18,17 +18,21 @@ import type { Machine } from './machine'
 // gather pipe, dispatches compiled blocks directly, runs blocks on past conditional branches,
 // loops small loops inside WebAssembly, jumps inside a block's WebAssembly function when a branch
 // lands in the same block, skips the software fused multiply-add when it can give the same bits
-// without it, computes the reciprocal (square root) estimates from the hardware tables, and
-// recompiles hot blocks together into one module so they hand over to each other without the
-// dispatcher. Even so the JIT is well short of the GameCube's 486 MHz, so the emulated CPU runs at
-// half its clock (oc=0.5): games burn much of the clock waiting in loops Dolphin can't skip, and a
-// lower clock cuts that waiting. Need for Speed: Underground 2's race clock went from about a third
-// of real speed to about two thirds at the same frame rate, to about four fifths with the jumps
-// inside blocks, and to about 95% with the estimates and the block regions (about 120% with no
-// speed limit). 0.65 gave that game no more frames and slowed its heaviest stretches. A game that
-// already ran at full speed used less than half the clock here, so it loses nothing. The page's
-// own gamepad polling is off, since it would overwrite the app's input.
-const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=0.5&pacing=tick&nogamepad=1'
+// without it, computes the reciprocal (square root) estimates from the hardware tables,
+// recompiles hot blocks together into one module grouped into functions along their branches, so
+// they hand over to each other with a branch instead of a call or the dispatcher, and compiles
+// blocks of any length so the short hot ones join those groups. Even so the JIT is short of the
+// GameCube's 486 MHz, so the emulated CPU runs below its clock (oc): games burn much of the clock
+// waiting in loops Dolphin can't skip, and a lower clock cuts that waiting. At half the clock Need
+// for Speed: Underground 2's race clock went from about a third of real speed to about two thirds,
+// four fifths with the jumps inside blocks and 95% with the estimates and the block regions, but
+// the game drew only about 21 frames a second. With the grouped regions and the short blocks the
+// emulator runs that race at about 150% at half the clock with no speed limit, so the clock is now
+// 0.65: the race keeps real time with the same ~20% to spare as before and draws about 30 frames a
+// second (0.75 gave 37 with 12% to spare, 0.85 fell to 97% of real time). Tony Hawk's Pro Skater 3
+// stays at full speed and 60 frames a second. The page's own gamepad polling is off, since it would
+// overwrite the app's input.
+const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=0.65&pacing=tick&nogamepad=1'
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3
 

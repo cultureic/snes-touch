@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -2610,6 +2611,89 @@ struct WasmGprRegCache
 };
 static WasmGprRegCache s_gpr_rc;
 
+// SNES Touch: the floating-point counterpart. Each paired-single register the block uses lives in
+// two f64 locals (ps0, ps1) for the whole block instead of being loaded and stored by every FP
+// instruction: loaded in the prologue, written back wherever the GPR cache writes back (exits,
+// helpers that read guest state), reloaded after helpers that may write it, dirty the same sticky
+// way. The 32-bit halves some emitters use (lfd/stfd's byte-swapped words, fctiwz, stfiwx) read
+// and patch the local's bits. Opt-in (?fprcache=1): measured ~4% slower in Need for Speed:
+// Underground 2's race, the prologue loads and exit write-backs costing more than they save in
+// blocks that run millions of times a second and often leave early.
+constexpr u32 DOLPHIN_WEB_ENABLE_FPR_CACHE = 1u << 27;
+struct WasmFprRegCache
+{
+  bool active = false;
+  u32 ps_base = 0;                // == layout.ps_offset
+  std::array<s32, 32> local{};    // FPR i's ps0 local (ps1 is the next), -1 when not cached
+  std::array<bool, 64> dirty{};   // per lane, sticky
+  u32 scratch_local = 0;          // i32 for half-word writes
+};
+static WasmFprRegCache s_fpr_rc;
+
+// The cached lane holding `offset`: its local, its index (2 * register + lane), and the byte of
+// the lane the offset points at.
+inline bool FprCacheLane(u32 offset, u32* out_local, u32* out_index, u32* out_byte)
+{
+  if (!s_fpr_rc.active || offset < s_fpr_rc.ps_base)
+    return false;
+  const u32 rel = offset - s_fpr_rc.ps_base;
+  if (rel >= 32u * sizeof(PowerPC::PairedSingle))
+    return false;
+  const u32 reg = rel / sizeof(PowerPC::PairedSingle);
+  if (s_fpr_rc.local[reg] < 0)
+    return false;
+  const u32 lane = (rel % sizeof(PowerPC::PairedSingle)) / sizeof(u64);
+  *out_local = static_cast<u32>(s_fpr_rc.local[reg]) + lane;
+  *out_index = 2 * reg + lane;
+  *out_byte = rel % sizeof(u64);
+  return true;
+}
+
+u32 FprLaneOffset(u32 reg, u32 lane)
+{
+  return s_fpr_rc.ps_base + reg * static_cast<u32>(sizeof(PowerPC::PairedSingle)) +
+         lane * static_cast<u32>(sizeof(u64));
+}
+
+void EmitFprCacheFlushDirty(std::vector<u8>& body)
+{
+  if (!s_fpr_rc.active)
+    return;
+  for (u32 reg = 0; reg < 32; ++reg)
+  {
+    for (u32 lane = 0; lane < 2 && s_fpr_rc.local[reg] >= 0; ++lane)
+    {
+      if (!s_fpr_rc.dirty[2 * reg + lane])
+        continue;
+      EmitLocalGet(body, 0);
+      EmitLocalGet(body, static_cast<u32>(s_fpr_rc.local[reg]) + lane);
+      body.push_back(0x39);  // f64.store
+      body.push_back(0x03);
+      EmitU32Leb(body, FprLaneOffset(reg, lane));
+    }
+  }
+}
+
+// Reloads every cached register, or only `only` (after a helper that writes just it).
+void EmitFprCacheReload(std::vector<u8>& body, s32 only = -1)
+{
+  if (!s_fpr_rc.active)
+    return;
+  for (u32 reg = 0; reg < 32; ++reg)
+  {
+    if (s_fpr_rc.local[reg] < 0 || (only >= 0 && static_cast<u32>(only) != reg))
+      continue;
+    for (u32 lane = 0; lane < 2; ++lane)
+    {
+      EmitLocalGet(body, 0);
+      body.push_back(0x2b);  // f64.load
+      body.push_back(0x03);
+      EmitU32Leb(body, FprLaneOffset(reg, lane));
+      EmitLocalSet(body, static_cast<u32>(s_fpr_rc.local[reg]) + lane);
+    }
+  }
+}
+
 // §28cz fastmem bounds-check hoist plan. Built per block (gated on the enable
 // bit) BEFORE the emit loop by AnalyzeFastmemHoistPlan, which re-runs the exact
 // s_fmh_ grouping logic and records, per CodeOp, whether the op is the first
@@ -2653,8 +2737,11 @@ inline bool RegCacheGprIndex(u32 offset, u32* out_index)
 // Flush every dirty GPR local back to the guest-state struct. Stack-neutral, so
 // it is safe to splice before any state-touching import call and before the
 // block-end return. Dirty stays set on purpose (see struct comment).
+u32 s_wasm_built_flushes = 0;
 void EmitRegCacheFlushDirty(std::vector<u8>& body)
 {
+  ++s_wasm_built_flushes;
+  EmitFprCacheFlushDirty(body);
   if (!s_gpr_rc.active)
     return;
   for (u32 i = 0; i < 32; ++i)
@@ -2673,6 +2760,7 @@ void EmitRegCacheFlushDirty(std::vector<u8>& body)
 // arbitrary GPRs (interpret/system/HLE helpers). Stack-neutral.
 void EmitRegCacheReloadAll(std::vector<u8>& body)
 {
+  EmitFprCacheReload(body);
   if (!s_gpr_rc.active)
     return;
   for (u32 i = 0; i < 32; ++i)
@@ -2711,6 +2799,8 @@ void EmitI32Const(std::vector<u8>& body, u32 value)
   body.push_back(0x41);
   EmitI32Leb(body, static_cast<s32>(value));
 }
+
+void EmitI64Const(std::vector<u8>& body, u64 value);
 
 void EmitF64ConstBits(std::vector<u8>& body, u64 bits)
 {
@@ -2763,6 +2853,19 @@ void EmitStateLoadU32(std::vector<u8>& body, u32 offset)
     EmitLocalGet(body, WASM_GPR_LOCAL_BASE + gpr_index);
     return;
   }
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte % 4 == 0)
+  {
+    EmitLocalGet(body, fpr_local);
+    body.push_back(0xbd);  // i64.reinterpret_f64
+    if (fpr_byte == 4)
+    {
+      EmitI64Const(body, 32);
+      body.push_back(0x88);  // i64.shr_u
+    }
+    body.push_back(0xa7);  // i32.wrap_i64
+    return;
+  }
   ++s_wasm_emit_state_load_u32_count;
   EmitLocalGet(body, 0);
   body.push_back(0x28);
@@ -2772,6 +2875,12 @@ void EmitStateLoadU32(std::vector<u8>& body, u32 offset)
 
 void EmitStateLoadF64(std::vector<u8>& body, u32 offset)
 {
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte == 0)
+  {
+    EmitLocalGet(body, fpr_local);
+    return;
+  }
   ++s_wasm_emit_state_load_f64_count;
   EmitLocalGet(body, 0);
   body.push_back(0x2b);
@@ -2781,6 +2890,13 @@ void EmitStateLoadF64(std::vector<u8>& body, u32 offset)
 
 void EmitStateLoadI64(std::vector<u8>& body, u32 offset)
 {
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte == 0)
+  {
+    EmitLocalGet(body, fpr_local);
+    body.push_back(0xbd);  // i64.reinterpret_f64
+    return;
+  }
   ++s_wasm_emit_state_load_i64_count;
   EmitLocalGet(body, 0);
   body.push_back(0x29);
@@ -2822,6 +2938,29 @@ void EmitStateStoreU32Suffix(std::vector<u8>& body, u32 offset)
     s_gpr_rc.dirty[gpr_index] = true;
     return;
   }
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte % 4 == 0)
+  {
+    // [state_ptr, word]: patch that half of the lane's bits.
+    EmitLocalSet(body, s_fpr_rc.scratch_local);
+    body.push_back(0x1a);
+    EmitLocalGet(body, fpr_local);
+    body.push_back(0xbd);
+    EmitI64Const(body, fpr_byte == 4 ? 0x00000000ffffffffULL : 0xffffffff00000000ULL);
+    body.push_back(0x83);  // i64.and
+    EmitLocalGet(body, s_fpr_rc.scratch_local);
+    body.push_back(0xad);  // i64.extend_i32_u
+    if (fpr_byte == 4)
+    {
+      EmitI64Const(body, 32);
+      body.push_back(0x86);  // i64.shl
+    }
+    body.push_back(0x84);  // i64.or
+    body.push_back(0xbf);  // f64.reinterpret_i64
+    EmitLocalSet(body, fpr_local);
+    s_fpr_rc.dirty[fpr_index] = true;
+    return;
+  }
   ++s_wasm_emit_state_store_u32_count;
   body.push_back(0x36);
   body.push_back(0x02);
@@ -2830,6 +2969,14 @@ void EmitStateStoreU32Suffix(std::vector<u8>& body, u32 offset)
 
 void EmitStateStoreF64Suffix(std::vector<u8>& body, u32 offset)
 {
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte == 0)
+  {
+    EmitLocalSet(body, fpr_local);
+    body.push_back(0x1a);  // drop the state_ptr the prefix pushed
+    s_fpr_rc.dirty[fpr_index] = true;
+    return;
+  }
   ++s_wasm_emit_state_store_f64_count;
   body.push_back(0x39);
   body.push_back(0x03);
@@ -2838,6 +2985,15 @@ void EmitStateStoreF64Suffix(std::vector<u8>& body, u32 offset)
 
 void EmitStateStoreI64Suffix(std::vector<u8>& body, u32 offset)
 {
+  u32 fpr_local, fpr_index, fpr_byte;
+  if (FprCacheLane(offset, &fpr_local, &fpr_index, &fpr_byte) && fpr_byte == 0)
+  {
+    body.push_back(0xbf);  // f64.reinterpret_i64
+    EmitLocalSet(body, fpr_local);
+    body.push_back(0x1a);
+    s_fpr_rc.dirty[fpr_index] = true;
+    return;
+  }
   ++s_wasm_emit_state_store_i64_count;
   body.push_back(0x37);
   body.push_back(0x03);
@@ -4624,6 +4780,8 @@ void EmitFpCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcou
   // FP ops write FPRs (+CR/FPSCR), not GPRs — reload only the op's GPR outputs
   // (normally none), so the FP-heavy Melee path doesn't pay a full reload.
   EmitRegCacheReloadMask(body, op.regsOut);
+  if (op.fregOut >= 0)
+    EmitFprCacheReload(body, op.fregOut);
 }
 
 void EmitLfsImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 current_pc, u32 downcount)
@@ -4637,6 +4795,7 @@ void EmitLfsImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 curren
   body.push_back(0x10);
   EmitU32Leb(body, 6);
   EmitImportedHaltCheck(body);
+  EmitFprCacheReload(body, inst.FD);
 }
 
 void EmitStfsImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 current_pc,
@@ -4664,6 +4823,7 @@ void EmitLfdImportCall(std::vector<u8>& body, UGeckoInstruction inst, u32 curren
   body.push_back(0x10);
   EmitU32Leb(body, 8);
   EmitImportedHaltCheck(body);
+  EmitFprCacheReload(body, inst.FD);
 }
 
 void EmitFctiwzImportCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u32 downcount)
@@ -4677,6 +4837,7 @@ void EmitFctiwzImportCall(std::vector<u8>& body, const PPCAnalyst::CodeOp& op, u
   body.push_back(0x10);
   EmitU32Leb(body, 12);
   EmitImportedHaltCheck(body);
+  EmitFprCacheReload(body, op.inst.FD);
 }
 
 void EmitFctiwzFast(std::vector<u8>& body, const WasmStateLayout& layout,
@@ -8785,6 +8946,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
                                                 u32 loop_pc = 0,
                                                 bool allow_internal_jumps = false)
 {
+  s_wasm_built_flushes = 0;
   AnalyzeFastmemHoistability(ops);
   AnalyzeFastmemHoistPlan(ops);  // §28cz build the hoist plan (no-op unless enable bit set)
   const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
@@ -8885,6 +9047,53 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
     }
   }
 
+  // SNES Touch: the FPR cache (see WasmFprRegCache), after every other local.
+  s_fpr_rc = {};
+  s_fpr_rc.local.fill(-1);
+  if (DolphinWebFeatureEnabled(DOLPHIN_WEB_ENABLE_FPR_CACHE))
+  {
+    BitSet32 fprs;
+    for (const PPCAnalyst::CodeOp& op : ops)
+    {
+      if (op.skip)
+        continue;
+      fprs |= op.fregsIn;
+      if (op.fregOut >= 0)
+        fprs[op.fregOut] = true;
+    }
+    if (fprs.Count() != 0)
+    {
+      // locals declared so far: one per entry of each (count, type) group
+      u32 next = 1;
+      for (std::size_t g = 0, pos = 1; g < body[0]; ++g, pos += 2)
+        next += body[pos];
+      s_fpr_rc.active = true;
+      s_fpr_rc.ps_base = layout.ps_offset;
+      for (int reg : fprs)
+      {
+        s_fpr_rc.local[reg] = static_cast<s32>(next);
+        next += 2;
+      }
+      s_fpr_rc.scratch_local = next;
+      // after the existing (count, type) groups, before the code already emitted
+      const std::size_t groups_end = 1 + 2 * static_cast<std::size_t>(body[0]);
+      body[0] += 2;
+      body.insert(body.begin() + groups_end,
+                  {static_cast<u8>(2 * fprs.Count()), 0x7c, 0x01, 0x7f});
+      for (int reg : fprs)
+      {
+        for (u32 lane = 0; lane < 2; ++lane)
+        {
+          EmitLocalGet(body, 0);
+          body.push_back(0x2b);  // f64.load
+          body.push_back(0x03);
+          EmitU32Leb(body, FprLaneOffset(static_cast<u32>(reg), lane));
+          EmitLocalSet(body, static_cast<u32>(s_fpr_rc.local[reg]) + lane);
+        }
+      }
+    }
+  }
+
   if (s_wasm_fp_plan.active)
   {
     EmitStateLoadU32(body, layout.msr_offset);
@@ -8951,6 +9160,8 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
         if (bit >= 0 && bit < 32 && s_gpr_rc.present[bit])
           s_gpr_rc.dirty[bit] = true;
       }
+      if (op.fregOut >= 0 && s_fpr_rc.active && s_fpr_rc.local[op.fregOut] >= 0)
+        s_fpr_rc.dirty[2 * op.fregOut] = s_fpr_rc.dirty[2 * op.fregOut + 1] = true;
     }
     body.push_back(0x03);  // loop
     body.push_back(0x40);
@@ -9022,6 +9233,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
         }
         s_gpr_rc.active = false;  // §28cx C1: don't leak cache state on abort
         s_wasm_fp_plan.active = false;
+        s_fpr_rc.active = false;
         s_fmh_plan.active = false;  // §28cz: don't leak hoist plan on abort
         s_fmh_plan.ops.clear();
         return {};
@@ -9057,6 +9269,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
 
   s_gpr_rc.active = false;  // §28cx C1: cache state is per-block; clear on exit
   s_wasm_fp_plan.active = false;
+  s_fpr_rc.active = false;
   s_fmh_plan.active = false;  // §28cz: hoist plan is per-block; clear on exit
   s_fmh_plan.ops.clear();
   return bytes;
@@ -9080,11 +9293,13 @@ constexpr u32 WASM_REGION_MIN_WINDOW_RUNS = 64;      // to be a member
 constexpr u64 WASM_REGION_MIN_WINDOW_TOTAL = 100000;  // to bother at all
 constexpr u32 WASM_REGION_REBUILD_WINDOWS = 4;        // between builds
 constexpr u32 WASM_REGION_REBUILD_OUTSIDE_PERCENT = 20;
-constexpr std::size_t WASM_REGION_MAX_BLOCKS = 4000;
+constexpr std::size_t WASM_REGION_MAX_BLOCKS = 8000;
 // Bodies kept for blocks that may join a region; past this, new blocks are left out.
 constexpr std::size_t WASM_REGION_MAX_BODY_BYTES = 96u << 20;
 constexpr u32 WASM_REGION_IMPORTED_FUNCTIONS = WASM_IMPORT_FAST_MELEE_SERVICE_POLL_CALL_INDEX + 1;
 constexpr u32 WASM_REGION_HASH_MULTIPLIER = 0x9e3779b1;
+// Words per hash slot: pc (0 empty, 1 removed), member, its cluster, its place in the cluster.
+constexpr u32 WASM_REGION_HASH_WORDS = 4;
 
 struct WasmRegionBlock
 {
@@ -9100,6 +9315,10 @@ struct WasmRegionBlock
   std::vector<u32> exits;  // static successors
   bool dynamic_exit = false;
   s32 region_index = -1;
+  u32 gprs_used = 0;     // GPRs the block reads or writes
+  u32 gprs_written = 0;  // GPRs it may write
+  u32 flush_sites = 0;   // places its body writes cached GPRs back
+  bool may_change_features = false;  // has mtmsr, mtspr, rfi or sc
 };
 
 struct WasmRegion
@@ -9107,7 +9326,7 @@ struct WasmRegion
   std::vector<const void*> members;  // keys of s_wasm_region_blocks, null once destroyed
   std::unique_ptr<u32[]> valid;
   std::unique_ptr<u32[]> runs;  // counted by the wrappers
-  std::unique_ptr<u32[]> hash;  // {pc, index} pairs; pc 0 is empty, 1 removed
+  std::unique_ptr<u32[]> hash;  // WASM_REGION_HASH_WORDS per slot
   u32 hash_bits = 0;
   s32 base_handle = 0;
 };
@@ -9182,6 +9401,15 @@ void RegisterWasmRegionBlock(const void* key, s32* handle_slot, const u32* runs_
   block.seen_runs = *runs_slot;
   block.body = std::move(s_wasm_built_body);
   s_wasm_built_body.clear();
+  block.flush_sites = s_wasm_built_flushes;
+  for (const PPCAnalyst::CodeOp& op : ops)
+  {
+    block.gprs_used |= (op.regsIn | op.regsOut).m_val;
+    block.gprs_written |= op.regsOut.m_val;
+    const UGeckoInstruction inst = op.inst;
+    block.may_change_features |= (inst.OPCD == 31 && (inst.SUBOP10 == 146 || inst.SUBOP10 == 467)) ||
+                                 (inst.OPCD == 19 && inst.SUBOP10 == 50) || inst.OPCD == 17;
+  }
   const auto add_exit = [&block](u32 target) {
     if (std::find(block.exits.begin(), block.exits.end(), target) == block.exits.end())
       block.exits.push_back(target);
@@ -9225,11 +9453,11 @@ void ForgetWasmRegionBlock(const void* key)
     region.members[index] = nullptr;
     const u32 mask = (1u << region.hash_bits) - 1;
     for (u32 slot = WasmRegionHashSlot(found->second.pc, region.hash_bits);
-         region.hash[2 * slot] != 0; slot = (slot + 1) & mask)
+         region.hash[WASM_REGION_HASH_WORDS * slot] != 0; slot = (slot + 1) & mask)
     {
-      if (region.hash[2 * slot + 1] == static_cast<u32>(index))
+      if (region.hash[WASM_REGION_HASH_WORDS * slot + 1] == static_cast<u32>(index))
       {
-        region.hash[2 * slot] = 1;
+        region.hash[WASM_REGION_HASH_WORDS * slot] = 1;
         break;
       }
     }
@@ -9417,7 +9645,7 @@ void EmitWasmRegionWrapper(std::vector<u8>& code, const WasmRegionBlock& block, 
     body.push_back(0x40);
     const auto emit_slot_word = [&body, hash](u32 word) {
       EmitLocalGet(body, 1);
-      EmitI32Const(body, 3);
+      EmitI32Const(body, 4);  // WASM_REGION_HASH_WORDS words
       body.push_back(0x74);
       body.push_back(0x28);
       body.push_back(0x02);
@@ -9503,26 +9731,629 @@ std::vector<u8> BuildWasmRegionModule(const std::vector<WasmRegionBlock*>& membe
   return bytes;
 }
 
-// At a timeslice boundary, so no compiled block is running. `chosen` is hottest first.
-void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen)
+// SNES Touch: region clusters. A wrapper's call into its block's own function and its tail call
+// to the next wrapper cost about as much as the wrapper's bookkeeping, and every block-to-block
+// transition in the region paid both: the wrappers alone were ~15% of the emulation thread in Need
+// for Speed: Underground 2. So the region's blocks are grouped along their static exits (an exit
+// weighs its source's runs split by its targets' runs; groups merge heaviest exit first, up to a
+// size cap), and each group is one function: a loop around a br_table over its members, each
+// member being the block's own function body with its returns turned into branches out of it,
+// followed by what the wrapper did. A transition to a later member of the same group is a branch
+// forward, to an earlier one or through the hash it goes round the loop, and only a transition to
+// another group is a tail call. The wrapper's pc = npc store is gone (RunWasmBlock sets pc from npc
+// when the region hands back, and nothing inside reads pc), and only members with an instruction
+// that can change the CPU features check them. ?wasmcluster=0 keeps one wrapper per block.
+constexpr u32 DOLPHIN_WEB_DISABLE_WASM_CLUSTERS = 1u << 28;
+constexpr std::size_t WASM_CLUSTER_MAX_BYTES = 128u << 10;
+constexpr u32 WASM_CLUSTER_MAX_MEMBERS = 256;
+// Locals of a cluster function: 0 state, 1 the member to start at (afterwards scratch, as in every
+// block), 2..40 as in every block, then these.
+constexpr u32 WASM_CLUSTER_NEXT_LOCAL = 41;    // the member the loop runs next
+constexpr u32 WASM_CLUSTER_RESULT_LOCAL = 42;  // a member's result, then its cycles, then a slot
+constexpr u32 WASM_CLUSTER_NPC_LOCAL = 43;
+// Transitions that don't just branch forward: back round the loop (static, through the hash), and
+// to another cluster (static, through the hash).
+enum WasmClusterTransition : u32
 {
+  WASM_CLUSTER_BACK_STATIC,
+  WASM_CLUSTER_BACK_DYNAMIC,
+  WASM_CLUSTER_CROSS_STATIC,
+  WASM_CLUSTER_CROSS_DYNAMIC,
+  WASM_CLUSTER_TRANSITION_COUNT
+};
+std::array<u32, WASM_CLUSTER_TRANSITION_COUNT> s_wasm_cluster_transitions{};
+u32 s_wasm_region_clusters = 0;
+u32 s_wasm_region_largest_cluster = 0;
+u32 s_wasm_cluster_unrewritable = 0;
+
+bool ReadWasmU32Leb(std::span<const u8> bytes, std::size_t& pos, u32* value)
+{
+  u32 result = 0;
+  for (u32 shift = 0; shift < 35; shift += 7)
+  {
+    if (pos >= bytes.size())
+      return false;
+    const u8 byte = bytes[pos++];
+    result |= static_cast<u32>(byte & 0x7f) << shift;
+    if ((byte & 0x80) == 0)
+    {
+      if (value)
+        *value = result;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SkipWasmLeb(std::span<const u8> bytes, std::size_t& pos)
+{
+  for (u32 i = 0; i < 10; ++i)
+  {
+    if (pos >= bytes.size())
+      return false;
+    if ((bytes[pos++] & 0x80) == 0)
+      return true;
+  }
+  return false;
+}
+
+// A block's function body as the code of a region member, to sit inside a `block (result i32)`:
+// it must declare exactly the usual locals (the cluster function declares them once), every
+// `return` becomes a `br` out of that block, and the function's own closing `end` goes. False for
+// anything it doesn't know how to move.
+bool RewriteWasmBodyAsRegionMember(std::span<const u8> body, std::vector<u8>& out)
+{
+  static constexpr u8 locals5[] = {0x05, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c,
+                                   0x01, 0x7f, 0x20, 0x7f};
+  static constexpr u8 locals6[] = {0x06, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c,
+                                   0x01, 0x7f, 0x20, 0x7f, 0x01, 0x7f};
+  std::size_t pos;
+  if (body.size() > sizeof(locals6) && std::equal(std::begin(locals6), std::end(locals6), body.begin()))
+    pos = sizeof(locals6);
+  else if (body.size() > sizeof(locals5) &&
+           std::equal(std::begin(locals5), std::end(locals5), body.begin()))
+    pos = sizeof(locals5);
+  else
+    return false;
+  out.clear();
+  out.reserve(body.size());
+  u32 depth = 0;
+  while (pos < body.size())
+  {
+    const std::size_t start = pos;
+    const u8 op = body[pos++];
+    switch (op)
+    {
+    case 0x02:  // block
+    case 0x03:  // loop
+    case 0x04:  // if
+    {
+      if (pos >= body.size())
+        return false;
+      const u8 type = body[pos++];
+      if (type != 0x40 && type != 0x7f && type != 0x7e && type != 0x7d && type != 0x7c)
+        return false;
+      ++depth;
+      break;
+    }
+    case 0x0b:  // end
+      if (depth == 0)
+        return pos == body.size();
+      --depth;
+      break;
+    case 0x0f:  // return: out of the member's block instead
+      out.push_back(0x0c);
+      EmitU32Leb(out, depth);
+      continue;
+    case 0x0c:  // br
+    case 0x0d:  // br_if
+    case 0x10:  // call
+    case 0x20:  // local.get
+    case 0x21:  // local.set
+    case 0x22:  // local.tee
+    case 0x23:  // global.get
+    case 0x24:  // global.set
+      if (!ReadWasmU32Leb(body, pos, nullptr))
+        return false;
+      break;
+    case 0x0e:  // br_table
+    {
+      u32 targets;
+      if (!ReadWasmU32Leb(body, pos, &targets))
+        return false;
+      for (u32 i = 0; i <= targets; ++i)
+      {
+        if (!ReadWasmU32Leb(body, pos, nullptr))
+          return false;
+      }
+      break;
+    }
+    case 0x11:  // call_indirect
+      if (!ReadWasmU32Leb(body, pos, nullptr) || !ReadWasmU32Leb(body, pos, nullptr))
+        return false;
+      break;
+    case 0x3f:  // memory.size
+    case 0x40:  // memory.grow
+      if (pos >= body.size())
+        return false;
+      ++pos;
+      break;
+    case 0x41:  // i32.const
+    case 0x42:  // i64.const
+      if (!SkipWasmLeb(body, pos))
+        return false;
+      break;
+    case 0x43:  // f32.const
+      pos += 4;
+      break;
+    case 0x44:  // f64.const
+      pos += 8;
+      break;
+    case 0xfc:
+    {
+      u32 sub;
+      if (!ReadWasmU32Leb(body, pos, &sub) || sub > 7)  // only the saturating truncations
+        return false;
+      break;
+    }
+    default:
+      if (op >= 0x28 && op <= 0x3e)  // loads and stores: align, offset
+      {
+        if (!ReadWasmU32Leb(body, pos, nullptr) || !ReadWasmU32Leb(body, pos, nullptr))
+          return false;
+        break;
+      }
+      if (op == 0x00 || op == 0x01 || op == 0x05 || op == 0x1a || op == 0x1b ||
+          (op >= 0x45 && op <= 0xc4))
+      {
+        break;
+      }
+      return false;
+    }
+    if (pos > body.size())
+      return false;
+    out.insert(out.end(), body.begin() + start, body.begin() + pos);
+  }
+  return false;
+}
+
+struct WasmClusterPlan
+{
+  std::vector<u32> cluster_of;  // per member
+  std::vector<u32> local_of;    // per member: its place in its cluster
+  std::vector<std::vector<u32>> clusters;  // each cluster's members, by PC
+};
+
+// Groups the region's members along their static exits; `runs` are their runs in the last window.
+WasmClusterPlan PartitionWasmRegion(const std::vector<WasmRegionBlock*>& members,
+                                    const std::unordered_map<u32, u32>& index_of_pc,
+                                    const std::vector<u32>& runs)
+{
+  const u32 count = static_cast<u32>(members.size());
+  std::vector<std::tuple<double, u32, u32>> exits;
+  std::vector<u32> targets;
+  for (u32 u = 0; u < count; ++u)
+  {
+    double sum = 0;
+    targets.clear();
+    for (const u32 pc : members[u]->exits)
+    {
+      const auto found = index_of_pc.find(pc);
+      if (found == index_of_pc.end() || found->second == u)
+        continue;
+      targets.push_back(found->second);
+      sum += runs[found->second];
+    }
+    if (sum <= 0)
+      continue;
+    for (const u32 v : targets)
+      exits.emplace_back(static_cast<double>(runs[u]) * runs[v] / sum, u, v);
+  }
+  std::sort(exits.begin(), exits.end(),
+            [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+  std::vector<u32> parent(count), size(count);
+  std::vector<std::size_t> bytes(count);
+  for (u32 k = 0; k < count; ++k)
+  {
+    parent[k] = k;
+    size[k] = 1;
+    bytes[k] = members[k]->body.size();
+  }
+  const auto find = [&parent](u32 x) {
+    while (parent[x] != x)
+    {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  for (const auto& [weight, u, v] : exits)
+  {
+    const u32 a = find(u);
+    const u32 b = find(v);
+    if (a == b || bytes[a] + bytes[b] > WASM_CLUSTER_MAX_BYTES ||
+        size[a] + size[b] > WASM_CLUSTER_MAX_MEMBERS)
+    {
+      continue;
+    }
+    parent[b] = a;
+    size[a] += size[b];
+    bytes[a] += bytes[b];
+  }
+  WasmClusterPlan plan;
+  plan.cluster_of.resize(count);
+  plan.local_of.resize(count);
+  std::unordered_map<u32, u32> cluster_of_root;
+  for (u32 k = 0; k < count; ++k)
+  {
+    const auto [it, inserted] =
+        cluster_of_root.try_emplace(find(k), static_cast<u32>(plan.clusters.size()));
+    if (inserted)
+      plan.clusters.emplace_back();
+    plan.clusters[it->second].push_back(k);
+  }
+  for (u32 c = 0; c < plan.clusters.size(); ++c)
+  {
+    std::vector<u32>& list = plan.clusters[c];
+    std::sort(list.begin(), list.end(),
+              [&members](u32 a, u32 b) { return members[a]->pc < members[b]->pc; });
+    for (u32 i = 0; i < list.size(); ++i)
+    {
+      plan.cluster_of[list[i]] = c;
+      plan.local_of[list[i]] = i;
+    }
+  }
+  return plan;
+}
+
+void EmitCountAbsolute(std::vector<u8>& body, const void* counter)
+{
+  const u32 address = static_cast<u32>(reinterpret_cast<std::uintptr_t>(counter));
+  EmitI32Const(body, 0);
+  EmitI32LoadAbsolute(body, address);
+  EmitI32Const(body, 1);
+  body.push_back(0x6a);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, address);
+}
+
+// One member of a cluster function: its code inside a block, then what its wrapper did. Every path
+// out of it branches to another member or leaves the function.
+void EmitWasmClusterMember(std::vector<u8>& body, const std::vector<u8>& member_code,
+                           const WasmRegionBlock& block, u32 index, const WasmClusterPlan& plan,
+                           const std::unordered_map<u32, u32>& index_of_pc,
+                           const WasmRegion& region, u32 feature_flags)
+{
+  const u32 cluster = plan.cluster_of[index];
+  const u32 local = plan.local_of[index];
+  // From the member's top level: a later member's block is (its place - ours - 1) out, the loop
+  // (cluster size - 1 - ours).
+  const u32 to_loop = static_cast<u32>(plan.clusters[cluster].size()) - 1 - local;
+  const auto emit_br = [&body](u32 depth) {
+    body.push_back(0x0c);
+    EmitU32Leb(body, depth);
+  };
+  const auto leave = [&body] {
+    EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+    body.push_back(0x0f);
+  };
+
+  // A fresh function starts with its locals zeroed; the internal-jump segment relies on it.
+  EmitI32Const(body, 0);
+  EmitLocalSet(body, WASM_SEGMENT_LOCAL);
+  EmitCountAbsolute(body, &region.runs[index]);
+  body.push_back(0x02);
+  body.push_back(0x7f);
+  body.insert(body.end(), member_code.begin(), member_code.end());
+  body.push_back(0x0b);
+  EmitLocalSet(body, WASM_CLUSTER_RESULT_LOCAL);
+
+  // 1 halted; a side exit or a spent loop tells its cycles; 0 is the natural end.
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x71);
+  body.push_back(0x45);
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitCountWasmRegionExit(body, WASM_REGION_EXIT_HALT);
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x0f);
+  body.push_back(0x0b);
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  EmitI32Const(body, ~WASM_SIDE_EXIT_FLAG);
+  body.push_back(0x71);
+  EmitLocalSet(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x05);
+  EmitI32Const(body, block.downcount);
+  EmitLocalSet(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x0b);
+
+  // downcount -= cycles; back to the dispatcher once the timeslice is over
+  EmitLocalGet(body, 0);
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_downcount_offset);
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x6b);
+  body.push_back(0x22);
+  EmitU32Leb(body, WASM_CLUSTER_RESULT_LOCAL);
+  body.push_back(0x36);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_downcount_offset);
+  EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+  EmitI32Const(body, 0);
+  body.push_back(0x4c);  // i32.le_s
+  body.push_back(0x04);
+  body.push_back(0x40);
+  EmitCountWasmRegionExit(body, WASM_REGION_EXIT_SLICE);
+  leave();
+  body.push_back(0x0b);
+  if (block.may_change_features)
+  {
+    EmitLocalGet(body, 0);
+    body.push_back(0x28);
+    body.push_back(0x02);
+    EmitU32Leb(body, s_wasm_region_feature_flags_offset);
+    EmitI32Const(body, feature_flags);
+    body.push_back(0x47);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitCountWasmRegionExit(body, WASM_REGION_EXIT_FEATURES);
+    leave();
+    body.push_back(0x0b);
+  }
+  EmitLocalGet(body, 0);
+  body.push_back(0x28);
+  body.push_back(0x02);
+  EmitU32Leb(body, s_wasm_region_npc_offset);
+  EmitLocalSet(body, WASM_CLUSTER_NPC_LOCAL);
+
+  // Static exits, from `depth` constructs inside the member's top level.
+  for (const u32 target_pc : block.exits)
+  {
+    const auto found = index_of_pc.find(target_pc);
+    if (found == index_of_pc.end())
+      continue;
+    const u32 target = found->second;
+    EmitLocalGet(body, WASM_CLUSTER_NPC_LOCAL);
+    EmitI32Const(body, target_pc);
+    body.push_back(0x46);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitI32LoadAbsolute(body, static_cast<u32>(reinterpret_cast<std::uintptr_t>(&region.valid[target])));
+    body.push_back(0x04);
+    body.push_back(0x40);
+    constexpr u32 depth = 2;
+    if (plan.cluster_of[target] == cluster)
+    {
+      const u32 place = plan.local_of[target];
+      if (place > local)
+      {
+        emit_br(depth + place - local - 1);
+      }
+      else
+      {
+        EmitCountAbsolute(body, &s_wasm_cluster_transitions[WASM_CLUSTER_BACK_STATIC]);
+        EmitI32Const(body, place);
+        EmitLocalSet(body, WASM_CLUSTER_NEXT_LOCAL);
+        emit_br(depth + to_loop);
+      }
+    }
+    else
+    {
+      EmitCountAbsolute(body, &s_wasm_cluster_transitions[WASM_CLUSTER_CROSS_STATIC]);
+      EmitLocalGet(body, 0);
+      EmitI32Const(body, plan.local_of[target]);
+      body.push_back(0x12);  // return_call
+      EmitU32Leb(body, WASM_REGION_IMPORTED_FUNCTIONS + plan.cluster_of[target]);
+    }
+    body.push_back(0x0b);
+    EmitCountWasmRegionExit(body, WASM_REGION_EXIT_DEAD);
+    leave();
+    body.push_back(0x0b);
+  }
+
+  if (block.dynamic_exit)
+  {
+    const u32 hash = static_cast<u32>(reinterpret_cast<std::uintptr_t>(region.hash.get()));
+    const auto emit_slot_word = [&body, hash](u32 word) {
+      EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+      EmitI32Const(body, 4);  // WASM_REGION_HASH_WORDS words
+      body.push_back(0x74);
+      body.push_back(0x28);
+      body.push_back(0x02);
+      EmitU32Leb(body, hash + 4 * word);
+    };
+    EmitLocalGet(body, WASM_CLUSTER_NPC_LOCAL);
+    EmitI32Const(body, 2);
+    body.push_back(0x76);
+    EmitI32Const(body, WASM_REGION_HASH_MULTIPLIER);
+    body.push_back(0x6c);
+    EmitI32Const(body, 32 - region.hash_bits);
+    body.push_back(0x76);
+    EmitLocalSet(body, WASM_CLUSTER_RESULT_LOCAL);
+    body.push_back(0x02);
+    body.push_back(0x40);
+    body.push_back(0x03);
+    body.push_back(0x40);
+    emit_slot_word(0);
+    EmitLocalGet(body, WASM_CLUSTER_NPC_LOCAL);
+    body.push_back(0x46);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    emit_slot_word(2);
+    EmitI32Const(body, cluster);
+    body.push_back(0x46);
+    body.push_back(0x04);
+    body.push_back(0x40);
+    EmitCountAbsolute(body, &s_wasm_cluster_transitions[WASM_CLUSTER_BACK_DYNAMIC]);
+    emit_slot_word(3);
+    EmitLocalSet(body, WASM_CLUSTER_NEXT_LOCAL);
+    emit_br(4 + to_loop);
+    body.push_back(0x0b);
+    EmitCountAbsolute(body, &s_wasm_cluster_transitions[WASM_CLUSTER_CROSS_DYNAMIC]);
+    EmitLocalGet(body, 0);
+    emit_slot_word(3);
+    emit_slot_word(2);
+    body.push_back(0x13);  // return_call_indirect through the clusters' table
+    EmitU32Leb(body, 1);
+    EmitU32Leb(body, 1);
+    body.push_back(0x0b);
+    emit_slot_word(0);
+    body.push_back(0x45);
+    body.push_back(0x0d);  // br_if: an empty slot, not in the region
+    EmitU32Leb(body, 1);
+    EmitLocalGet(body, WASM_CLUSTER_RESULT_LOCAL);
+    EmitI32Const(body, 1);
+    body.push_back(0x6a);
+    EmitI32Const(body, (1u << region.hash_bits) - 1);
+    body.push_back(0x71);
+    EmitLocalSet(body, WASM_CLUSTER_RESULT_LOCAL);
+    emit_br(0);
+    body.push_back(0x0b);
+    body.push_back(0x0b);
+  }
+
+  EmitCountWasmRegionExit(body, block.dynamic_exit ? WASM_REGION_EXIT_OUTSIDE_DYNAMIC :
+                                                      WASM_REGION_EXIT_OUTSIDE_STATIC);
+  leave();
+}
+
+// The region as clusters: one (state, member) function per cluster, then one (state) entry per
+// member for the dispatcher, in table "t". Table 1 holds the clusters for the hash's tail calls.
+std::vector<u8> BuildWasmClusterRegionModule(const std::vector<WasmRegionBlock*>& members,
+                                             const std::vector<std::vector<u8>>& codes,
+                                             const WasmClusterPlan& plan,
+                                             const std::unordered_map<u32, u32>& index_of_pc,
+                                             const WasmRegion& region, u32 feature_flags)
+{
+  const u32 count = static_cast<u32>(members.size());
+  const u32 clusters = static_cast<u32>(plan.clusters.size());
+  std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+  EmitWasmBlockTypesAndImports(bytes);
+
+  std::vector<u8> functions;
+  EmitU32Leb(functions, clusters + count);
+  functions.insert(functions.end(), clusters, 0x01);
+  functions.insert(functions.end(), count, 0x00);
+  EmitSection(bytes, 3, functions);
+
+  std::vector<u8> tables = {0x02, 0x70, 0x01};
+  EmitU32Leb(tables, count);
+  EmitU32Leb(tables, count);
+  tables.insert(tables.end(), {0x70, 0x01});
+  EmitU32Leb(tables, clusters);
+  EmitU32Leb(tables, clusters);
+  EmitSection(bytes, 4, tables);
+
+  std::vector<u8> exports = {0x01};
+  EmitName(exports, "t");
+  exports.push_back(0x01);
+  exports.push_back(0x00);
+  EmitSection(bytes, 7, exports);
+
+  std::vector<u8> elements = {0x02, 0x00, 0x41, 0x00, 0x0b};
+  EmitU32Leb(elements, count);
+  for (u32 k = 0; k < count; ++k)
+    EmitU32Leb(elements, WASM_REGION_IMPORTED_FUNCTIONS + clusters + k);
+  elements.insert(elements.end(), {0x02, 0x01, 0x41, 0x00, 0x0b, 0x00});
+  EmitU32Leb(elements, clusters);
+  for (u32 c = 0; c < clusters; ++c)
+    EmitU32Leb(elements, WASM_REGION_IMPORTED_FUNCTIONS + c);
+  EmitSection(bytes, 9, elements);
+
+  std::vector<u8> code;
+  EmitU32Leb(code, clusters + count);
+  std::vector<u8> body;
+  for (u32 c = 0; c < clusters; ++c)
+  {
+    const std::vector<u32>& list = plan.clusters[c];
+    const u32 size = static_cast<u32>(list.size());
+    body = {0x07, 0x02, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f, 0x01, 0x7f, 0x03, 0x7f};
+    EmitLocalGet(body, 1);
+    EmitLocalSet(body, WASM_CLUSTER_NEXT_LOCAL);
+    body.push_back(0x03);  // loop
+    body.push_back(0x40);
+    for (u32 i = 0; i < size; ++i)
+    {
+      body.push_back(0x02);
+      body.push_back(0x40);
+    }
+    EmitLocalGet(body, WASM_CLUSTER_NEXT_LOCAL);
+    body.push_back(0x0e);  // br_table
+    EmitU32Leb(body, size);
+    for (u32 i = 0; i < size; ++i)
+      EmitU32Leb(body, i);
+    EmitU32Leb(body, size - 1);
+    for (u32 i = 0; i < size; ++i)
+    {
+      body.push_back(0x0b);
+      EmitWasmClusterMember(body, codes[list[i]], *members[list[i]], list[i], plan, index_of_pc,
+                            region, feature_flags);
+    }
+    body.push_back(0x0b);  // loop
+    body.push_back(0x00);  // unreachable
+    body.push_back(0x0b);
+    s_wasm_region_largest_cluster =
+        std::max(s_wasm_region_largest_cluster, static_cast<u32>(body.size()));
+    EmitU32Leb(code, static_cast<u32>(body.size()));
+    code.insert(code.end(), body.begin(), body.end());
+  }
+  for (u32 k = 0; k < count; ++k)
+  {
+    body = {0x00};
+    EmitLocalGet(body, 0);
+    EmitI32Const(body, plan.local_of[k]);
+    body.push_back(0x12);
+    EmitU32Leb(body, WASM_REGION_IMPORTED_FUNCTIONS + plan.cluster_of[k]);
+    body.push_back(0x0b);
+    EmitU32Leb(code, static_cast<u32>(body.size()));
+    code.insert(code.end(), body.begin(), body.end());
+  }
+  EmitSection(bytes, 10, code);
+  return bytes;
+}
+
+// At a timeslice boundary, so no compiled block is running. `chosen` is hottest first.
+void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen,
+                     const std::vector<u32>& chosen_runs)
+{
+  const bool clustered = !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASM_CLUSTERS);
   std::vector<WasmRegionBlock*> members;
   std::vector<const void*> keys;
+  std::vector<u32> runs;
+  std::vector<std::vector<u8>> codes;
   std::unordered_map<u32, u32> index_of_pc;
-  for (const void* key : chosen)
+  std::vector<u8> code;
+  for (std::size_t i = 0; i < chosen.size(); ++i)
   {
     if (members.size() >= WASM_REGION_MAX_BLOCKS)
       break;
-    WasmRegionBlock& block = s_wasm_region_blocks.find(key)->second;
+    WasmRegionBlock& block = s_wasm_region_blocks.find(chosen[i])->second;
     if (index_of_pc.contains(block.pc))
       continue;
+    if (clustered && !RewriteWasmBodyAsRegionMember(block.body, code))
+    {
+      ++s_wasm_cluster_unrewritable;
+      continue;
+    }
     index_of_pc.emplace(block.pc, static_cast<u32>(members.size()));
     members.push_back(&block);
-    keys.push_back(key);
+    keys.push_back(chosen[i]);
+    runs.push_back(chosen_runs[i]);
+    if (clustered)
+      codes.push_back(code);
   }
   const u32 count = static_cast<u32>(members.size());
   if (count < 2)
     return;
+  const WasmClusterPlan plan =
+      clustered ? PartitionWasmRegion(members, index_of_pc, runs) : WasmClusterPlan{};
 
   auto region = std::make_unique<WasmRegion>();
   region->members = std::move(keys);
@@ -9532,18 +10363,24 @@ void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen)
   while ((1u << region->hash_bits) < 2 * count)
     ++region->hash_bits;
   const u32 mask = (1u << region->hash_bits) - 1;
-  region->hash = std::make_unique<u32[]>(2 * (mask + 1));
+  region->hash = std::make_unique<u32[]>(WASM_REGION_HASH_WORDS * (mask + 1));
   for (u32 k = 0; k < count; ++k)
   {
     region->valid[k] = 1;
     u32 slot = WasmRegionHashSlot(members[k]->pc, region->hash_bits);
-    while (region->hash[2 * slot] != 0)
+    while (region->hash[WASM_REGION_HASH_WORDS * slot] != 0)
       slot = (slot + 1) & mask;
-    region->hash[2 * slot] = members[k]->pc;
-    region->hash[2 * slot + 1] = k;
+    u32* const words = &region->hash[WASM_REGION_HASH_WORDS * slot];
+    words[0] = members[k]->pc;
+    words[1] = k;
+    words[2] = clustered ? plan.cluster_of[k] : 0;
+    words[3] = clustered ? plan.local_of[k] : 0;
   }
 
-  const std::vector<u8> bytes = BuildWasmRegionModule(members, index_of_pc, *region, feature_flags);
+  const std::vector<u8> bytes =
+      clustered ? BuildWasmClusterRegionModule(members, codes, plan, index_of_pc, *region,
+                                               feature_flags) :
+                  BuildWasmRegionModule(members, index_of_pc, *region, feature_flags);
   const auto imports = WasmBlockImportIndices();
   const int base = DolphinWeb_CompileWasmRegion(bytes.data(), static_cast<int>(bytes.size()),
                                                 static_cast<int>(count), imports.data());
@@ -9579,12 +10416,66 @@ void BuildWasmRegion(u32 feature_flags, const std::vector<const void*>& chosen)
   ++s_wasm_region_builds;
   s_wasm_region_members = count;
   s_wasm_region_bytes = static_cast<u32>(bytes.size());
+  s_wasm_region_clusters = static_cast<u32>(plan.clusters.size());
 }
+
+#ifndef DOLPHIN_WEB_EDGE_PROFILE
+#define DOLPHIN_WEB_EDGE_PROFILE 0
+#endif
+#if DOLPHIN_WEB_EDGE_PROFILE
+// Diagnostic build: every block-to-block transition the dispatcher sees, by start PCs. Regions are
+// never built, so every transition goes through the dispatcher. Posted to the disc worker once per
+// window with the compiled blocks' sizes and register use.
+std::unordered_map<u64, u32> s_edge_profile;
+u32 s_edge_profile_prev = 0;
+
+void RecordEdgeProfile(u32 pc)
+{
+  ++s_edge_profile[(static_cast<u64>(s_edge_profile_prev) << 32) | pc];
+  s_edge_profile_prev = pc;
+}
+
+void PostEdgeProfile()
+{
+  std::vector<u32> edges;
+  for (const auto& [key, count] : s_edge_profile)
+  {
+    if (count < 4)
+      continue;
+    edges.insert(edges.end(), {static_cast<u32>(key >> 32), static_cast<u32>(key), count});
+  }
+  std::vector<u32> blocks;
+  for (const auto& [key, block] : s_wasm_region_blocks)
+  {
+    blocks.insert(blocks.end(),
+                  {block.pc, block.feature_flags, static_cast<u32>(block.body.size()),
+                   block.gprs_used, block.gprs_written, *block.runs_slot,
+                   static_cast<u32>(block.exits.size()) | (block.dynamic_exit ? 0x100u : 0u) |
+                       (block.flush_sites << 16),
+                   block.downcount});
+    for (std::size_t j = 0; j < 4; ++j)
+      blocks.push_back(j < block.exits.size() ? block.exits[j] : 0);
+  }
+  EM_ASM({
+    self.postMessage({type: "dolphin-wasm-region-dump",
+                      bytes: new Uint8Array(Module.HEAPU8.buffer, $0, $1 * 4).slice(),
+                      pcs: Array.from(new Uint32Array(Module.HEAPU8.buffer, $2, $3))});
+  }, edges.data(), static_cast<int>(edges.size()), blocks.data(), static_cast<int>(blocks.size()));
+}
+#endif
 
 // Once per window of timeslices: how much ran, and how much of it went through the dispatcher
 // outside the region. Builds the first region, and rebuilds when the region misses too much.
 void MaybeBuildWasmRegion(CachedInterpreter& cpu)
 {
+#if DOLPHIN_WEB_EDGE_PROFILE
+  if (++s_wasm_region_window_slices >= WASM_REGION_WINDOW_SLICES)
+  {
+    s_wasm_region_window_slices = 0;
+    PostEdgeProfile();
+  }
+  return;
+#endif
   if (++s_wasm_region_window_slices < WASM_REGION_WINDOW_SLICES || !s_wasm_jit_enabled ||
       !WasmRegionsEnabled())
   {
@@ -9632,10 +10523,15 @@ void MaybeBuildWasmRegion(CachedInterpreter& cpu)
   }
   std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   std::vector<const void*> chosen;
+  std::vector<u32> chosen_runs;
   chosen.reserve(hot.size());
+  chosen_runs.reserve(hot.size());
   for (const auto& entry : hot)
+  {
     chosen.push_back(entry.second);
-  BuildWasmRegion(feature_flags, chosen);
+    chosen_runs.push_back(entry.first);
+  }
+  BuildWasmRegion(feature_flags, chosen, chosen_runs);
   s_wasm_region_windows_since_build = 0;
 }
 
@@ -9876,6 +10772,9 @@ void CachedInterpreter::ExecuteOneBlock([[maybe_unused]] bool allow_redispatch)
 #line 7825
   for (;;)
   {
+#if DOLPHIN_WEB_EDGE_PROFILE
+    RecordEdgeProfile(ppc_state.pc);
+#endif
     if (*reinterpret_cast<const AnyCallback*>(normal_entry) != AnyCallbackCast(RunWasmBlock))
       ++s_dispatch_interpreted;
 #if DOLPHIN_WEB_STATIC_EXIT_LINKS
@@ -12741,11 +13640,11 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
       return false;
     }
   }
-  // §28ca: lever-gated min-prefix. Default 4. When bit 21 is CLEARED
-  // (?shortprefix=1), drop to 2 so short blocks that currently fall to
-  // Interpret<false> (54% of attempts in the §28bz audit) compile instead.
+  // §28ca: lever-gated min-prefix: 4 while bit 21 is set (?shortprefix=0). SNES Touch: otherwise
+  // every block compiles, however short, so the hot ones join the region's grouped functions (the
+  // host leaves the bit clear by default now; it used to drop the minimum to 2 on request).
   const u32 MIN_WASM_PREFIX_INSTRUCTIONS =
-      DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_SHORT_PREFIX) ? 4u : 2u;
+      DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_SHORT_PREFIX) ? 4u : 1u;
 
   if (DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASMBLOCK))
     return false;
@@ -13574,6 +14473,12 @@ extern "C" const char* GetPpcWasmHelperStats()
       << ",outstatic=" << s_wasm_region_exits[WASM_REGION_EXIT_OUTSIDE_STATIC]
       << ",outdyn=" << s_wasm_region_exits[WASM_REGION_EXIT_OUTSIDE_DYNAMIC]
       << ",halt=" << s_wasm_region_exits[WASM_REGION_EXIT_HALT]
+      << " cluster:" << s_wasm_region_clusters << "n/" << s_wasm_region_largest_cluster
+      << "maxbytes/" << s_wasm_cluster_unrewritable << "unrewritable"
+      << " clustermove:backstatic=" << s_wasm_cluster_transitions[WASM_CLUSTER_BACK_STATIC]
+      << ",backdyn=" << s_wasm_cluster_transitions[WASM_CLUSTER_BACK_DYNAMIC]
+      << ",crossstatic=" << s_wasm_cluster_transitions[WASM_CLUSTER_CROSS_STATIC]
+      << ",crossdyn=" << s_wasm_cluster_transitions[WASM_CLUSTER_CROSS_DYNAMIC]
       << " regionruns:entries=" << s_wasm_region_entries << ",standalone=" << s_wasm_standalone_runs
       << ",slices=" << s_wasm_slices << ",interpreted=" << s_dispatch_interpreted
       << " regionwindow:hot=" << s_wasm_region_hot_blocks
@@ -14777,6 +15682,173 @@ extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmPsqStoreSmoke(u32 iterations, u32 
   }
   emscripten_log(EM_LOG_CONSOLE, "psq store smoke: %u cases x 2 builds\n", iterations);
   s_wasm_gqr_source = nullptr;
+  return 1;
+}
+
+// SNES Touch: random blocks of FP instructions compiled with and without the FPR cache, run on
+// the same random registers and RAM: every FPR lane, the RAM, CR, FPSCR and the address GPRs must
+// match. Returns 1, or 300 + reason at the first mismatch.
+extern "C" EMSCRIPTEN_KEEPALIVE int RunPpcWasmFprCacheSmoke(u32 iterations, u32 seed)
+{
+  auto& state = Core::System::GetInstance().GetPPCState();
+  std::array<u8, 256> ram{};
+  const WasmStateLayout layout =
+      MakeWasmBlockTestLayout(state, ram.data(), static_cast<u32>(ram.size()));
+  u64 rng = 0xd1b54a32d192ed03ULL ^ seed;
+  const auto next = [&rng] {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+  };
+  const auto a_form = [](u32 opcd, u32 fd, u32 fa, u32 fb, u32 fc, u32 xo) {
+    return UGeckoInstruction{(opcd << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (fc << 6) |
+                             (xo << 1)};
+  };
+  const auto x_form = [](u32 opcd, u32 fd, u32 fa, u32 fb, u32 xo) {
+    return UGeckoInstruction{(opcd << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (xo << 1)};
+  };
+  const auto d_form = [](u32 opcd, u32 fd, u32 ra, u32 d) {
+    return UGeckoInstruction{(opcd << 26) | (fd << 21) | (ra << 16) | (d & 0xffff)};
+  };
+  const auto random_op = [&]() -> UGeckoInstruction {
+    const u32 fd = next() & 7, fa = next() & 7, fb = next() & 7, fc = next() & 7;
+    switch (next() % 24)
+    {
+    case 0: return a_form(4, fd, fa, fb, 0, 21);    // ps_add
+    case 1: return a_form(4, fd, fa, fb, 0, 20);    // ps_sub
+    case 2: return a_form(4, fd, fa, 0, fc, 25);    // ps_mul
+    case 3: return a_form(4, fd, fa, fb, fc, 29);   // ps_madd
+    case 4: return a_form(4, fd, fa, fb, fc, 14);   // ps_madds0
+    case 5: return a_form(4, fd, fa, fb, fc, 10);   // ps_sum0
+    case 6: return a_form(4, fd, 0, fb, 0, 26);     // ps_rsqrte
+    case 7: return a_form(4, fd, 0, fb, 0, 24);     // ps_res
+    case 8: return x_form(4, fd, fa, fb, 528 + 32 * static_cast<u32>(next() & 3));  // merges
+    case 9: return x_form(4, fd, 0, fb, (next() & 1) ? 72 : 40);  // ps_mr, ps_neg
+    case 10: return a_form(59, fd, fa, fb, 0, 21);  // fadds
+    case 11: return a_form(59, fd, fa, 0, fc, 25);  // fmuls
+    case 12: return a_form(63, fd, fa, fb, fc, 29); // fmadd
+    case 13: return x_form(63, fd, 0, fb, 12);      // frsp
+    case 14: return x_form(63, fd, 0, fb, 15);      // fctiwz
+    case 15: return x_form(63, fd, 0, fb, 72);      // fmr
+    case 16: return d_form(48, fd, 3, static_cast<u32>(next() % 24) * 4);  // lfs
+    case 17: return d_form(52, fd, 3, static_cast<u32>(next() % 24) * 4);  // stfs
+    case 18: return d_form(50, fd, 3, static_cast<u32>(next() % 12) * 8);  // lfd
+    case 19: return d_form(54, fd, 3, static_cast<u32>(next() % 12) * 8);  // stfd
+    case 20:  // psq_l fd, d(r3), W, GQR0 (float)
+      return UGeckoInstruction{(56u << 26) | (fd << 21) | (3u << 16) |
+                               (static_cast<u32>(next() & 1) << 15) |
+                               (static_cast<u32>(next() % 12) * 8)};
+    case 21:  // psq_st
+      return UGeckoInstruction{(60u << 26) | (fd << 21) | (3u << 16) |
+                               (static_cast<u32>(next() & 1) << 15) |
+                               (static_cast<u32>(next() % 12) * 8)};
+    case 22: return x_form(31, fd, 0, 4, 983);      // stfiwx fd, 0, r4
+    default: return x_form(63, (fd & 7) << 2, fa, fb, 0);  // fcmpu crfd
+    }
+  };
+  const auto random_value = [&]() -> u64 {
+    const u64 r = next();
+    switch (r & 7)
+    {
+    case 0: return next();  // any bits
+    case 1: return 0;
+    case 2: return 0x7ff8000000000000ULL;
+    default:
+      return std::bit_cast<u64>(static_cast<double>(static_cast<float>(
+          (static_cast<s64>(next() % 2000001) - 1000000) / 977.0)));
+    }
+  };
+
+  for (u32 iteration = 0; iteration < iterations; ++iteration)
+  {
+    const u32 count = 8 + static_cast<u32>(next() % 13);
+    std::vector<PPCAnalyst::CodeOp> ops;
+    for (u32 k = 0; k < count; ++k)
+      ops.push_back(MakeWasmBlockTestOp(random_op(), 0x80004000 + 4 * k));
+    std::array<std::vector<u8>, 2> bytes;
+    for (u32 cache = 0; cache < 2; ++cache)
+    {
+      const u32 previous_mask = s_dolphin_web_disable_mask.load(std::memory_order_relaxed);
+      s_dolphin_web_disable_mask.store(cache ? previous_mask | DOLPHIN_WEB_ENABLE_FPR_CACHE :
+                                               previous_mask & ~DOLPHIN_WEB_ENABLE_FPR_CACHE);
+      bytes[cache] = BuildWasmCachedInterpreterBlock(ops, layout, 0x80004000 + 4 * count, true);
+      s_dolphin_web_disable_mask.store(previous_mask, std::memory_order_relaxed);
+      if (bytes[cache].empty())
+        return 301;
+    }
+    const int handle_off = CompileWasmCachedInterpreterBlockForTest(bytes[0]);
+    const int handle_on = CompileWasmCachedInterpreterBlockForTest(bytes[1]);
+    if (handle_off <= 0 || handle_on <= 0)
+      return 302;
+
+    std::array<u64, 16> fprs_in{};
+    for (u64& v : fprs_in)
+      v = random_value();
+    std::array<u8, 256> ram_in{};
+    for (u8& byte : ram_in)
+      byte = static_cast<u8>(next());
+    const u32 r4 = 0x80000000u + 160 + static_cast<u32>(next() % 16) * 4;
+    struct Result
+    {
+      std::array<u64, 16> fprs;
+      std::array<u8, 256> ram;
+      std::array<u32, 8> cr;
+      u32 fpscr, r3, r4;
+      int halted;
+    };
+    const auto run = [&](int handle) {
+      ram = ram_in;
+      for (u32 i = 0; i < 8; ++i)
+        state.ps[i].SetBoth(fprs_in[2 * i], fprs_in[2 * i + 1]);
+      for (u32 field = 0; field < 8; ++field)
+        state.cr.SetField(field, 0);
+      state.fpscr.Hex = 0;
+      state.msr.Hex = 1u << 13;
+      state.spr[SPR_HID2] = 1u << 31;
+      state.spr[SPR_GQR0] = 0;
+      state.Exceptions = 0;
+      state.gpr[3] = 0x80000000u + 32;
+      state.gpr[4] = r4;
+      Result result{};
+      result.halted = DolphinWeb_CachedInterpreterRunWasmBlockForTest(
+          handle, static_cast<int>(reinterpret_cast<std::uintptr_t>(&state)));
+      for (u32 i = 0; i < 8; ++i)
+      {
+        result.fprs[2 * i] = state.ps[i].PS0AsU64();
+        result.fprs[2 * i + 1] = state.ps[i].PS1AsU64();
+      }
+      result.ram = ram;
+      for (u32 field = 0; field < 8; ++field)
+        result.cr[field] = static_cast<u32>(state.cr.GetField(field));
+      result.fpscr = state.fpscr.Hex;
+      result.r3 = state.gpr[3];
+      result.r4 = state.gpr[4];
+      return result;
+    };
+    const Result off = run(handle_off);
+    const Result on = run(handle_on);
+    const int reason = off.halted != on.halted ? 3 : off.fprs != on.fprs ? 4 :
+                       off.ram != on.ram ? 5 : off.cr != on.cr ? 6 :
+                       off.fpscr != on.fpscr ? 7 : (off.r3 != on.r3 || off.r4 != on.r4) ? 8 : 0;
+    if (reason != 0)
+    {
+      std::string listing;
+      for (const PPCAnalyst::CodeOp& op : ops)
+        listing += fmt::format("{:08x} ", op.inst.hex);
+      u32 lane = 0;
+      while (lane < 16 && off.fprs[lane] == on.fprs[lane])
+        ++lane;
+      emscripten_log(EM_LOG_CONSOLE,
+                     "fpr cache smoke iteration %u reason %d: ops %s| first lane %u off %016llx "
+                     "on %016llx",
+                     iteration, reason, listing.c_str(), lane,
+                     static_cast<unsigned long long>(lane < 16 ? off.fprs[lane] : 0),
+                     static_cast<unsigned long long>(lane < 16 ? on.fprs[lane] : 0));
+      return 300 + reason;
+    }
+  }
+  emscripten_log(EM_LOG_CONSOLE, "fpr cache smoke: %u blocks match\n", iterations);
   return 1;
 }
 #endif
