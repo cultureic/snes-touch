@@ -1405,6 +1405,8 @@ const CACHED_INTERPRETER_DISABLE_BITS = {
   sideexit:        1 << 18,
   // SNES Touch: blocks that branch to their own start loop inside WASM (default-on; ?wasmloop=0 to turn off)
   wasmloop:        1 << 16,
+  // SNES Touch: branches inside a compiled block jump inside its WebAssembly function (default-on; ?innerjump=0 to turn off)
+  innerjump:       1 << 19,
   regalloc:        1 << 20, // §28by GPR regalloc / dead-store-skip (default-off; ?regalloc=1 to enable)
   shortprefix:     1 << 21, // §28ca lower JIT min-prefix 4→2 (default-off; ?shortprefix=1 to enable)
   smearcompile:    1 << 22, // §28ce cap JIT compiles/slice (default-off; ?smearcompile=1 to enable)
@@ -1515,6 +1517,9 @@ function requestedCachedInterpreterDisableMask() {
   }
   if (params.get("wasmloop") === "0") {
     mask |= CACHED_INTERPRETER_DISABLE_BITS.wasmloop;
+  }
+  if (params.get("innerjump") === "0") {
+    mask |= CACHED_INTERPRETER_DISABLE_BITS.innerjump;
   }
   return mask >>> 0;
 }

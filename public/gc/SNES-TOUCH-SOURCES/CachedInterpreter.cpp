@@ -284,6 +284,9 @@ constexpr u32 DOLPHIN_WEB_DISABLE_SIDE_EXITS = 1u << 18;
 // SNES Touch: a block that branches back to its own start loops inside its WASM function while
 // its cycle budget lasts (default-on; ?wasmloop=0 turns it off).
 constexpr u32 DOLPHIN_WEB_DISABLE_WASM_LOOPS = 1u << 16;
+// SNES Touch: branches to another instruction of the same block jump inside its WASM function
+// (?innerjump=0 turns it off).
+constexpr u32 DOLPHIN_WEB_DISABLE_INTERNAL_JUMPS = 1u << 19;
 constexpr u32 DOLPHIN_WEB_DISABLE_REGALLOC    = 1u << 20; // §28by GPR regalloc / dead-store-skip (default-off)
 constexpr u32 DOLPHIN_WEB_DISABLE_SHORT_PREFIX = 1u << 21; // §28ca lower JIT min-prefix 4→2 (default-off)
 constexpr u32 DOLPHIN_WEB_DISABLE_COMPILE_THROTTLE = 1u << 22; // §28ce cap JIT compiles/slice (default-off)
@@ -3521,6 +3524,164 @@ void EmitWasmLoopBackBranch(std::vector<u8>& body, const WasmStateLayout& layout
   EmitI32Const(body, op.address + 4);
   EmitStateStoreU32Suffix(body, layout.npc_offset);
   body.push_back(0x0b);
+}
+
+// SNES Touch: internal jumps. A conditional branch to another instruction of the same block (an
+// if that skips ahead, or a loop whose head is inside the block), and the block's final branch when
+// it lands inside the block, now jump inside the WASM function instead of leaving it through the
+// dispatcher and a call into another module. The block is cut into segments at every such target:
+// the function is a loop around a br_table that enters the segment held in a local, and the end of
+// one segment runs into the next. Cycles are charged per segment: a jump charges its segment up to
+// the branch, running into the next segment charges the whole segment, and a backward jump checks
+// the budget and leaves like a side exit once it is spent. Every GPR the block writes is marked
+// dirty up front, so any exit writes back what an earlier pass changed. The block's natural end
+// still returns 0 and RunWasmBlock charges what is left, the last segment's cycles.
+constexpr u32 WASM_SEGMENT_LOCAL = 40;  // the fastmem-hoist flag's slot; that plan is off here
+
+struct WasmInternalJumps
+{
+  bool active = false;
+  u32 segments = 0;
+  std::vector<int> segment_at;  // per op: the segment starting at it, or -1
+  std::vector<int> jump_to;     // per op: the segment its branch jumps to, or -1
+};
+
+// Set by BuildWasmCachedInterpreterBlock: whether the block uses internal jumps, and the cycles its
+// natural end still has to charge.
+bool s_wasm_built_internal_jumps = false;
+u32 s_wasm_built_tail_cycles = 0;
+
+bool WasmInternalBranchTarget(const PPCAnalyst::CodeOp& op, bool is_last, u32* target)
+{
+  const UGeckoInstruction inst = op.inst;
+  if (op.skip || !op.canEndBlock || op.branchIsIdleLoop)
+    return false;
+  if (inst.OPCD == 16 && !inst.LK_2 && (is_last || IsConditionalBranchBo(inst.BO)))
+  {
+    const u32 displacement = static_cast<u32>(static_cast<s32>(static_cast<s16>(inst.BD << 2)));
+    *target = inst.AA_2 ? displacement : op.address + displacement;
+    return true;
+  }
+  if (inst.OPCD == 18 && !inst.LK && is_last)
+  {
+    const u32 displacement = ((inst.hex & 0x03fffffcu) ^ 0x02000000u) - 0x02000000u;
+    *target = inst.AA ? displacement : op.address + displacement;
+    return true;
+  }
+  return false;
+}
+
+WasmInternalJumps PlanWasmInternalJumps(std::span<const PPCAnalyst::CodeOp> ops,
+                                        const PPCAnalyst::CodeOp* terminal)
+{
+  WasmInternalJumps plan;
+  const u32 base = ops[0].address;
+  for (std::size_t k = 0; k < ops.size(); ++k)
+  {
+    if (ops[k].address != base + static_cast<u32>(k) * 4)
+      return plan;
+  }
+  std::vector<int> target_op(ops.size(), -1);
+  std::vector<bool> label(ops.size(), false);
+  label[0] = true;
+  for (std::size_t k = 0; k < ops.size(); ++k)
+  {
+    u32 target;
+    if (!WasmInternalBranchTarget(ops[k], &ops[k] == terminal, &target))
+      continue;
+    const u32 offset = target - base;
+    if ((offset & 3) != 0 || offset / 4 >= ops.size() || ops[offset / 4].skip)
+      continue;
+    target_op[k] = static_cast<int>(offset / 4);
+    label[offset / 4] = true;
+    plan.active = true;
+  }
+  if (!plan.active)
+    return plan;
+  plan.segment_at.assign(ops.size(), -1);
+  plan.jump_to.assign(ops.size(), -1);
+  for (std::size_t k = 0; k < ops.size(); ++k)
+  {
+    if (label[k])
+      plan.segment_at[k] = static_cast<int>(plan.segments++);
+  }
+  for (std::size_t k = 0; k < ops.size(); ++k)
+  {
+    if (target_op[k] >= 0)
+      plan.jump_to[k] = plan.segment_at[target_op[k]];
+  }
+  return plan;
+}
+
+void EmitWasmChargeCycles(std::vector<u8>& body, u32 cycles)
+{
+  if (cycles == 0)
+    return;
+  EmitStateStoreU32Prefix(body);
+  EmitStateLoadU32(body, s_wasm_downcount_offset);
+  EmitI32Const(body, cycles);
+  body.push_back(0x6b);  // i32.sub
+  EmitStateStoreU32Suffix(body, s_wasm_downcount_offset);
+}
+
+// loop_depth: how many blocks are open between this point and the dispatch loop.
+void EmitWasmInternalJump(std::vector<u8>& body, const WasmStateLayout& layout,
+                          const PPCAnalyst::CodeOp& op, u32 downcount, bool is_last, int segment,
+                          u32 loop_depth, bool backward)
+{
+  const UGeckoInstruction inst = op.inst;
+  const bool conditional = inst.OPCD == 16 && IsConditionalBranchBo(inst.BO);
+  u32 target = 0;
+  WasmInternalBranchTarget(op, is_last, &target);
+  u32 depth = loop_depth;
+  if (conditional)
+  {
+    if ((inst.BO & BO_DONT_DECREMENT_FLAG) == 0)
+    {
+      const u32 ctr_offset = SprOffset(layout, SPR_CTR);
+      EmitStateStoreU32Prefix(body);
+      EmitStateLoadU32(body, ctr_offset);
+      EmitI32Const(body, 1);
+      body.push_back(0x6b);
+      EmitStateStoreU32Suffix(body, ctr_offset);
+    }
+    EmitBranchRegisterCondition(body, layout, inst, true);
+    body.push_back(0x04);  // if taken
+    body.push_back(0x40);
+    ++depth;
+  }
+  EmitWasmChargeCycles(body, downcount);
+  EmitI32Const(body, static_cast<u32>(segment));
+  EmitLocalSet(body, WASM_SEGMENT_LOCAL);
+  if (backward)
+  {
+    EmitStateLoadU32(body, s_wasm_downcount_offset);
+    EmitI32Const(body, 0);
+    body.push_back(0x4a);  // i32.gt_s
+    body.push_back(0x0d);  // br_if to the dispatch loop
+    EmitU32Leb(body, depth);
+    EmitRegCacheFlushDirty(body);
+    EmitStateStoreU32Prefix(body);
+    EmitI32Const(body, target);
+    EmitStateStoreU32Suffix(body, layout.npc_offset);
+    EmitI32Const(body, WASM_SIDE_EXIT_FLAG);
+    body.push_back(0x0f);
+  }
+  else
+  {
+    body.push_back(0x0c);  // br to the dispatch loop
+    EmitU32Leb(body, depth);
+  }
+  if (conditional)
+  {
+    body.push_back(0x0b);
+    if (is_last)
+    {
+      EmitStateStoreU32Prefix(body);
+      EmitI32Const(body, op.address + 4);
+      EmitStateStoreU32Suffix(body, layout.npc_offset);
+    }
+  }
 }
 
 void EmitBranchRegisterCondition(std::vector<u8>& body, const WasmStateLayout& layout,
@@ -7998,10 +8159,19 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
                                                 bool allow_interpret_fallback = false,
                                                 bool record_emit_failure = false,
                                                 bool last_op_ends_block = true,
-                                                u32 loop_pc = 0)
+                                                u32 loop_pc = 0,
+                                                bool allow_internal_jumps = false)
 {
   AnalyzeFastmemHoistability(ops);
   AnalyzeFastmemHoistPlan(ops);  // §28cz build the hoist plan (no-op unless enable bit set)
+  const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
+  WasmInternalJumps jumps;
+  if (allow_internal_jumps && !s_fmh_plan.active && s_wasm_downcount_offset != 0 &&
+      last_op != ops.rend())
+  {
+    jumps = PlanWasmInternalJumps(ops, last_op_ends_block ? &*last_op : nullptr);
+  }
+  s_wasm_built_internal_jumps = jumps.active;
   std::vector<u8> bytes = {0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
 
   std::vector<u8> types;
@@ -8068,7 +8238,7 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
   // group `0x01, 0x7f` (one i32 at index WASM_FMH_FLAG_LOCAL=40, the per-group
   // range-check flag) and bump the leading group count 5 → 6. When the plan is
   // inactive the locals section is byte-identical to today (no extra local).
-  std::vector<u8> body = s_fmh_plan.active
+  std::vector<u8> body = s_fmh_plan.active || jumps.active
       ? std::vector<u8>{0x06, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f, 0x01, 0x7f}
       : std::vector<u8>{0x05, 0x03, 0x7f, 0x02, 0x7e, 0x01, 0x7c, 0x01, 0x7f, 0x20, 0x7f};
 
@@ -8101,10 +8271,10 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
     }
   }
 
-  const auto last_op = std::find_if(ops.rbegin(), ops.rend(), [](const auto& op) { return !op.skip; });
-  const bool loops = last_op != ops.rend() && last_op_ends_block && !s_fmh_plan.active &&
-                     s_wasm_downcount_offset != 0 && IsWasmLoopBackBranch(*last_op, loop_pc);
-  if (loops)
+  const bool loops = !jumps.active && last_op != ops.rend() && last_op_ends_block &&
+                     !s_fmh_plan.active && s_wasm_downcount_offset != 0 &&
+                     IsWasmLoopBackBranch(*last_op, loop_pc);
+  if (loops || jumps.active)
   {
     // Every GPR the block writes may be newer in its local than in memory on a later iteration,
     // so every exit writes them back, whatever the order the block writes them in.
@@ -8119,12 +8289,46 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
     body.push_back(0x03);  // loop
     body.push_back(0x40);
   }
-  u32 downcount = 0;
-  for (const PPCAnalyst::CodeOp& op : ops)
+  if (jumps.active)
   {
+    // One block per segment, the innermost holding the br_table; segment 0 follows its end.
+    for (u32 s = 0; s < jumps.segments; ++s)
+    {
+      body.push_back(0x02);
+      body.push_back(0x40);
+    }
+    EmitLocalGet(body, WASM_SEGMENT_LOCAL);
+    body.push_back(0x0e);  // br_table
+    EmitU32Leb(body, jumps.segments);
+    for (u32 s = 0; s < jumps.segments; ++s)
+      EmitU32Leb(body, s);
+    EmitU32Leb(body, 0);
+    body.push_back(0x0b);
+  }
+  u32 downcount = 0;
+  int segment = 0;
+  for (std::size_t k = 0; k < ops.size(); ++k)
+  {
+    const PPCAnalyst::CodeOp& op = ops[k];
+    if (jumps.active && k != 0 && jumps.segment_at[k] >= 0)
+    {
+      // Running into the next segment charges this one.
+      EmitWasmChargeCycles(body, downcount);
+      body.push_back(0x0b);
+      downcount = 0;
+      segment = jumps.segment_at[k];
+    }
     downcount += op.opinfo->num_cycles;
     if (op.skip)
       continue;
+
+    if (jumps.active && jumps.jump_to[k] >= 0)
+    {
+      EmitWasmInternalJump(body, layout, op, downcount, last_op_ends_block && &op == &*last_op,
+                           jumps.jump_to[k], jumps.segments - 1 - static_cast<u32>(segment),
+                           jumps.jump_to[k] <= segment);
+      continue;
+    }
 
     if (loops && &op == &*last_op)
     {
@@ -8159,8 +8363,9 @@ std::vector<u8> BuildWasmCachedInterpreterBlock(std::span<const PPCAnalyst::Code
     }
   }
 
-  if (loops)
+  if (loops || jumps.active)
     body.push_back(0x0b);
+  s_wasm_built_tail_cycles = downcount;
 
   // §28cx C1: commit all dirty GPR locals to guest memory before the block's
   // single unconditional exit. The halt early-returns inside the call emitters
@@ -11625,7 +11830,11 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
                                       did_merge || prefix_ended_block,
                                       did_merge || DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_WASM_LOOPS) ?
                                           0 :
-                                          js.blockStart);
+                                          js.blockStart,
+                                      !did_merge &&
+                                          (compiled_entire_block || compiled_block_ends_with_branch) &&
+                                          (m_ppc_state.feature_flags & FEATURE_FLAG_PERFMON) == 0 &&
+                                          !DolphinWebHelperDisabled(DOLPHIN_WEB_DISABLE_INTERNAL_JUMPS));
   if (bytes.empty())
   {
     LogWasmBlockReject("emit", nullptr, 0, js.blockStart, code_block.m_num_instructions);
@@ -11693,7 +11902,10 @@ bool CachedInterpreter::TryWriteWasmBlock(u32 nextPC)
     ++s_wasm_block_partial_compile_count;
   if (!s_wasm_jit_direct_only)
     ++s_wasm_block_mixed_compile_count;
-  const u32 eff_downcount = did_merge ? merge_downcount : prefix_downcount;
+  // With internal jumps the earlier segments charge themselves; the natural end charges the last.
+  const u32 eff_downcount = did_merge                   ? merge_downcount :
+                            s_wasm_built_internal_jumps ? s_wasm_built_tail_cycles :
+                                                          prefix_downcount;
   const u32 eff_loadstores = did_merge ? merge_loadstores : prefix_loadstores;
   const u32 eff_fpinst = did_merge ? merge_fpinst : prefix_fpinst;
   js.downcountAmount = eff_downcount;

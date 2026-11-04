@@ -3,13 +3,14 @@ Build: npm run fetch:dolphin && npm run patch:upstream, apply this patch, add '_
 The JavaScript changes (src/upstream-worker-adapter.js, src/upstream-discio-worker.js, src/upstream-worker-protocol.js, src/core-host.js) are marked 'SNES Touch' in the files themselves.
 
 What the C++ changes do:
-- core/upstream: controllers in all four ports and a SetInputStateForPort export (players 2-4); tools: a macOS toolchain branch.
-- vendor/dolphin CachedInterpreter.cpp (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the PowerPC-to-WASM JIT routed mcrf (opcode 19, SUBOP10 0) to the condition-register logic emitter and produced invalid WebAssembly, it now takes the fallback path; ps_sum0/1, ps_sel, fsel, ps_div, ps_neg/mr/abs/nabs and the integer psq_l formats are compiled natively instead of ending the block; stw/sth/stb into the write-gather pipe page go straight into the pipe; compiled blocks are dispatched directly (DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH=1); blocks run on past conditional branches (side exits), and a block that branches back to its own start loops inside WebAssembly while its cycle budget lasts (?sideexit=0 and ?wasmloop=0 turn these off; src/core-host.js).
+- core/upstream: controllers in all four ports and a SetInputStateForPort export (players 2-4); the WebGPU backend keeps XFB copies on the GPU like OGL (Dolphin's default), and the XFB hook only decodes the RAM copy when the picture is really there; tools: a macOS toolchain branch.
+- vendor/dolphin CachedInterpreter.cpp (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the PowerPC-to-WASM JIT routed mcrf (opcode 19, SUBOP10 0) to the condition-register logic emitter and produced invalid WebAssembly, it now takes the fallback path; ps_sum0/1, ps_sel, fsel, ps_div, ps_neg/mr/abs/nabs and the integer psq_l formats are compiled natively instead of ending the block; stw/sth/stb into the write-gather pipe page go straight into the pipe; compiled blocks are dispatched directly (DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH=1); blocks run on past conditional branches (side exits), and a block that branches back to its own start loops inside WebAssembly while its cycle budget lasts (?sideexit=0 and ?wasmloop=0 turn these off; src/core-host.js); a branch to another instruction of the same block jumps inside the block's WebAssembly function (a loop around a br_table over the block's segments, cycles charged per segment) instead of leaving through the dispatcher (?innerjump=0 turns it off).
 - vendor/dolphin Interpreter_FPUtils.h (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the fused multiply-adds skip the software fma that WebAssembly falls back to when the product is exact in double precision, which gives the same bits.
+- vendor/dolphin VideoBackendBase.cpp: passes the XFB hook whether the XFB is in RAM (see core/upstream).
 - vendor/dolphin VideoCommon: the WebGPU backend had been exempted from Dolphin's depth conversion for backends without a reversible depth range (fog depth, per-pixel depth, depth copies, EFB peeks and pokes, clear depth), but its vertex shader writes a reversed depth buffer, so those exemptions fed inverted depth into the fog formula and fogged everything near the camera to the fog colour (a black screen in Need for Speed: Underground 2). The standard conversion is restored.
 
 diff --git a/core/upstream/dolphin_web_core.cpp b/core/upstream/dolphin_web_core.cpp
-index 9f07725..c3c28f0 100644
+index 9f07725..b05b38b 100644
 --- a/core/upstream/dolphin_web_core.cpp
 +++ b/core/upstream/dolphin_web_core.cpp
 @@ -29,6 +29,7 @@
@@ -20,7 +21,7 @@ index 9f07725..c3c28f0 100644
  #include "Core/ConfigLoaders/BaseConfigLoader.h"
  #include "Core/ConfigManager.h"
  #include "Core/Core.h"
-@@ -619,6 +620,9 @@ void EnsureRuntime()
+@@ -619,9 +620,16 @@ void EnsureRuntime()
    Config::SetBase(Config::MAIN_OSD_MESSAGES, false);
    Config::SetBase(Config::MAIN_SLOT_A, ExpansionInterface::EXIDeviceType::MemoryCardFolder);
    Config::SetBase(Config::MAIN_SLOT_B, ExpansionInterface::EXIDeviceType::None);
@@ -29,9 +30,17 @@ index 9f07725..c3c28f0 100644
 +    Config::SetBase(Config::GetInfoForSIDevice(port), SerialInterface::SIDevices::SIDEVICE_GC_CONTROLLER);
    Config::SetBase(Config::MAIN_AUDIO_BACKEND, std::string("Web Audio"));
    Config::SetBase(Config::MAIN_AUDIO_MUTED, false);
-   Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM, s_video_backend == "OGL");
+-  Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM, s_video_backend == "OGL");
++  // SNES Touch: the WebGPU backend presents from the texture cache too, so like OGL it keeps XFB
++  // copies on the GPU (Dolphin's default). Copying them back to RAM read every frame back from the
++  // GPU, and the CPU thread then decoded that RAM copy for nothing.
++  Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM,
++                  s_video_backend == "OGL" || s_video_backend == "WebGPU");
+   Config::SetBase(Config::GFX_HACK_COPY_EFB_SCALED, false);
+   // §28cx: ubershaders DISCRIMINATOR (May-30). The UBO const-index fix made the
+   // uber pixel shaders translate (fail 27->0) and 7195 draws execute, but the EFB
 diff --git a/core/upstream/dolphin_web_discio.cpp b/core/upstream/dolphin_web_discio.cpp
-index be24a6b..dc7bf92 100644
+index be24a6b..11f2c36 100644
 --- a/core/upstream/dolphin_web_discio.cpp
 +++ b/core/upstream/dolphin_web_discio.cpp
 @@ -131,6 +131,8 @@ struct PadPollSnapshot
@@ -74,7 +83,40 @@ index be24a6b..dc7bf92 100644
  int SetPresentationScale(float scale)
  {
    if (scale < 0.25f || scale > 1.0f)
-@@ -1087,13 +1113,13 @@ const char* GetVideoStats()
+@@ -897,7 +923,7 @@ std::uint32_t* GetFrameSignalPtr()
+ }
+ 
+ void DolphinWeb_OnXfb(const std::uint8_t* xfb, std::uint32_t width, std::uint32_t stride,
+-                      std::uint32_t height)
++                      std::uint32_t height, int decode)
+ {
+   const auto callback_start = WebProfileClock::now();
+   if (s_last_xfb_profile_time.time_since_epoch().count() != 0)
+@@ -917,8 +943,12 @@ void DolphinWeb_OnXfb(const std::uint8_t* xfb, std::uint32_t width, std::uint32_
+ 
+   const int presentation_width = ScaledPresentationDimension(width);
+   const int presentation_height = ScaledPresentationDimension(height);
+-  DecodeXfbToPresentationBuffer(xfb, width, stride, height, presentation_width,
+-                                 presentation_height);
++  // SNES Touch: with the picture on the GPU only the frame is counted (see Video_OutputXFB).
++  if (decode)
++  {
++    DecodeXfbToPresentationBuffer(xfb, width, stride, height, presentation_width,
++                                   presentation_height);
++  }
+   const auto decode_done = WebProfileClock::now();
+   s_last_xfb_decode_us = ElapsedMicros(callback_start, decode_done);
+   s_total_xfb_decode_us += s_last_xfb_decode_us;
+@@ -927,7 +957,7 @@ void DolphinWeb_OnXfb(const std::uint8_t* xfb, std::uint32_t width, std::uint32_
+ 
+   std::uint32_t hash = 2166136261u;
+   std::uint32_t nonzero_samples = 0;
+-  const std::size_t frame_bytes = static_cast<std::size_t>(stride) * height;
++  const std::size_t frame_bytes = decode ? static_cast<std::size_t>(stride) * height : 0;
+   const std::size_t sample_count = std::min<std::size_t>(frame_bytes / 4, 2048);
+   const std::size_t sample_step =
+       std::max<std::size_t>(4, ((frame_bytes / std::max<std::size_t>(1, sample_count)) / 4) * 4);
+@@ -1087,13 +1117,13 @@ const char* GetVideoStats()
  
  int DolphinWeb_GetPadStatus(int pad_num, GCPadStatus* status)
  {
@@ -143,6 +185,32 @@ index 0c240e4..d8390b8 100644
    invariant(lock.schemaVersion === 1, `Unsupported toolchain lock schema ${lock.schemaVersion}`);
    invariant(`${process.platform}-${process.arch}` === lock.platform, `Toolchain lock requires ${lock.platform}`);
  
+diff --git a/vendor/dolphin/Source/Core/VideoCommon/VideoBackendBase.cpp b/vendor/dolphin/Source/Core/VideoCommon/VideoBackendBase.cpp
+--- a/vendor/dolphin/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/vendor/dolphin/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -77,7 +77,7 @@
+ VideoBackendBase* g_video_backend = nullptr;
+ 
+ #ifdef __EMSCRIPTEN__
+-extern "C" void DolphinWeb_OnXfb(const u8* xfb, u32 width, u32 stride, u32 height);
++extern "C" void DolphinWeb_OnXfb(const u8* xfb, u32 width, u32 stride, u32 height, int decode);
+ extern "C" void DolphinWeb_RecordVideoOutputProfile(u32 sync_us, u32 publish_us, u32 total_us);
+ extern "C" int DolphinWeb_UseWorkerOwnedWebGL();
+ #endif
+@@ -127,8 +127,12 @@
+     {
+       const size_t xfb_size = static_cast<size_t>(fb_stride) * (fb_height - 1) +
+                               static_cast<size_t>(fb_width) * 2;
++      // SNES Touch: a hardware backend keeps the XFB on the GPU unless XFB copies go to RAM, so
++      // the RAM copy is stale; decoding it cost the CPU thread ~4% for a picture nobody shows.
++      const bool xfb_in_ram = !g_ActiveConfig.bSkipXFBCopyToRam ||
++                              GetConfigName() == "Software Renderer";
+       if (const u8* xfb = system.GetMemory().GetPointerForRange(xfb_addr, xfb_size))
+-        DolphinWeb_OnXfb(xfb, fb_width, fb_stride, fb_height);
++        DolphinWeb_OnXfb(xfb, fb_width, fb_stride, fb_height, xfb_in_ram ? 1 : 0);
+     }
+   };
+ #endif
 diff --git a/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp b/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp
 --- a/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp
 +++ b/vendor/dolphin/Source/Core/VideoCommon/PixelShaderGen.cpp

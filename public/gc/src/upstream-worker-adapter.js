@@ -988,6 +988,10 @@ export class UpstreamWorkerAdapter {
     if (typeof response.frameProfileStats === "string") {
       this.frameProfileStats = response.frameProfileStats;
     }
+    // SNES Touch: keep the core's sampled block profile (?ppcprof=1&metrics=1) readable from the page.
+    if (typeof response.ppcProfileStats === "string") {
+      this.ppcProfileStats = response.ppcProfileStats;
+    }
   }
 
   applyFrame(response) {

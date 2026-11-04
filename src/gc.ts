@@ -16,11 +16,16 @@ import type { Machine } from './machine'
 // bug that made it emit invalid WebAssembly (mcrf routed to the CR-logic emitter), compiles more
 // paired-single and quantized-load instructions natively, writes GX commands straight into the
 // gather pipe, dispatches compiled blocks directly, runs blocks on past conditional branches,
-// loops small loops inside WebAssembly and skips the software fused multiply-add when it can give
-// the same bits without it. By the game's race clock that is about a third of real speed; what
-// remains is mostly the per-block dispatch. The page's own gamepad polling is off, since it would
-// overwrite the app's input.
-const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=1&pacing=tick&nogamepad=1'
+// loops small loops inside WebAssembly, jumps inside a block's WebAssembly function when a branch
+// lands in the same block, and skips the software fused multiply-add when it can give the same
+// bits without it. That emulates about 190 million PowerPC cycles a second on a fast computer,
+// well under the GameCube's 486 MHz, so the emulated CPU runs at half its clock (oc=0.5): games
+// burn much of the clock waiting in loops Dolphin can't skip, and a lower clock cuts that waiting.
+// Need for Speed: Underground 2's race clock went from about a third of real speed to about two
+// thirds at the same frame rate, and to about four fifths with the jumps inside blocks. A game that
+// already ran at full speed used less than half the clock here, so it loses nothing. The page's own
+// gamepad polling is off, since it would overwrite the app's input.
+const PAGE = '/gc/?core=upstream&video=wgpu&presenter=webgpu&cpu=dual&speed=1&wasmjit=1&jitwarmup=700&oc=0.5&pacing=tick&nogamepad=1'
 const BOOT_TIMEOUT = 60_000
 const FAST_FORWARD_SPEED = 3
 
