@@ -88,18 +88,27 @@ function readAscii(buffer, offset, length) {
  * caller falls back to the configured default.
  */
 export async function readGameId(file) {
+  return (await readDiscHeader(file))?.id ?? null;
+}
+
+/**
+ * SNES Touch: the game id plus the disc's revision (header byte 7), which names
+ * Dolphin's revision-specific GameSettings files (GALE01r2.ini). Same probes as
+ * readGameId; null when the file cannot be identified.
+ */
+export async function readDiscHeader(file) {
   if (!file || typeof file.slice !== "function") return null;
   try {
     // One read covering every probe offset, rather than several range reads.
     const head = await file.slice(0, 0x8010).arrayBuffer();
     for (const probe of ID_PROBES) {
-      if (probe.offset + 6 > head.byteLength) continue;
+      if (probe.offset + 8 > head.byteLength) continue;
       if (probe.magic) {
         const seen = readAscii(head, probe.magic.at, probe.magic.bytes.length);
         if (seen !== probe.magic.bytes) continue;
       }
       const id = readAscii(head, probe.offset, 6);
-      if (ID_PATTERN.test(id)) return id;
+      if (ID_PATTERN.test(id)) return { id, revision: new Uint8Array(head)[probe.offset + 7] };
     }
   } catch {
     // Unreadable slice (permissions, zero-length, exotic container): no id.

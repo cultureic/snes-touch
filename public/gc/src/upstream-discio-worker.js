@@ -9,6 +9,7 @@ import {
   sha256Hex
 } from "./upstream-worker-protocol.js";
 import { parseDolHeader } from "./dol.js";
+import { readDiscHeader } from "./game-profiles.js";
 import { decodeWgpuSamplerState } from "./wgpu-sampler-state.js";
 import { decodePrebuiltCache } from "./prebuilt-jit-cache-format.js";
 import {
@@ -811,19 +812,59 @@ self.addEventListener("message", async (event) => {
 const SNES_TOUCH_USER_ROOT = "/dolphin-user/GC";
 let snesTouchPendingUserFiles = null;
 
+function snesTouchWriteFile(fs, path, data) {
+  let dir = "";
+  for (const part of path.split("/").slice(1, -1)) {
+    dir += "/" + part;
+    try { fs.mkdir(dir); } catch {}
+  }
+  fs.writeFile(path, data);
+}
+
 function snesTouchWriteUserFiles(fs) {
   const files = snesTouchPendingUserFiles;
   snesTouchPendingUserFiles = null;
   if (!files) return;
   for (const [path, data] of Object.entries(files)) {
-    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/") && !path.startsWith("/dolphin-sys/GC/") &&
-        !path.startsWith("/dolphin-sys/GameSettings/")) continue;
-    let dir = "";
-    for (const part of path.split("/").slice(1, -1)) {
-      dir += "/" + part;
-      try { fs.mkdir(dir); } catch {}
+    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/") && !path.startsWith("/dolphin-sys/GC/")) continue;
+    snesTouchWriteFile(fs, path, data);
+  }
+}
+
+// SNES Touch: Dolphin's per-game settings, fetched from ../sys/GameSettings (a copy of Dolphin's
+// Data/Sys/GameSettings plus an index.json of the names) once the mounted disc's id is known.
+// As in desktop Dolphin, the game reads the files named after its id when it boots, broadest
+// first (G.ini, GAL.ini, GALE01.ini, then GALE01r2.ini for revision 2), and they override our
+// own settings the way they override a desktop user's: Zelda: Ocarina of Time gets the frame
+// copies in RAM its pause screen is built from, Tony Hawk's Pro Skater 3 runs without a
+// separate GPU thread. If they can't be fetched the game boots without them.
+let snesTouchGameSettingsNames = null;
+
+async function snesTouchWriteGameSettings(fs, file) {
+  const gameId = api.getGameId();
+  if (!gameId) return;
+  const start = performance.now();
+  try {
+    if (!snesTouchGameSettingsNames) {
+      const response = await fetch(new URL("../sys/GameSettings/index.json", import.meta.url));
+      if (!response.ok) throw new Error(`index.json: HTTP ${response.status}`);
+      snesTouchGameSettingsNames = new Set(await response.json());
     }
-    fs.writeFile(path, data);
+    const names = [gameId.slice(0, 1), gameId.slice(0, 3), gameId];
+    // The core doesn't report the revision; the header has it (ISO, RVZ and CISO).
+    const header = await readDiscHeader(file);
+    if (header?.id === gameId) names.push(`${gameId}r${header.revision}`);
+    const found = [...new Set(names)].map((name) => `${name}.ini`)
+      .filter((name) => snesTouchGameSettingsNames.has(name));
+    const contents = await Promise.all(found.map(async (name) => {
+      const response = await fetch(new URL(`../sys/GameSettings/${name}`, import.meta.url));
+      if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+      return new Uint8Array(await response.arrayBuffer());
+    }));
+    found.forEach((name, i) => snesTouchWriteFile(fs, `/dolphin-sys/GameSettings/${name}`, contents[i]));
+    console.log(`[game-settings] ${gameId}: ${found.join(", ") || "none"} (${(performance.now() - start).toFixed(1)}ms)`);
+  } catch (error) {
+    console.warn(`[game-settings] ${gameId}: booting without them (${error.message})`);
   }
 }
 
@@ -2523,6 +2564,7 @@ async function mountFile(file) {
   if (!accepted) {
     throw new Error("Upstream Dolphin DiscIO rejected the selected disc");
   }
+  await snesTouchWriteGameSettings(fs, file);
 
   coreBoot = {
     attempted: false,

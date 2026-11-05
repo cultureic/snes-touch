@@ -334,13 +334,13 @@ export class UpstreamWorkerAdapter {
 
     // SNES Touch: saved user files (memory cards) to put back before the disc boots, plus
     // Dolphin's free replacement GameCube fonts (Apache-2.0, ../sys/GC), which games read in
-    // place of the console's BIOS fonts, and Dolphin's GameSettings for the games that need
-    // theirs (../sys/GameSettings); this build only embeds Sys/Wii.
+    // place of the console's BIOS fonts; this build only embeds Sys/Wii. Dolphin's per-game
+    // settings are fetched by the worker once the disc's id is known (snesTouchWriteGameSettings).
     const snesTouchUserFiles = { ...(globalThis.__snesTouchUserFiles ?? {}) };
-    for (const file of ["GC/font_western.bin", "GC/font_japanese.bin", "GameSettings/D43.ini"]) {
+    for (const font of ["font_western.bin", "font_japanese.bin"]) {
       try {
-        const response = await fetch(new URL(`../sys/${file}`, import.meta.url));
-        if (response.ok) snesTouchUserFiles[`/dolphin-sys/${file}`] = new Uint8Array(await response.arrayBuffer());
+        const response = await fetch(new URL(`../sys/GC/${font}`, import.meta.url));
+        if (response.ok) snesTouchUserFiles[`/dolphin-sys/GC/${font}`] = new Uint8Array(await response.arrayBuffer());
       } catch {}
     }
     const loadPayload = {
