@@ -816,7 +816,8 @@ function snesTouchWriteUserFiles(fs) {
   snesTouchPendingUserFiles = null;
   if (!files) return;
   for (const [path, data] of Object.entries(files)) {
-    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/") && !path.startsWith("/dolphin-sys/GC/")) continue;
+    if (!path.startsWith(SNES_TOUCH_USER_ROOT + "/") && !path.startsWith("/dolphin-sys/GC/") &&
+        !path.startsWith("/dolphin-sys/GameSettings/")) continue;
     let dir = "";
     for (const part of path.split("/").slice(1, -1)) {
       dir += "/" + part;
@@ -6320,6 +6321,8 @@ const WGPU_CMD_OP_SUBMIT_PRESENT = 22;
 const WGPU_CMD_OP_DESTROY = 23;
 const WGPU_CMD_OP_BLIT_TEXTURE = 24;
 const WGPU_CMD_OP_CLEAR_RECT = 25;
+// SNES Touch: texture rect back into wasm memory, then the producer's fence (EFB copies to RAM).
+const WGPU_CMD_OP_READBACK_TEXTURE = 26;
 // ClearRect uses the full attachment viewport and [0,1] depth range, so its
 // scissor alone determines coverage and its depth is independent of game state.
 // A/B switch: false restores the original game-viewport-dependent clear.
@@ -9167,6 +9170,64 @@ function diagReadColorTrace(dev, encoder, entry, tag) {
     buf.unmap(); buf.destroy();
   }).catch((e) => console.log(`[dtrace] #${seq} colour map failed (${tag}): ${e && e.message}`)));
 }
+// SNES Touch: EFB copies to RAM (WGPU_CMD_OP_READBACK_TEXTURE, from
+// WebGPUStagingTexture::CopyFromTexture). The copy is encoded and submitted at once; when the
+// map resolves, the rows go into the staging texture's buffer in wasm memory and the serial into
+// its fence word, which the video thread futex-waits on only when Dolphin needs the copy in RAM.
+// Bytes per texel of the formats copyTextureToBuffer can read here (not depth24plus).
+const WGPU_READBACK_TEXEL_BYTES = {
+  rgba8unorm: 4, bgra8unorm: 4, rgb10a2unorm: 4, r32float: 4, depth32float: 4,
+  rgba16float: 8, r16uint: 2
+};
+// Unmapped MAP_READ buffers kept for reuse, as { dev, buffer }: matched by device and size.
+const wgpuReadbackBuffers = [];
+function encodeWgpuReadback(dev, encoder, entry, x, y, w, h, layer, level) {
+  const texelBytes = WGPU_READBACK_TEXEL_BYTES[entry?.format];
+  if (!texelBytes || !entry.tex || w === 0 || h === 0) return null;
+  const rowBytes = w * texelBytes;
+  const bytesPerRow = Math.ceil(rowBytes / 256) * 256;
+  const size = bytesPerRow * h;
+  const free = wgpuReadbackBuffers.findIndex((b) => b.dev === dev && b.buffer.size === size);
+  let buffer = null;
+  try {
+    buffer = free >= 0
+      ? wgpuReadbackBuffers.splice(free, 1)[0].buffer
+      : dev.createBuffer({ size, usage: 0x1 | 0x8, label: "efb-copy-readback" });
+    encoder.copyTextureToBuffer(
+      { texture: entry.tex, mipLevel: level, origin: { x, y, z: layer },
+        aspect: entry.format === "depth32float" ? "depth-only" : "all" },
+      { buffer, bytesPerRow, rowsPerImage: h },
+      { width: w, height: h, depthOrArrayLayers: 1 });
+  } catch (e) {
+    recordRendererError("readback", e?.message || e);
+    buffer?.destroy();
+    return null;
+  }
+  return { dev, buffer, bytesPerRow, rowBytes, h };
+}
+function finishWgpuReadback(pending, dstPtr, dstStride, fencePtr, serial) {
+  const { dev, buffer, bytesPerRow, rowBytes, h } = pending;
+  buffer.mapAsync(0x1).then(() => {
+    const src = new Uint8Array(buffer.getMappedRange());
+    const heap = moduleInstance.HEAPU8;
+    for (let row = 0; row < h; row++) {
+      heap.set(src.subarray(row * bytesPerRow, row * bytesPerRow + rowBytes),
+               dstPtr + row * dstStride);
+    }
+    buffer.unmap();
+    if (wgpuReadbackBuffers.length < 8) wgpuReadbackBuffers.push({ dev, buffer });
+    else buffer.destroy();
+  }, (e) => {
+    recordRendererError("readback", e?.message || e);
+    buffer.destroy();
+  }).finally(() => signalWgpuReadback(fencePtr, serial));
+}
+function signalWgpuReadback(fencePtr, serial) {
+  if (!moduleInstance || !fencePtr) return;
+  const heap32 = new Int32Array(moduleInstance.HEAPU8.buffer);
+  Atomics.store(heap32, fencePtr >>> 2, serial | 0);
+  Atomics.notify(heap32, fencePtr >>> 2);
+}
 function diagReadTexture(dev, encoder, entry, label, tag) {
   if (!entry || !entry.tex || String(entry.format || "").startsWith("depth")) return;
   const w = entry.tex.width, h = entry.tex.height;
@@ -9970,6 +10031,9 @@ function drainWebGpuCmdRing(source = "presentation") {
           fenceU32[word + 2],
           Math.imul(fenceU32[word + 3], fenceU32[word + 5]) >>> 0
         );
+      } else if (op === WGPU_CMD_OP_READBACK_TEXTURE) {
+        // A discarded readback still releases the producer waiting on it.
+        signalWgpuReadback(fenceU32[word + 6], fenceU32[word + 7]);
       }
       discardTo = (discardTo + 1) >>> 0;
       if (op === WGPU_CMD_OP_END_PASS) {
@@ -13086,6 +13150,24 @@ function drainWebGpuCmdRing(source = "presentation") {
               a4 & 0xFFFF, a4 >>> 16, a5 & 0xFFFF, a5 >>> 16,
               a6 & 0xFF, (a6 >>> 8) & 0xFF, (a6 >>> 16) & 0xFF, (a6 >>> 24) & 0xFF);
           }
+          break;
+        }
+        case WGPU_CMD_OP_READBACK_TEXTURE: {
+          const sourceId = u32[recWord + 1];
+          const s = webGpuObjects.textures.get(sourceId);
+          const a1 = u32[recWord + 2], a2 = u32[recWord + 3], a3 = u32[recWord + 4];
+          const fencePtr = u32[recWord + 6], serial = u32[recWord + 7];
+          if (!s) wgpuReplayClassifier?.recordMissingResource({ kind: "readback-source", id: sourceId });
+          endPass("readback", read);
+          const pending = s && encodeWgpuReadback(dev, ensureEnc(), s,
+            a1 & 0xFFFF, a1 >>> 16, a2 & 0xFFFF, a2 >>> 16, a3 & 0xFF, (a3 >>> 8) & 0xFF);
+          if (!pending) {
+            signalWgpuReadback(fencePtr, serial);
+            break;
+          }
+          // Submit now: the copy has to be queued before the buffer can be mapped.
+          submitEnc("readback");
+          finishWgpuReadback(pending, u32[recWord + 5], a3 >>> 16, fencePtr, serial);
           break;
         }
         default:

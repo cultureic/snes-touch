@@ -8,6 +8,7 @@ What the C++ changes do:
 - vendor/dolphin Interpreter_FPUtils.h (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the fused multiply-adds skip the software fma that WebAssembly falls back to when the product is exact in double precision, which gives the same bits.
 - vendor/dolphin VideoBackendBase.cpp: passes the XFB hook whether the XFB is in RAM (see core/upstream).
 - vendor/dolphin VideoBackends/WebGPU (the port's backend) WebGPUTexture.cpp and WebGPUGfx.h: a texture-to-texture copy closes the render pass being recorded before its blit, as Vulkan's backend ends its render pass there. Pushed into the open pass, the blit poisoned it and both were dropped, so a game whose displayed XFB is a window into its XFB copy (Dolphin stitches that window from the GPU copy) showed only the fuchsia Dolphin writes into RAM for XFBs kept on the GPU: The Legend of Zelda: Ocarina of Time Master Quest, which shows 608x464 of its 640x480 copies.
+- vendor/dolphin VideoBackends/WebGPU TextureCache.h, VideoBackend.cpp, WebGPUTexture.cpp/.h and WebGPUCommandStream.cpp/.h: EFB copies to RAM. The backend's CopyEFB was an empty stub and its staging textures read nothing back, so a game whose Dolphin GameSettings turn EFBToTextureEnable off got zeros in RAM; The Legend of Zelda: Ocarina of Time Master Quest builds its pause-screen background on the CPU from such a copy and showed it black. The backend now uses its own TextureCache (it had been left unused) to run Dolphin's EFB encoder into a staging texture that reads the texels back: a new ring command (ReadbackTexture, 26) has the disc worker copy them into wasm memory and then store a fence value the video thread waits on. The wait gives up after 5 s, at once if the consumer failed, and 20 ms after the CPU starts stepping, because Core::PauseAndLock (save states) runs on that worker and waits for the video thread. The EFB peek cache and save-state texture serialization keep the zero-filled staging textures. Dolphin's Sys/GameSettings/D43.ini ships in public/gc/sys/GameSettings and is written into /dolphin-sys before the disc boots.
 - vendor/dolphin VideoCommon: the WebGPU backend had been exempted from Dolphin's depth conversion for backends without a reversible depth range (fog depth, per-pixel depth, depth copies, EFB peeks and pokes, clear depth), but its vertex shader writes a reversed depth buffer, so those exemptions fed inverted depth into the fog formula and fogged everything near the camera to the fog colour (a black screen in Need for Speed: Underground 2). The standard conversion is restored.
 
 diff --git a/core/upstream/dolphin_web_core.cpp b/core/upstream/dolphin_web_core.cpp
@@ -375,6 +376,189 @@ diff --git a/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp b/ven
      return;
    }
  
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/TextureCache.h b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/TextureCache.h
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/TextureCache.h
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/TextureCache.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include "VideoBackends/WebGPU/WebGPUTexture.h"
+ #include "VideoCommon/TextureCacheBase.h"
+ 
+ namespace WebGPU
+@@ -17,19 +18,26 @@
+ //
+ // The override is gone; TextureCacheBase's real implementation runs instead.
+ //
+-// CopyEFB (EFB copy to RAM, below) is still a stub. That one needs working
+-// staging-texture readback, and WebGPUStagingTexture is itself a stub, so
+-// removing it would break rather than fix.
++// SNES Touch: CopyEFB (EFB copy to RAM, below) was an empty stub too, so a game
++// whose GameSettings turn EFBToTextureEnable off read zeros back: Zelda: Ocarina
++// of Time Master Quest builds its pause-screen background on the CPU from such a
++// copy and showed it black. TextureCacheBase's encoder runs now, and its staging
++// texture reads the encoded texels back from the GPU. Only these staging textures
++// do; the EFB peek cache and save-state texture serialization keep the zero-filled
++// stub, so games that don't copy to RAM wait on nothing new.
+ class TextureCache final : public TextureCacheBase
+ {
+ protected:
+-  void CopyEFB(AbstractStagingTexture* /* dst */, const EFBCopyParams& /* params */,
+-               u32 /* native_width */, u32 /* bytes_per_row */, u32 /* num_blocks_y */,
+-               u32 /* memory_stride */, const MathUtil::Rectangle<int>& /* src_rect */,
+-               bool /* scale_by_half */, bool /* linear_filter */, float /* y_scale */,
+-               float /* gamma */, bool /* clamp_top */, bool /* clamp_bottom */,
+-               const std::array<u32, 3>& /* filter_coefficients */) override
++  void CopyEFB(AbstractStagingTexture* dst, const EFBCopyParams& params, u32 native_width,
++               u32 bytes_per_row, u32 num_blocks_y, u32 memory_stride,
++               const MathUtil::Rectangle<int>& src_rect, bool scale_by_half, bool linear_filter,
++               float y_scale, float gamma, bool clamp_top, bool clamp_bottom,
++               const std::array<u32, 3>& filter_coefficients) override
+   {
++    static_cast<WebGPUStagingTexture*>(dst)->EnableGpuReadback();
++    TextureCacheBase::CopyEFB(dst, params, native_width, bytes_per_row, num_blocks_y,
++                              memory_stride, src_rect, scale_by_half, linear_filter, y_scale,
++                              gamma, clamp_top, clamp_bottom, filter_coefficients);
+   }
+ };
+ 
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/VideoBackend.cpp b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/VideoBackend.cpp
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/VideoBackend.cpp
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/VideoBackend.cpp
+@@ -23,8 +23,10 @@
+ #include "VideoBackends/WebGPU/WebGPUGfx.h"
+ #include "VideoBackends/WebGPU/WebGPUShaderTranslator.h"
+ #include "VideoBackends/WebGPU/WebGPUVertexManager.h"
++#include "VideoBackends/WebGPU/TextureCache.h"
+ 
+ #include "VideoCommon/AbstractShader.h"
++#include "VideoCommon/EFBInterface.h"
+ 
+ // Day-18: reuse Software's CPU rasteriser. Clipper / Rasterizer /
+ // SWVertexLoader / SWBoundingBox / SWEFBInterface + SW's TextureCache
+@@ -312,10 +314,15 @@
+   // SWEFBInterface/SW::TextureCache are gone. SWBoundingBox stays as
+   // the bbox impl for now (self-contained CPU bbox, not the
+   // rasteriser; a GPU bbox is a post-cutover refinement).
++  // SNES Touch: the backend's own TextureCache (its EFB copies to RAM read back from the GPU,
++  // see TextureCache.h) in place of the plain TextureCacheBase the four-argument overload
++  // supplies, so it goes with VideoCommon's HardwareEFBInterface like that overload's.
+   return InitializeShared(std::make_unique<WebGPUGfx>(),
+                           std::make_unique<WebGPU::VertexManager>(),
+                           std::make_unique<PerfQueryBase>(),
+-                          std::make_unique<SW::SWBoundingBox>());
++                          std::make_unique<SW::SWBoundingBox>(),
++                          std::make_unique<HardwareEFBInterface>(),
++                          std::make_unique<WebGPU::TextureCache>());
+ }
+ 
+ void VideoBackend::Shutdown()
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.cpp b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.cpp
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.cpp
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.cpp
+@@ -13,6 +13,8 @@
+ #include <emscripten/emscripten.h>
+ #include <emscripten/threading.h>
+ 
++#include "Core/HW/CPU.h"
++#include "Core/System.h"
+ #include "VideoCommon/WasmWebGpuProducerProfile.h"
+ #include "VideoCommon/WasmWebGpuDrawProfile.h"
+ 
+@@ -1467,9 +1469,61 @@
+   rec.arg.u[5] = Pack16(dst_w, dst_h);
+   rec.arg.u[6] = (src_layer & 0xFFu) | ((src_level & 0xFFu) << 8) |
+                  ((dst_layer & 0xFFu) << 16) | ((dst_level & 0xFFu) << 24);
++  return Push(rec);
++}
++
++bool WebGPUCommandStream::PushReadbackTexture(u32 src_id, u32 src_x, u32 src_y, u32 w, u32 h,
++                                              u32 src_layer, u32 src_level, u32 dst_ptr,
++                                              u32 dst_stride, u32 fence_ptr, u32 serial)
++{
++  if (!m_header || src_id == 0 || w == 0 || h == 0 || dst_ptr == 0 || fence_ptr == 0 ||
++      dst_stride > 0xFFFFu)
++    return false;
++  // Like BLIT_TEXTURE, an encoder operation that must follow the pass producing its source.
++  if (m_pass_staging)
++  {
++    PoisonPass();
++    return false;
++  }
++  CmdRecord rec{};
++  rec.op = static_cast<u32>(CmdOp::ReadbackTexture);
++  rec.arg.u[0] = src_id;
++  rec.arg.u[1] = Pack16(src_x, src_y);
++  rec.arg.u[2] = Pack16(w, h);
++  rec.arg.u[3] = (src_layer & 0xFFu) | ((src_level & 0xFFu) << 8) | (dst_stride << 16);
++  rec.arg.u[4] = dst_ptr;
++  rec.arg.u[5] = fence_ptr;
++  rec.arg.u[6] = serial;
+   return Push(rec);
+ }
+ 
++bool WebGPUCommandStream::WaitForReadback(const std::atomic<u32>& fence, u32 serial) const
++{
++  // Generous: the first use of a pipeline can wait for the browser to compile its shaders, and
++  // the discio worker may be busy with a long task before it replays the readback. A copy whose
++  // wait gives up reaches RAM with whatever the buffer held before (Zelda: Ocarina of Time
++  // Master Quest then built its pause screen from the previous depth copy).
++  constexpr double kTimeoutMs = 5000.0;
++  // Core::PauseAndLock (save states, pausing) runs on the discio worker and waits for this
++  // thread to go idle, so a readback it still owes then can't land until the wait gives up.
++  constexpr double kSteppingTimeoutMs = 20.0;
++  const double start = emscripten_get_now();
++  for (;;)
++  {
++    const u32 done = fence.load(std::memory_order_acquire);
++    if (done == serial)
++      return true;
++    const double waited = emscripten_get_now() - start;
++    if (waited >= kTimeoutMs || ConsumerFailed() ||
++        (waited >= kSteppingTimeoutMs && Core::System::GetInstance().GetCPU().IsStepping()))
++    {
++      return false;
++    }
++    emscripten_futex_wait(
++        const_cast<volatile void*>(reinterpret_cast<const volatile void*>(&fence)), done, 4.0);
++  }
++}
++
+ WebGPUCommandStream& GetCommandStream()
+ {
+   static WebGPUCommandStream s_stream;
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.h b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.h
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.h
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUCommandStream.h
+@@ -137,6 +137,13 @@
+   //   flags: 8=explicit channel mask, 1=RGB, 2=depth, 4=alpha.
+   //   Without flag 8, legacy flag 1 enables all RGBA channels.
+   ClearRect = 25,
++  // SNES Touch: texture rect back into wasm memory (EFB copies to RAM, see
++  // WebGPUStagingTexture). The consumer copies it to a mappable buffer and
++  // submits; when the map resolves it writes the rows at dstPtr, then stores
++  // `serial` at fencePtr and Atomics.notify()s, which the producer futex-waits on.
++  //   u0=srcId u1=(srcX|srcY<<16) u2=(w|h<<16)
++  //   u3=(srcLayer | srcLevel<<8 | dstStride<<16) u4=dstPtr u5=fencePtr u6=serial
++  ReadbackTexture = 26,
+ };
+ 
+ // Stable producer attribution for UploadBuffer records. The value is carried
+@@ -396,6 +403,13 @@
+   bool PushBlitTexture(u32 src_id, u32 dst_id, u32 src_x, u32 src_y, u32 src_w,
+                        u32 src_h, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+                        u32 src_layer, u32 src_level, u32 dst_layer, u32 dst_level);
++  // SNES Touch: GPU texture readback into wasm memory (ReadbackTexture).
++  bool PushReadbackTexture(u32 src_id, u32 src_x, u32 src_y, u32 w, u32 h, u32 src_layer,
++                           u32 src_level, u32 dst_ptr, u32 dst_stride, u32 fence_ptr,
++                           u32 serial);
++  // Waits until the consumer has stored `serial` in `fence`. False if it gave up (the consumer
++  // failed or took too long, or the core is being paused); the readback can still land later.
++  bool WaitForReadback(const std::atomic<u32>& fence, u32 serial) const;
+ 
+   // Discard the current staged pass without publishing BEGIN_PASS or any of
+   // its state/draw records. Safe to call redundantly.
 diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
 --- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
 +++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
@@ -391,16 +575,22 @@ diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h b/vendo
 diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
 --- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
 +++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
-@@ -7,6 +7,8 @@
+@@ -4,9 +4,14 @@
+ #include "VideoBackends/WebGPU/WebGPUTexture.h"
+ 
+ #include <algorithm>
++#include <cstdint>
  #include <cstring>
  
++#include <emscripten/emscripten.h>
++
  #include "VideoBackends/WebGPU/WebGPUCommandStream.h"
 +#include "VideoBackends/WebGPU/WebGPUGfx.h"
 +#include "VideoCommon/AbstractGfx.h"
  
  namespace WebGPU
  {
-@@ -101,6 +103,17 @@
+@@ -101,6 +106,17 @@
  
  WebGPUTexture::~WebGPUTexture() = default;
  
@@ -418,7 +608,7 @@ diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp b
  void WebGPUTexture::CopyRectangleFromTexture(const AbstractTexture* src,
                                               const MathUtil::Rectangle<int>& src_rect,
                                               u32 src_layer, u32 src_level,
-@@ -147,6 +160,7 @@
+@@ -147,6 +163,7 @@
    if (src_id != 0 && dst_id != 0)
    {
      const auto clamp0 = [](int v) { return v < 0 ? 0u : static_cast<u32>(v); };
@@ -426,7 +616,7 @@ diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp b
      GetCommandStream().PushBlitTexture(
          src_id, dst_id, clamp0(src_rect.left), clamp0(src_rect.top),
          clamp0(src_rect.GetWidth()), clamp0(src_rect.GetHeight()), clamp0(dst_rect.left),
-@@ -168,6 +182,7 @@
+@@ -168,6 +185,7 @@
    if (src_id == 0 || dst_id == 0)
      return;
    const auto clamp0 = [](int v) { return v < 0 ? 0u : static_cast<u32>(v); };
@@ -434,3 +624,121 @@ diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp b
    GetCommandStream().PushBlitTexture(
        src_id, dst_id, clamp0(rect.left), clamp0(rect.top), clamp0(rect.GetWidth()),
        clamp0(rect.GetHeight()), clamp0(rect.left), clamp0(rect.top),
+@@ -208,19 +226,71 @@
+   // the AbstractStagingTexture interface produces zero-filled pixels
+   // (rather than reading uninitialized memory). Real WebGPU storage
+   // comes later.
+-  m_buffer.resize(m_texel_size * config.width * config.height);
+-  m_map_pointer = reinterpret_cast<char*>(m_buffer.data());
++  m_buffer = std::make_unique<u8[]>(m_texel_size * config.width * config.height);
++  m_map_pointer = reinterpret_cast<char*>(m_buffer.get());
+   m_map_stride = m_texel_size * config.width;
++  m_readback_fence = std::make_unique<std::atomic<u32>>(0);
+ }
+ 
+-WebGPUStagingTexture::~WebGPUStagingTexture() = default;
++WebGPUStagingTexture::~WebGPUStagingTexture()
++{
++  // An unanswered readback can still be written into the buffer and the fence later,
++  // so leak them rather than free memory the consumer may write to.
++  if (!WaitForReadback())
++  {
++    static_cast<void>(m_buffer.release());
++    static_cast<void>(m_readback_fence.release());
++  }
++}
+ 
+-void WebGPUStagingTexture::CopyFromTexture(const AbstractTexture* /* src */,
+-                                           const MathUtil::Rectangle<int>& /* src_rect */,
+-                                           u32 /* src_layer */, u32 /* src_level */,
+-                                           const MathUtil::Rectangle<int>& /* dst_rect */)
++bool WebGPUStagingTexture::WaitForReadback()
+ {
++  if (m_readback_fence->load(std::memory_order_acquire) == m_readback_serial ||
++      GetCommandStream().WaitForReadback(*m_readback_fence, m_readback_serial))
++  {
++    return true;
++  }
++  static u32 s_given_up = 0;
++  if (++s_given_up == 1 || (s_given_up % 100) == 0)
++  {
++    EM_ASM(
++        {
++          if (typeof console !== 'undefined')
++            console.warn('[webgpu-readback] gave up waiting for the consumer (' + $0 + ')');
++        },
++        static_cast<int>(s_given_up));
++  }
++  return false;
++}
++
++void WebGPUStagingTexture::CopyFromTexture(const AbstractTexture* src,
++                                           const MathUtil::Rectangle<int>& src_rect,
++                                           u32 src_layer, u32 src_level,
++                                           const MathUtil::Rectangle<int>& dst_rect)
++{
+   m_needs_flush = true;
++  if (!m_gpu_readback || !src || src_rect.GetWidth() <= 0 || src_rect.GetHeight() <= 0)
++    return;
++  const u32 src_id = static_cast<const WebGPUTexture*>(src)->GetBridgeId();
++  if (src_id == 0)
++    return;
++
++  // One readback into the buffer at a time, so an older one can't land on top of this one.
++  WaitForReadback();
++  u8* const dst = m_buffer.get() + static_cast<size_t>(dst_rect.top) * m_map_stride +
++                  static_cast<size_t>(dst_rect.left) * m_texel_size;
++  const u32 serial = m_readback_serial + 1;
++  // An encoder operation, like the blits above.
++  EndRecordedPassForBlit();
++  if (GetCommandStream().PushReadbackTexture(
++          src_id, static_cast<u32>(src_rect.left), static_cast<u32>(src_rect.top),
++          static_cast<u32>(src_rect.GetWidth()), static_cast<u32>(src_rect.GetHeight()),
++          src_layer, src_level, static_cast<u32>(reinterpret_cast<uintptr_t>(dst)),
++          static_cast<u32>(m_map_stride),
++          static_cast<u32>(reinterpret_cast<uintptr_t>(m_readback_fence.get())), serial))
++  {
++    m_readback_serial = serial;
++  }
+ }
+ 
+ void WebGPUStagingTexture::CopyToTexture(const MathUtil::Rectangle<int>& /* src_rect */,
+@@ -242,6 +312,7 @@
+ 
+ void WebGPUStagingTexture::Flush()
+ {
++  WaitForReadback();
+   m_needs_flush = false;
+ }
+ 
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.h b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.h
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.h
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <vector>
+ 
+@@ -73,8 +74,18 @@
+   void Unmap() override;
+   void Flush() override;
+ 
++  // SNES Touch: copies into this texture read the texels back from the GPU (ReadbackTexture)
++  // instead of leaving the zero-filled buffer. TextureCache sets it for EFB copies to RAM only.
++  void EnableGpuReadback() { m_gpu_readback = true; }
++
+ private:
+-  std::vector<u8> m_buffer;
++  bool WaitForReadback();
++
++  std::unique_ptr<u8[]> m_buffer;
++  // The consumer stores the serial of each readback it has written into m_buffer here.
++  std::unique_ptr<std::atomic<u32>> m_readback_fence;
++  u32 m_readback_serial = 0;
++  bool m_gpu_readback = false;
+ };
+ 
+ class WebGPUFramebuffer final : public AbstractFramebuffer
