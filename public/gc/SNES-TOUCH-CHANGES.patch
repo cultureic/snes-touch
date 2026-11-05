@@ -7,6 +7,7 @@ What the C++ changes do:
 - vendor/dolphin CachedInterpreter.cpp, CachedInterpreter.h and CachedInterpreterBlockCache.cpp (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the PowerPC-to-WASM JIT routed mcrf (opcode 19, SUBOP10 0) to the condition-register logic emitter and produced invalid WebAssembly, it now takes the fallback path; ps_sum0/1, ps_sel, fsel, ps_div, ps_neg/mr/abs/nabs and the integer psq_l formats are compiled natively instead of ending the block; stw/sth/stb into the write-gather pipe page go straight into the pipe; compiled blocks are dispatched directly (DOLPHIN_WEB_DIRECT_WASM_BLOCK_DISPATCH=1); blocks run on past conditional branches (side exits), and a block that branches back to its own start loops inside WebAssembly while its cycle budget lasts (?sideexit=0 and ?wasmloop=0 turn these off; src/core-host.js); a branch to another instruction of the same block jumps inside the block's WebAssembly function (a loop around a br_table over the block's segments, cycles charged per segment) instead of leaving through the dispatcher (?innerjump=0 turns it off); frsqrte, ps_rsqrte, fres and ps_res are computed in WebAssembly from the hardware tables Common::ApproximateReciprocalSquareRoot / ApproximateReciprocal use (bit-identical, checked against the interpreter on 3 million random inputs by RunPpcWasmEstimateSmoke), and ps_cmpu0/1, ps_cmpo0/1 and psq_lx/stx/lux/stux no longer end a compiled block; psq_st of the integer formats at any scale is compiled (single(value) * 2^scale in single precision, clamped, truncated, as the interpreter's ScaleAndClamp; checked against StoreQuantizedLane by RunPpcWasmPsqStoreSmoke); with ?fpplan=1 a block that can't write the MSR or SPRs reads MSR.FP/LE once and compiles its psq ops for the GQR values at compile time behind an entry guard (opt-in: it measured slower); hot blocks are compiled again together into one WebAssembly module (a "region") that does RunWasmBlock's end-of-block work and hands over to the next block directly while the timeslice lasts, because calls from the dispatcher into thousands of separate block modules dominated the emulation thread (?wasmregion=0 turns it off; the block cache tells the region when a member is destroyed); the region's blocks are grouped along their static exits into functions (a loop around a br_table over the members; each member is the block's own function body with its returns rewritten into branches out of it, followed by the end-of-block work), so a transition inside a group is a branch and only one between groups is a tail call (?wasmcluster=0 keeps one function and tail call per block, about 15% slower in Need for Speed: Underground 2's race); blocks of any length are compiled (?shortprefix now defaults on and means a minimum of one instruction; ?shortprefix=0 restores four) and the region holds up to 8000 blocks. with feature bit 27 set (only through the raw ?disable= mask) each block keeps the paired-single registers it uses in f64 locals (opt-in: it measured about 4% slower); DOLPHIN_WEB_EDGE_PROFILE (off) builds a diagnostic core that counts every block-to-block transition and posts them to the disc worker.
 - vendor/dolphin Interpreter_FPUtils.h (shipped whole in SNES-TOUCH-SOURCES/, marked SNES Touch): the fused multiply-adds skip the software fma that WebAssembly falls back to when the product is exact in double precision, which gives the same bits.
 - vendor/dolphin VideoBackendBase.cpp: passes the XFB hook whether the XFB is in RAM (see core/upstream).
+- vendor/dolphin VideoBackends/WebGPU (the port's backend) WebGPUTexture.cpp and WebGPUGfx.h: a texture-to-texture copy closes the render pass being recorded before its blit, as Vulkan's backend ends its render pass there. Pushed into the open pass, the blit poisoned it and both were dropped, so a game whose displayed XFB is a window into its XFB copy (Dolphin stitches that window from the GPU copy) showed only the fuchsia Dolphin writes into RAM for XFBs kept on the GPU: The Legend of Zelda: Ocarina of Time Master Quest, which shows 608x464 of its 640x480 copies.
 - vendor/dolphin VideoCommon: the WebGPU backend had been exempted from Dolphin's depth conversion for backends without a reversible depth range (fog depth, per-pixel depth, depth copies, EFB peeks and pokes, clear depth), but its vertex shader writes a reversed depth buffer, so those exemptions fed inverted depth into the fog formula and fogged everything near the camera to the fog colour (a black screen in Need for Speed: Underground 2). The standard conversion is restored.
 
 diff --git a/core/upstream/dolphin_web_core.cpp b/core/upstream/dolphin_web_core.cpp
@@ -374,3 +375,62 @@ diff --git a/vendor/dolphin/Source/Core/VideoCommon/FramebufferManager.cpp b/ven
      return;
    }
  
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUGfx.h
+@@ -104,6 +104,9 @@
+                     const MathUtil::Rectangle<int>& dst_rect,
+                     const AbstractTexture* src_texture,
+                     const MathUtil::Rectangle<int>& src_rect) override;
++  // SNES Touch: closes the render pass being recorded so an encoder-level copy can follow it
++  // (WebGPUTexture::CopyRectangleFromTexture), as Vulkan ends its render pass there.
++  void EndRecordedPass() { EndPassIfOpen(); }
+ 
+ private:
+   float m_clear_r = 0.05f;
+diff --git a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
+--- a/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
++++ b/vendor/dolphin/Source/Core/VideoBackends/WebGPU/WebGPUTexture.cpp
+@@ -7,6 +7,8 @@
+ #include <cstring>
+ 
+ #include "VideoBackends/WebGPU/WebGPUCommandStream.h"
++#include "VideoBackends/WebGPU/WebGPUGfx.h"
++#include "VideoCommon/AbstractGfx.h"
+ 
+ namespace WebGPU
+ {
+@@ -101,6 +103,17 @@
+ 
+ WebGPUTexture::~WebGPUTexture() = default;
+ 
++// SNES Touch: a blit is an encoder operation, so the render pass being recorded has to be closed
++// first, as Vulkan ends its render pass in these copies. Pushed while a pass was being recorded,
++// the blit poisoned that pass and both were dropped, so an XFB that Dolphin stitches from a GPU
++// copy (Zelda: Ocarina of Time Master Quest shows a 608x464 window into its 640x480 copies) kept
++// the fuchsia that marks an XFB which is not in RAM.
++static void EndRecordedPassForBlit()
++{
++  if (g_gfx)
++    static_cast<WebGPUGfx*>(g_gfx.get())->EndRecordedPass();
++}
++
+ void WebGPUTexture::CopyRectangleFromTexture(const AbstractTexture* src,
+                                              const MathUtil::Rectangle<int>& src_rect,
+                                              u32 src_layer, u32 src_level,
+@@ -147,6 +160,7 @@
+   if (src_id != 0 && dst_id != 0)
+   {
+     const auto clamp0 = [](int v) { return v < 0 ? 0u : static_cast<u32>(v); };
++    EndRecordedPassForBlit();
+     GetCommandStream().PushBlitTexture(
+         src_id, dst_id, clamp0(src_rect.left), clamp0(src_rect.top),
+         clamp0(src_rect.GetWidth()), clamp0(src_rect.GetHeight()), clamp0(dst_rect.left),
+@@ -168,6 +182,7 @@
+   if (src_id == 0 || dst_id == 0)
+     return;
+   const auto clamp0 = [](int v) { return v < 0 ? 0u : static_cast<u32>(v); };
++  EndRecordedPassForBlit();
+   GetCommandStream().PushBlitTexture(
+       src_id, dst_id, clamp0(rect.left), clamp0(rect.top), clamp0(rect.GetWidth()),
+       clamp0(rect.GetHeight()), clamp0(rect.left), clamp0(rect.top),

@@ -155,7 +155,8 @@ export class UpstreamWorkerAdapter {
     this.xfbFastPaths = (Number(xfbFastPaths) || 0) & 3;
     this.correctTimeDrift = Boolean(correctTimeDrift);
     this.coreLog = Boolean(coreLog);
-    this.efbDiag = Boolean(efbDiag);
+    // SNES Touch: keep 2 (blit the presented XFB entry); Boolean() turned it into 1 (the EFB).
+    this.efbDiag = efbDiag === 2 ? 2 : Boolean(efbDiag);
     this.jitVerbose = Boolean(jitVerbose);
     this.frameCap = Number(frameCap) || 0;
     this.cachedInterpreterDisableMask = (Number(cachedInterpreterDisableMask) || 0) >>> 0;

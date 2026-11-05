@@ -13443,7 +13443,11 @@ function replayCreatePipelineCfg(pipelineId, blobPtr, blobLen) {
   const stripIdxFmt = u[4];
   const cullCode = u[5];
   const depthTest = u[7];
-  const depthWrite = u[8];
+  // SNES Touch: GX, like Vulkan, OpenGL and D3D, only updates depth while the depth test is on.
+  // WebGPU has no switch for the test, so a disabled test becomes compare "always", and it must
+  // not write either: writing let the prerendered backgrounds of Zelda: Ocarina of Time Master
+  // Quest (test off, update on) store the nearest depth and hide every character drawn after them.
+  const depthWrite = depthTest ? u[8] : 0;
   const depthCompare = u[9];
   const hasDepth = u[10];
   const depthFmt = u[11];
