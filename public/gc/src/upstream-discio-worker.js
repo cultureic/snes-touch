@@ -9212,10 +9212,12 @@ function diagReadColorTrace(dev, encoder, entry, tag) {
     buf.unmap(); buf.destroy();
   }).catch((e) => console.log(`[dtrace] #${seq} colour map failed (${tag}): ${e && e.message}`)));
 }
-// SNES Touch: EFB copies to RAM (WGPU_CMD_OP_READBACK_TEXTURE, from
-// WebGPUStagingTexture::CopyFromTexture). The copy is encoded and submitted at once; when the
-// map resolves, the rows go into the staging texture's buffer in wasm memory and the serial into
-// its fence word, which the video thread futex-waits on only when Dolphin needs the copy in RAM.
+// SNES Touch: staging-texture readbacks (WGPU_CMD_OP_READBACK_TEXTURE, from
+// WebGPUStagingTexture::CopyFromTexture): EFB copies to RAM, the EFB peek cache and save-state
+// textures. The copy is encoded and submitted at once; when the map resolves, the rows go into
+// the staging texture's buffer in wasm memory and its fence word counts one more done, which the
+// video thread futex-waits on only when Dolphin needs the texels. Several readbacks into one
+// staging texture can be in flight and their maps may resolve in any order, so it is a count.
 // Bytes per texel of the formats copyTextureToBuffer can read here (not depth24plus).
 const WGPU_READBACK_TEXEL_BYTES = {
   rgba8unorm: 4, bgra8unorm: 4, rgb10a2unorm: 4, r32float: 4, depth32float: 4,
@@ -9247,7 +9249,7 @@ function encodeWgpuReadback(dev, encoder, entry, x, y, w, h, layer, level) {
   }
   return { dev, buffer, bytesPerRow, rowBytes, h };
 }
-function finishWgpuReadback(pending, dstPtr, dstStride, fencePtr, serial) {
+function finishWgpuReadback(pending, dstPtr, dstStride, fencePtr) {
   const { dev, buffer, bytesPerRow, rowBytes, h } = pending;
   buffer.mapAsync(0x1).then(() => {
     const src = new Uint8Array(buffer.getMappedRange());
@@ -9262,12 +9264,12 @@ function finishWgpuReadback(pending, dstPtr, dstStride, fencePtr, serial) {
   }, (e) => {
     recordRendererError("readback", e?.message || e);
     buffer.destroy();
-  }).finally(() => signalWgpuReadback(fencePtr, serial));
+  }).finally(() => signalWgpuReadback(fencePtr));
 }
-function signalWgpuReadback(fencePtr, serial) {
+function signalWgpuReadback(fencePtr) {
   if (!moduleInstance || !fencePtr) return;
   const heap32 = new Int32Array(moduleInstance.HEAPU8.buffer);
-  Atomics.store(heap32, fencePtr >>> 2, serial | 0);
+  Atomics.add(heap32, fencePtr >>> 2, 1);
   Atomics.notify(heap32, fencePtr >>> 2);
 }
 function diagReadTexture(dev, encoder, entry, label, tag) {
@@ -10075,7 +10077,7 @@ function drainWebGpuCmdRing(source = "presentation") {
         );
       } else if (op === WGPU_CMD_OP_READBACK_TEXTURE) {
         // A discarded readback still releases the producer waiting on it.
-        signalWgpuReadback(fenceU32[word + 6], fenceU32[word + 7]);
+        signalWgpuReadback(fenceU32[word + 6]);
       }
       discardTo = (discardTo + 1) >>> 0;
       if (op === WGPU_CMD_OP_END_PASS) {
@@ -13198,18 +13200,18 @@ function drainWebGpuCmdRing(source = "presentation") {
           const sourceId = u32[recWord + 1];
           const s = webGpuObjects.textures.get(sourceId);
           const a1 = u32[recWord + 2], a2 = u32[recWord + 3], a3 = u32[recWord + 4];
-          const fencePtr = u32[recWord + 6], serial = u32[recWord + 7];
+          const fencePtr = u32[recWord + 6];
           if (!s) wgpuReplayClassifier?.recordMissingResource({ kind: "readback-source", id: sourceId });
           endPass("readback", read);
           const pending = s && encodeWgpuReadback(dev, ensureEnc(), s,
             a1 & 0xFFFF, a1 >>> 16, a2 & 0xFFFF, a2 >>> 16, a3 & 0xFF, (a3 >>> 8) & 0xFF);
           if (!pending) {
-            signalWgpuReadback(fencePtr, serial);
+            signalWgpuReadback(fencePtr);
             break;
           }
           // Submit now: the copy has to be queued before the buffer can be mapped.
           submitEnc("readback");
-          finishWgpuReadback(pending, u32[recWord + 5], a3 >>> 16, fencePtr, serial);
+          finishWgpuReadback(pending, u32[recWord + 5], a3 >>> 16, fencePtr);
           break;
         }
         default:
